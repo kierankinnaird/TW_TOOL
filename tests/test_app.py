@@ -43,12 +43,12 @@ class TestApp(unittest.TestCase):
 
     def test_timesheet_shows_cover_rows_and_totals(self):
         page = self.get("/timesheet?u=5&w=2026-11-02")
-        self.assertIn("PL-01", page)
-        self.assertIn("PL-02", page)
+        self.assertIn("PM-04", page)
+        self.assertIn("PM-02", page)
         self.assertIn("Week commencing 02/11/2026", page)
 
     def test_save_draft_then_submit_then_approve(self):
-        # Ewan (5) books Friday 6 Nov on BB0001 (scope 1) as Senior Planner (role 4)
+        # Ewan (5) books Friday 6 Nov on BB0001 (scope 1) as Planner (role 4)
         page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft",
                                              "h_1_4_2026-11-06": "7.5", "reason": ""})
         self.assertIn("1 entry saved", page)
@@ -153,34 +153,34 @@ class TestApp(unittest.TestCase):
     def test_add_client_role_and_reject_duplicates_and_blanks(self):
         self.assertIn("Client added", self.admin_post("/admin/add", {"t": "clients", "name": "Shell"}))
         self.assertIn("already exists", self.admin_post("/admin/add", {"t": "clients", "name": "Shell"}))
-        self.assertIn("Role added", self.admin_post("/admin/add", {"t": "roles", "skill_code": "QA-01", "name": "QA Engineer"}))
-        self.assertIn("is required", self.admin_post("/admin/add", {"t": "roles", "skill_code": "", "name": "x"}))
+        self.assertIn("Role added", self.admin_post("/admin/add", {"t": "roles", "skill_code": "QA-09", "name": "QA Engineer", "family": "Quality"}))
+        self.assertIn("is required", self.admin_post("/admin/add", {"t": "roles", "skill_code": "", "name": "x", "family": "y"}))
 
     def test_add_user_validates_dates_and_edit_user(self):
-        data = {"t": "users", "nmc_id": "A011", "name": "Test Person", "employment_type": "Staff", "role_id": "6",
+        data = {"t": "users", "nmc_id": "A901", "name": "Test Person", "employment_type": "Staff", "role_id": "6",
                 "permission": "user", "start_date": "2026-11-01", "end_date": ""}
         self.assertIn("User added", self.admin_post("/admin/add", data))
-        bad = dict(data, nmc_id="A012", start_date="01/11/2026")
+        bad = dict(data, nmc_id="A902", start_date="01/11/2026")
         self.assertIn("must be a date", self.admin_post("/admin/add", bad))
-        uid = self.one("select user_id from app_user where nmc_id='A011'")[0]
+        uid = self.one("select user_id from app_user where nmc_id='A901'")[0]
         self.assertIn("Saved", self.admin_post("/admin/save", {"t": "users", "id": str(uid), "name": "Test Person", "employment_type": "Contract",
                                                                "role_id": "4", "permission": "user", "end_date": "2026-12-31"}))
         self.assertEqual(tuple(self.one("select employment_type, role_id, end_date from app_user where user_id=?", uid)), ("Contract", 4, "2026-12-31"))
 
     def test_new_person_full_paaf_flow_then_can_book(self):
-        self.admin_post("/admin/add", {"t": "users", "nmc_id": "A011", "name": "Test Person", "employment_type": "Staff", "role_id": "6",
+        self.admin_post("/admin/add", {"t": "users", "nmc_id": "A901", "name": "Test Person", "employment_type": "Staff", "role_id": "6",
                                        "permission": "user", "start_date": "2026-11-01", "end_date": ""})
-        uid = self.one("select user_id from app_user where nmc_id='A011'")[0]
+        uid = self.one("select user_id from app_user where nmc_id='A901'")[0]
         self.assertIn("PAAF raised", self.admin_post("/admin/add", {"t": "paafs", "user_id": str(uid), "client_id": "1"}))
         # rate was resolved from the person's role (Cost Engineer on Apache)
-        self.assertEqual(self.one("select rt.sales_rate from paaf p join rate rt on rt.rate_id=p.rate_id where p.user_id=?", uid)[0], 85)
+        self.assertEqual(self.one("select rt.sales_rate from paaf p join rate rt on rt.rate_id=p.rate_id where p.user_id=?", uid)[0], 85.5)
         self.assertIn("already has a PAAF", self.admin_post("/admin/add", {"t": "paafs", "user_id": str(uid), "client_id": "1"}))
         pid = self.one("select paaf_id from paaf where user_id=?", uid)[0]
         book = {"u": str(uid), "w": "2026-11-02", "action": "Save draft", "h_1_6_2026-11-06": "4", "reason": ""}
         self.assertIn("No approved PAAF", self.post("/timesheet/save", book))                      # not approved yet
         self.assertIn("marked as sent", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Mark sent"}))
         self.assertIn("signed form reference is required", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Approve", "document_ref": ""}))
-        self.assertIn("approved", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Approve", "document_ref": "paaf/apache/A011.pdf", "expiry_date": ""}))
+        self.assertIn("approved", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Approve", "document_ref": "paaf/apache/A901.pdf", "expiry_date": ""}))
         self.assertIn("1 entry saved", self.post("/timesheet/save", book))                        # now allowed
 
     def test_paaf_needs_a_rate_for_the_role(self):
@@ -202,7 +202,7 @@ class TestApp(unittest.TestCase):
         self.assertEqual(self.one("select rt.sales_rate from time_entry t join rate rt on rt.rate_id=t.rate_id "
                                   "where t.user_id=5 and t.work_date='2026-11-06'")[0], 100)
         self.assertEqual(self.one("select rt.sales_rate from time_entry t join rate rt on rt.rate_id=t.rate_id "
-                                  "where t.user_id=5 and t.work_date='2026-11-02'")[0], 95)
+                                  "where t.user_id=5 and t.work_date='2026-11-02'")[0], 85.5)
 
     def test_add_scope_with_approver_and_change_approver(self):
         self.assertIn("Scope added", self.admin_post("/admin/add", {"t": "scopes", "scope_code": "BB0003", "project_id": "1",
@@ -214,12 +214,28 @@ class TestApp(unittest.TestCase):
         self.assertEqual(tuple(self.one("select status, approver_user_id from scope where scope_id=?", sid)), ("Closed", 6))
 
     def test_deactivated_role_is_hidden_from_new_timesheet_rows(self):
-        self.admin_post("/admin/save", {"t": "roles", "id": "2", "skill_code": "EM-01", "name": "Engineering Manager", "active": "0"})
+        self.admin_post("/admin/save", {"t": "roles", "id": "2", "skill_code": "EM-02", "name": "Engineering Manager", "family": "Engineering Management", "active": "0"})
         page = self.get("/timesheet?u=5&w=2026-11-02")
-        self.assertNotIn("EM-01 Engineering Manager", page)
-        self.assertIn("PL-02 Lead Planner", page)
+        self.assertNotIn("EM-02 Engineering Manager", page)
+        self.assertIn("PM-02 Project Controls Manager", page)
 
 
+
+    def test_user_switcher_shows_each_persons_job_title(self):
+        page = self.get("/reports?u=7")
+        for label in ["Alasdair Murray - Engineering Manager (admin)", "Hamish Lennox - Operations Superintendent",
+                      "Lachlan Rennie - Subsea Pipeline Engineer", "Mairi Thomson - Lead Technical Safety Engineer"]:
+            self.assertIn(label, page)
+
+    def test_roles_tab_groups_job_titles_by_family(self):
+        page = self.get("/admin?u=7&t=roles")
+        for text in ["Job family", "Piping Engineering", "Technical Safety", "Lead Process Engineer", "Document Controller"]:
+            self.assertIn(text, page)
+
+    def test_reports_show_the_new_job_titles(self):
+        page = self.get("/reports?u=7")
+        for text in ["PM-04 Planner", "EM-01 Operations Superintendent", "PI-01 Lead Piping Engineer", "TS-01 Lead Technical Safety Engineer"]:
+            self.assertIn(text, page)
 
     # ---------- Paul's demo feedback ----------
     def queue_ids(self, approver):
@@ -331,9 +347,9 @@ class TestApp(unittest.TestCase):
         self.assertIn("Saved", self.admin_post("/admin/save", {"t": "projects", "id": str(pid), "name": "Jetty Removal", "status": "Closed"}))
 
     def test_internal_paaf_authorise_needs_no_client_form(self):
-        self.admin_post("/admin/add", {"t": "users", "nmc_id": "A012", "name": "Internal Person", "employment_type": "Staff", "role_id": "6",
+        self.admin_post("/admin/add", {"t": "users", "nmc_id": "A902", "name": "Internal Person", "employment_type": "Staff", "role_id": "6",
                                        "permission": "user", "start_date": "2026-11-01", "end_date": ""})
-        uid = self.one("select user_id from app_user where nmc_id='A012'")[0]
+        uid = self.one("select user_id from app_user where nmc_id='A902'")[0]
         self.admin_post("/admin/add", {"t": "paafs", "user_id": str(uid), "client_id": "1"})
         pid = self.one("select paaf_id from paaf where user_id=?", uid)[0]
         self.assertIn("authorised internally", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Authorise internally"}))

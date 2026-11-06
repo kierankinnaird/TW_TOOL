@@ -1,11 +1,12 @@
 -- NMC Timewriting System - v1 mock database (SQLite)
 PRAGMA foreign_keys = ON;
 
--- Controlled list of job roles. Editable by admin/superuser.
+-- Controlled list of job titles, grouped into job families. Editable by admin/superuser.
 CREATE TABLE role (
     role_id     INTEGER PRIMARY KEY,
-    skill_code  TEXT NOT NULL UNIQUE,               -- e.g. PL-01
-    name        TEXT NOT NULL UNIQUE,
+    skill_code  TEXT NOT NULL UNIQUE,               -- e.g. PM-04
+    name        TEXT NOT NULL UNIQUE,               -- job title
+    family      TEXT NOT NULL,                      -- job family, e.g. Project Management
     active      INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1))
 );
 

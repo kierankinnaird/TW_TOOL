@@ -32,12 +32,12 @@ class Base(unittest.TestCase):
 
 class TestSeed(Base):
     def test_counts(self):
-        self.assertEqual(self.scalar("select count(*) from app_user"), 10)
-        self.assertEqual(self.scalar("select count(*) from time_entry"), 29)
-        self.assertEqual(self.scalar("select count(*) from rate"), 12)
+        self.assertEqual(self.scalar("select count(*) from app_user"), 28)
+        self.assertEqual(self.scalar("select count(*) from time_entry"), 52)
+        self.assertEqual(self.scalar("select count(*) from rate"), 58)
 
     def test_rates_rise_with_seniority_for_each_client(self):
-        order = ["Cost Engineer", "Senior Planner", "Project Engineer", "Lead Planner",
+        order = ["Cost Engineer", "Planner", "Project Engineer", "Project Controls Manager",
                  "Engineering Manager", "Project Manager"]
         for client in ("Apache", "Spirit"):
             rows = dict(self.con.execute(
@@ -45,9 +45,24 @@ class TestSeed(Base):
                 "join client c using(client_id) where c.name=?", (client,)))
             self.assertEqual([rows[n] for n in order], sorted(rows[n] for n in order), client)
 
+    def test_job_families_and_titles_from_the_estimate(self):
+        self.assertEqual(self.scalar("select count(*) from role"), 29)
+        families = {r[0] for r in self.con.execute("select family from role")}
+        for f in ["Project Management", "Engineering Management", "Project Engineering", "Piping Engineering", "Technical Safety", "HSES", "QA/QC"]:
+            self.assertIn(f, families)
+        self.assertEqual(self.scalar("select count(*) from role where family is null or family=''"), 0)
+
+    def test_every_user_has_a_job_title_and_every_title_is_priced_for_both_clients(self):
+        self.assertEqual(self.scalar("select count(*) from app_user where role_id not in (select role_id from role)"), 0)
+        self.assertEqual(self.scalar("select count(*) from role r where (select count(*) from rate where role_id=r.role_id)<>2"), 0)
+
+    def test_spirit_rates_match_the_morecambe_hub_estimate(self):
+        rows = dict(self.con.execute("select r.name, rt.sales_rate from rate rt join role r using(role_id) join client c using(client_id) where c.name='Spirit'"))
+        self.assertEqual((rows["Project Manager"], rows["Engineering Manager"], rows["Lead Technical Safety Engineer"], rows["Document Controller"]), (120, 110, 120, 65))
+
     def test_no_abbreviated_job_titles(self):
         names = [r[0] for r in self.con.execute("select name from role")]
-        self.assertIn("Senior Planner", names)
+        self.assertIn("Planner", names)
         self.assertFalse([n for n in names if "Snr" in n])
 
 
@@ -55,7 +70,7 @@ class TestBookingRules(Base):
     # Seed ids: Ewan=5 (paaf 1, Apache), Fraser=4 (paaf 4 'Sent'), Isla=1 (paaf 3 Apache, 5 Spirit)
     def test_valid_booking_is_accepted_and_audited(self):
         self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 8, 5))
-        self.assertEqual(self.scalar("select count(*) from time_entry_audit where action='CREATE'"), 30)
+        self.assertEqual(self.scalar("select count(*) from time_entry_audit where action='CREATE'"), 53)
 
     def test_unapproved_paaf_blocks_booking(self):
         self.blocked(NEW_ENTRY, (4, 1, 1, 4, 4, 4, "2026-11-06", 8, 4), "No approved PAAF")
@@ -77,8 +92,8 @@ class TestBookingRules(Base):
         self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, 10, "2026-11-06", 8, 5), "Rate does not match")  # Spirit rate on Apache
 
     def test_cover_booking_uses_higher_role_rate(self):
-        self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 5, 5, "2026-11-06", 8, 5))  # Senior Planner covering Lead Planner
-        self.assertEqual(self.scalar("select sales_rate from rate where rate_id=5"), 115)
+        self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 5, 5, "2026-11-06", 8, 5))  # Planner covering Project Controls Manager
+        self.assertEqual(self.scalar("select sales_rate from rate where rate_id=5"), 100)
 
     def test_hours_limits(self):
         self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 0, 5))
@@ -212,7 +227,7 @@ class TestLifecycle(Base):
         eid = self.scalar("select entry_id from time_entry where status='Draft' limit 1")  # Catriona's rejected entry
         self.con.execute("UPDATE time_entry SET last_edited_by=10, last_edited_at='t9' WHERE entry_id=?", (eid,))
         self.con.execute("DELETE FROM time_entry WHERE entry_id=?", (eid,))
-        self.assertEqual(self.scalar("select count(*) from time_entry"), 28)
+        self.assertEqual(self.scalar("select count(*) from time_entry"), 51)
 
     def test_every_status_change_is_audited(self):
         n_status = self.scalar("select count(*) from time_entry_audit where action='STATUS'")
@@ -224,9 +239,9 @@ class TestLifecycle(Base):
 class TestViews(Base):
     def test_ctr_counts_approved_only_and_shows_pending_separately(self):
         row = self.con.execute(
-            "select hours, pending_hours from v_ctr where scope_code='BB0001' and skill_code='PL-02'").fetchone()
+            "select hours, pending_hours from v_ctr where scope_code='BB0001' and skill_code='PM-02'").fetchone()
         approved = self.scalar("select sum(hours) from time_entry t join scope s using(scope_id) join rate r using(rate_id) "
-                               "join role ro using(role_id) where s.scope_code='BB0001' and ro.skill_code='PL-02' "
+                               "join role ro using(role_id) where s.scope_code='BB0001' and ro.skill_code='PM-02' "
                                "and t.status='Approved'") or 0
         self.assertEqual(row[0], approved)
         self.assertGreater(row[1], 0)
@@ -250,8 +265,8 @@ class TestViews(Base):
     def test_cover_hours_appear_on_their_own_line(self):
         lines = self.con.execute(
             "select skill_code from v_ctr where scope_code='BB0001'").fetchall()
-        self.assertIn(("PL-01",), lines)
-        self.assertIn(("PL-02",), lines)
+        self.assertIn(("PM-04",), lines)
+        self.assertIn(("PM-02",), lines)
 
 
 if __name__ == "__main__":

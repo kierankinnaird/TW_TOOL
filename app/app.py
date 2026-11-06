@@ -56,7 +56,7 @@ def table(headers, rows, raw_cols=()):
 
 def me_row(con, u):
     return con.execute(
-        "select u.*, r.name as role_name, r.skill_code from app_user u join role r on r.role_id=u.role_id "
+        "select u.*, r.name as role_name, r.family, r.skill_code from app_user u join role r on r.role_id=u.role_id "
         "where u.user_id=?", (u,)).fetchone()
 
 
@@ -70,16 +70,18 @@ def pending_for(con, u):
 
 
 def layout(con, u, title, body):
-    users = con.execute("select user_id, name from app_user order by name").fetchall()
-    opts = "".join('<option value="%d"%s>%s</option>' % (x["user_id"], " selected" if x["user_id"] == u else "", esc(x["name"]))
-                   for x in users)
+    users = con.execute("select a.user_id, a.name, r.name as role_name, a.permission from app_user a "
+                        "join role r on r.role_id=a.role_id order by a.name").fetchall()
+    opts = "".join('<option value="%d"%s>%s - %s%s</option>' % (
+        x["user_id"], " selected" if x["user_id"] == u else "", esc(x["name"]), esc(x["role_name"]),
+        " (admin)" if x["permission"] == "admin" else "") for x in users)
     me = me_row(con, u)
     menu = ['<a href="/timesheet?u=%d">My Timesheet</a>' % u,
             '<a href="/approvals?u=%d">Approvals (%d)</a>' % (u, pending_for(con, u)),
             '<a href="/reports?u=%d">Reports</a>' % u]
     if me and me["permission"] == "admin":
         menu += ['<a href="/admin?u=%d&amp;t=periods">Admin</a>' % u, '<a href="/audit?u=%d">Audit trail</a>' % u]
-    who = "%s (%s, %s)" % (esc(me["name"]), esc(me["role_name"]), esc(me["permission"])) if me else ""
+    who = "%s<br>%s (%s)<br>%s, %s" % (esc(me["name"]), esc(me["role_name"]), esc(me["skill_code"]), esc(me["family"]), esc(me["permission"])) if me else ""
     return (
         "<html><head><title>%s</title></head><body>"
         '<table width="100%%" border="0"><tr><td><b>NMC Timewriting</b> (mock)</td>'
@@ -528,7 +530,7 @@ def view_reports(con, u, q):
 
 
 # ---------- Admin ----------
-ADMIN_TABS = [("periods", "Weekly periods"), ("users", "Users"), ("roles", "Roles / skill codes"),
+ADMIN_TABS = [("periods", "Weekly periods"), ("users", "Users"), ("roles", "Job families / titles"),
               ("clients", "Clients"), ("rates", "Client rate cards"), ("paafs", "PAAFs"), ("scopes", "Projects / scopes / phases")]
 
 
@@ -628,11 +630,11 @@ def admin_body(con, u, t):
                     sel("permission", [("user", "user"), ("admin", "admin")]), txt("start_date", datetime.date.today().isoformat(), 10),
                     txt("end_date", "", 10)))
     elif t == "roles":
-        rows = [[r["skill_code"], r["name"], "Yes" if r["active"] else "No", edit_link(u, "roles", r["role_id"])]
-                for r in con.execute("select * from role order by skill_code")]
-        b.append(table(["Skill code", "Role", "Active", ""], rows, raw_cols=(3,)))
-        b.append('<h4>Add a role</h4><form method="post" action="/admin/add">%s Skill code %s Role name %s '
-                 '<input type="submit" value="Add role"></form>' % (hidden(u=u, t="roles"), txt("skill_code", "", 8), txt("name", "", 30)))
+        rows = [[r["family"], r["skill_code"], r["name"], "Yes" if r["active"] else "No", edit_link(u, "roles", r["role_id"])]
+                for r in con.execute("select * from role order by family, skill_code")]
+        b.append(table(["Job family", "Skill code", "Job title", "Active", ""], rows, raw_cols=(4,)))
+        b.append('<h4>Add a job title</h4><form method="post" action="/admin/add">%s Job family %s Skill code %s Job title %s '
+                 '<input type="submit" value="Add role"></form>' % (hidden(u=u, t="roles"), txt("family", "", 24), txt("skill_code", "", 8), txt("name", "", 30)))
     elif t == "clients":
         rows = [[r["name"]] for r in con.execute("select name from client order by name")]
         b.append(table(["Client"], rows))
@@ -734,8 +736,8 @@ def view_admin_edit(con, u, t, i, msgs=None):
         r = con.execute("select * from role where role_id=?", (i,)).fetchone()
         if not r:
             return layout(con, u, "Admin", "<p>Not found.</p>")
-        form = ("<tr><td>Skill code</td><td>%s</td></tr><tr><td>Role name</td><td>%s</td></tr><tr><td>Active</td><td>%s</td></tr>"
-                % (txt("skill_code", r["skill_code"], 8), txt("name", r["name"], 30), sel("active", [("1", "Yes"), ("0", "No")], str(r["active"]))))
+        form = ("<tr><td>Job family</td><td>%s</td></tr><tr><td>Skill code</td><td>%s</td></tr><tr><td>Job title</td><td>%s</td></tr><tr><td>Active</td><td>%s</td></tr>"
+                % (txt("family", r["family"], 24), txt("skill_code", r["skill_code"], 8), txt("name", r["name"], 30), sel("active", [("1", "Yes"), ("0", "No")], str(r["active"]))))
         note = "<p><small>Deactivating a role hides it from new users and new timesheet rows. It does not affect past entries.</small></p>"
     elif t == "scopes":
         r = con.execute("select s.*, c.name as client from scope s join client c on c.client_id=s.client_id where scope_id=?", (i,)).fetchone()
@@ -780,7 +782,8 @@ def admin_add(con, form):
                          g("permission"), need_date(g("start_date"), "Start date"), need_date(g("end_date"), "End date", False)))
             msg = "User added."
         elif t == "roles":
-            con.execute("insert into role (skill_code, name) values (?,?)", (need_text(g("skill_code"), "Skill code"), need_text(g("name"), "Role name")))
+            con.execute("insert into role (skill_code, name, family) values (?,?,?)",
+                        (need_text(g("skill_code"), "Skill code"), need_text(g("name"), "Job title"), need_text(g("family"), "Job family")))
             msg = "Role added."
         elif t == "clients":
             con.execute("insert into client (name) values (?)", (need_text(g("name"), "Client name"),))
@@ -846,8 +849,8 @@ def admin_save(con, form):
                         (need_text(g("name"), "Name"), g("employment_type"), int(g("role_id")), g("permission"),
                          need_date(g("end_date"), "End date", False), i))
         elif t == "roles":
-            con.execute("update role set skill_code=?, name=?, active=? where role_id=?",
-                        (need_text(g("skill_code"), "Skill code"), need_text(g("name"), "Role name"), int(g("active")), i))
+            con.execute("update role set skill_code=?, name=?, family=?, active=? where role_id=?",
+                        (need_text(g("skill_code"), "Skill code"), need_text(g("name"), "Job title"), need_text(g("family"), "Job family"), int(g("active")), i))
         elif t == "scopes":
             con.execute("update scope set description=?, status=?, approver_user_id=? where scope_id=?",
                         (need_text(g("description"), "Description"), g("status"), int(g("approver_user_id")), i))
