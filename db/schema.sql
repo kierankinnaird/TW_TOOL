@@ -50,15 +50,46 @@ CREATE TABLE paaf (
     UNIQUE (user_id, client_id)
 );
 
--- What can be booked to. Approver is set when the scope is created.
+-- Hierarchy: client > project > scope > phase. Hours are booked to a phase (the lowest level).
+-- The approver sits on the scope.
+CREATE TABLE project (
+    project_id    INTEGER PRIMARY KEY,
+    project_code  TEXT NOT NULL UNIQUE,
+    name          TEXT NOT NULL,
+    client_id     INTEGER NOT NULL REFERENCES client(client_id),
+    status        TEXT NOT NULL DEFAULT 'Open' CHECK (status IN ('Open','Closed'))
+);
+
 CREATE TABLE scope (
     scope_id          INTEGER PRIMARY KEY,
     scope_code        TEXT NOT NULL UNIQUE,           -- e.g. BB0001
     client_id         INTEGER NOT NULL REFERENCES client(client_id),
+    project_id        INTEGER NOT NULL REFERENCES project(project_id),
     description       TEXT NOT NULL,
     status            TEXT NOT NULL CHECK (status IN ('Pipeline','Open','Closed')),
     approver_user_id  INTEGER NOT NULL REFERENCES app_user(user_id)
 );
+
+-- A scope is split into phases (e.g. Define, Execute). Every scope has at least one.
+CREATE TABLE phase (
+    phase_id   INTEGER PRIMARY KEY,
+    scope_id   INTEGER NOT NULL REFERENCES scope(scope_id),
+    name       TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'Open' CHECK (status IN ('Open','Closed')),
+    UNIQUE (scope_id, name)
+);
+
+-- A scope sits under a project of the same client.
+CREATE TRIGGER trg_scope_project_client_insert BEFORE INSERT ON scope
+BEGIN
+    SELECT RAISE(ABORT, 'The scope client must match its project client')
+    WHERE (SELECT client_id FROM project WHERE project_id = NEW.project_id) <> NEW.client_id;
+END;
+CREATE TRIGGER trg_scope_project_client_update BEFORE UPDATE OF client_id, project_id ON scope
+BEGIN
+    SELECT RAISE(ABORT, 'The scope client must match its project client')
+    WHERE (SELECT client_id FROM project WHERE project_id = NEW.project_id) <> NEW.client_id;
+END;
 
 -- Weekly periods (Mon-Sun), identified by the Monday. An entry's week is derived from work_date.
 CREATE TABLE period (
@@ -74,6 +105,7 @@ CREATE TABLE time_entry (
     entry_id    INTEGER PRIMARY KEY,
     user_id     INTEGER NOT NULL REFERENCES app_user(user_id),
     scope_id    INTEGER NOT NULL REFERENCES scope(scope_id),
+    phase_id    INTEGER NOT NULL REFERENCES phase(phase_id), -- lowest booking level; must belong to scope_id
     paaf_id     INTEGER NOT NULL REFERENCES paaf(paaf_id),
     worked_role_id INTEGER NOT NULL REFERENCES role(role_id), -- skill code booked under (defaults to user's role)
     rate_id     INTEGER NOT NULL REFERENCES rate(rate_id),   -- client sales rate for worked role, snapshot at booking
@@ -101,7 +133,7 @@ CREATE TABLE time_entry_audit (
     reason      TEXT,
     old_status  TEXT, new_status TEXT,
     old_hours   NUMERIC, new_hours NUMERIC,
-    old_scope_id INTEGER, old_worked_role_id INTEGER, old_rate_id INTEGER, old_work_date TEXT
+    old_scope_id INTEGER, old_phase_id INTEGER, old_worked_role_id INTEGER, old_rate_id INTEGER, old_work_date TEXT
 );
 
 -- Booking guard: Open scope, Approved PAAF for the scope's client, matching rate, Open weekly period.
@@ -112,6 +144,12 @@ BEGIN
     WHERE NEW.status NOT IN ('Draft','Submitted');
     SELECT RAISE(ABORT, 'Scope is not Open')
     WHERE (SELECT status FROM scope WHERE scope_id = NEW.scope_id) <> 'Open';
+    SELECT RAISE(ABORT, 'Phase does not belong to this scope')
+    WHERE NOT EXISTS (SELECT 1 FROM phase WHERE phase_id = NEW.phase_id AND scope_id = NEW.scope_id);
+    SELECT RAISE(ABORT, 'Project is not Open')
+    WHERE (SELECT pr.status FROM scope sc JOIN project pr ON pr.project_id = sc.project_id WHERE sc.scope_id = NEW.scope_id) <> 'Open';
+    SELECT RAISE(ABORT, 'Phase is not Open')
+    WHERE (SELECT status FROM phase WHERE phase_id = NEW.phase_id) <> 'Open';
     SELECT RAISE(ABORT, 'No approved PAAF for this user and client')
     WHERE NOT EXISTS (
         SELECT 1 FROM paaf p JOIN scope s ON s.client_id = p.client_id
@@ -137,10 +175,13 @@ BEGIN
     WHERE NEW.last_edited_by IS NULL OR NEW.last_edited_at IS NULL
        OR (NEW.last_edited_by IS OLD.last_edited_by AND NEW.last_edited_at IS OLD.last_edited_at);
 
+    SELECT RAISE(ABORT, 'Phase does not belong to this scope')
+    WHERE NOT EXISTS (SELECT 1 FROM phase WHERE phase_id = NEW.phase_id AND scope_id = NEW.scope_id);
+
     -- changing an approved entry makes it Edited
     SELECT RAISE(ABORT, 'Changing an approved entry sets its status to Edited')
     WHERE OLD.status IN ('Approved','Edited') AND NEW.status <> 'Edited'
-      AND (NEW.hours IS NOT OLD.hours OR NEW.scope_id IS NOT OLD.scope_id OR NEW.work_date IS NOT OLD.work_date
+      AND (NEW.hours IS NOT OLD.hours OR NEW.scope_id IS NOT OLD.scope_id OR NEW.phase_id IS NOT OLD.phase_id OR NEW.work_date IS NOT OLD.work_date
            OR NEW.worked_role_id IS NOT OLD.worked_role_id OR NEW.rate_id IS NOT OLD.rate_id
            OR NEW.user_id IS NOT OLD.user_id)
       AND NOT (OLD.status = 'Edited' AND NEW.status = 'Approved');
@@ -176,14 +217,14 @@ CREATE TRIGGER trg_time_entry_audit_update
 AFTER UPDATE ON time_entry
 BEGIN
     INSERT INTO time_entry_audit(entry_id, action, changed_by, changed_at, reason,
-        old_status, new_status, old_hours, new_hours, old_scope_id, old_worked_role_id, old_rate_id, old_work_date)
+        old_status, new_status, old_hours, new_hours, old_scope_id, old_phase_id, old_worked_role_id, old_rate_id, old_work_date)
     VALUES (OLD.entry_id,
         CASE WHEN OLD.status <> NEW.status THEN 'STATUS' ELSE 'UPDATE' END,
         NEW.last_edited_by, NEW.last_edited_at,
         CASE WHEN NEW.status = 'Draft' AND OLD.status = 'Submitted' THEN NEW.reject_reason
              WHEN NEW.status = 'Edited' THEN NEW.last_change_reason END,
         OLD.status, NEW.status, OLD.hours, NEW.hours,
-        OLD.scope_id, OLD.worked_role_id, OLD.rate_id, OLD.work_date);
+        OLD.scope_id, OLD.phase_id, OLD.worked_role_id, OLD.rate_id, OLD.work_date);
 END;
 
 -- Only Draft entries can be deleted ("clear draft"), and the deleter must be named first
@@ -201,39 +242,44 @@ CREATE TRIGGER trg_time_entry_audit_delete
 AFTER DELETE ON time_entry
 BEGIN
     INSERT INTO time_entry_audit(entry_id, action, changed_by, changed_at, reason,
-        old_status, old_hours, old_scope_id, old_worked_role_id, old_rate_id, old_work_date)
+        old_status, old_hours, old_scope_id, old_phase_id, old_worked_role_id, old_rate_id, old_work_date)
     VALUES (OLD.entry_id, 'DELETE', OLD.last_edited_by, OLD.last_edited_at, 'Draft cleared',
-        OLD.status, OLD.hours, OLD.scope_id, OLD.worked_role_id, OLD.rate_id, OLD.work_date);
+        OLD.status, OLD.hours, OLD.scope_id, OLD.phase_id, OLD.worked_role_id, OLD.rate_id, OLD.work_date);
 END;
 
--- CTR (Cost Time Resource): per scope, one line per role: hours x sales rate = total.
+-- CTR (Cost Time Resource): per phase, one line per role: hours x sales rate = total.
 -- Totals count Approved entries only; pending_hours = Submitted + Edited awaiting approval.
 CREATE VIEW v_ctr AS
-SELECT s.scope_code, s.description AS scope, c.name AS client, r.skill_code, r.name AS role,
+SELECT c.name AS client, p.project_code, p.name AS project, s.scope_code, s.description AS scope,
+       ph.phase_id, ph.name AS phase, r.skill_code, r.name AS role,
        SUM(CASE WHEN t.status = 'Approved' THEN t.hours ELSE 0 END) AS hours,
        rt.sales_rate,
        SUM(CASE WHEN t.status = 'Approved' THEN t.hours * rt.sales_rate ELSE 0 END) AS total,
        SUM(CASE WHEN t.status IN ('Submitted','Edited') THEN t.hours ELSE 0 END) AS pending_hours
 FROM time_entry t
-JOIN scope s    ON s.scope_id = t.scope_id
+JOIN phase ph   ON ph.phase_id = t.phase_id
+JOIN scope s    ON s.scope_id = ph.scope_id
+JOIN project p  ON p.project_id = s.project_id
 JOIN client c   ON c.client_id = s.client_id
 JOIN rate rt    ON rt.rate_id = t.rate_id
 JOIN role r     ON r.role_id = rt.role_id
 WHERE t.status <> 'Draft'
-GROUP BY s.scope_id, rt.rate_id;
+GROUP BY ph.phase_id, rt.rate_id;
 
 -- Weekly period report (approved hours). Filter by week_start BETWEEN two dates for a date range.
 CREATE VIEW v_period_report AS
 SELECT date(t.work_date, 'weekday 0', '-6 days') AS week_start,
-       c.name AS client, s.scope_code, r.skill_code, r.name AS role,
+       c.name AS client, p.name AS project, s.scope_code, ph.name AS phase, r.skill_code, r.name AS role,
        SUM(t.hours) AS hours, SUM(t.hours * rt.sales_rate) AS total
 FROM time_entry t
-JOIN scope s  ON s.scope_id = t.scope_id
+JOIN phase ph ON ph.phase_id = t.phase_id
+JOIN scope s  ON s.scope_id = ph.scope_id
+JOIN project p ON p.project_id = s.project_id
 JOIN client c ON c.client_id = s.client_id
 JOIN rate rt  ON rt.rate_id = t.rate_id
 JOIN role r   ON r.role_id = rt.role_id
 WHERE t.status = 'Approved'
-GROUP BY week_start, s.scope_id, rt.rate_id;
+GROUP BY week_start, ph.phase_id, rt.rate_id;
 
 -- Entries waiting on each scope approver.
 CREATE VIEW v_approver_queue AS

@@ -123,5 +123,223 @@ class TestApp(unittest.TestCase):
         self.assertNotIn("2026-11-02</td>", page.split("Period reports")[1])
 
 
+    # ---------- admin forms ----------
+    def admin_post(self, path, data, u="7"):
+        d = {"u": u}
+        d.update(data)
+        return self.post(path, d)
+
+    def one(self, sql, *args):
+        con = app.db()
+        try:
+            return con.execute(sql, args).fetchone()
+        finally:
+            con.close()
+
+    def test_all_admin_tabs_and_edit_pages_load(self):
+        for t in ["periods", "users", "roles", "clients", "rates", "paafs", "scopes"]:
+            self.assertIn("Admin", self.get("/admin?u=7&t=%s" % t), t)
+        for t, i in [("users", 1), ("roles", 1), ("scopes", 1)]:
+            self.assertIn("Save changes", self.get("/admin/edit?u=7&t=%s&id=%d" % (t, i)), t)
+
+    def test_non_admin_cannot_use_admin_forms(self):
+        before = self.one("select count(*) from client")[0]
+        self.admin_post("/admin/add", {"t": "clients", "name": "Sneaky"}, u="5")
+        self.assertEqual(self.one("select count(*) from client")[0], before)
+        self.admin_post("/admin/period", {"action": "open", "week_start": "2026-11-09"}, u="5")
+        self.assertIsNone(self.one("select 1 from period where week_start='2026-11-09'"))
+        self.assertIn("Admin only", self.get("/admin/edit?u=5&t=users&id=1"))
+
+    def test_add_client_role_and_reject_duplicates_and_blanks(self):
+        self.assertIn("Client added", self.admin_post("/admin/add", {"t": "clients", "name": "Shell"}))
+        self.assertIn("already exists", self.admin_post("/admin/add", {"t": "clients", "name": "Shell"}))
+        self.assertIn("Role added", self.admin_post("/admin/add", {"t": "roles", "skill_code": "QA-01", "name": "QA Engineer"}))
+        self.assertIn("is required", self.admin_post("/admin/add", {"t": "roles", "skill_code": "", "name": "x"}))
+
+    def test_add_user_validates_dates_and_edit_user(self):
+        data = {"t": "users", "nmc_id": "A011", "name": "Test Person", "employment_type": "Staff", "role_id": "6",
+                "permission": "user", "start_date": "2026-11-01", "end_date": ""}
+        self.assertIn("User added", self.admin_post("/admin/add", data))
+        bad = dict(data, nmc_id="A012", start_date="01/11/2026")
+        self.assertIn("must be a date", self.admin_post("/admin/add", bad))
+        uid = self.one("select user_id from app_user where nmc_id='A011'")[0]
+        self.assertIn("Saved", self.admin_post("/admin/save", {"t": "users", "id": str(uid), "name": "Test Person", "employment_type": "Contract",
+                                                               "role_id": "4", "permission": "user", "end_date": "2026-12-31"}))
+        self.assertEqual(tuple(self.one("select employment_type, role_id, end_date from app_user where user_id=?", uid)), ("Contract", 4, "2026-12-31"))
+
+    def test_new_person_full_paaf_flow_then_can_book(self):
+        self.admin_post("/admin/add", {"t": "users", "nmc_id": "A011", "name": "Test Person", "employment_type": "Staff", "role_id": "6",
+                                       "permission": "user", "start_date": "2026-11-01", "end_date": ""})
+        uid = self.one("select user_id from app_user where nmc_id='A011'")[0]
+        self.assertIn("PAAF raised", self.admin_post("/admin/add", {"t": "paafs", "user_id": str(uid), "client_id": "1"}))
+        # rate was resolved from the person's role (Cost Engineer on Apache)
+        self.assertEqual(self.one("select rt.sales_rate from paaf p join rate rt on rt.rate_id=p.rate_id where p.user_id=?", uid)[0], 85)
+        self.assertIn("already has a PAAF", self.admin_post("/admin/add", {"t": "paafs", "user_id": str(uid), "client_id": "1"}))
+        pid = self.one("select paaf_id from paaf where user_id=?", uid)[0]
+        book = {"u": str(uid), "w": "2026-11-02", "action": "Save draft", "h_1_6_2026-11-06": "4", "reason": ""}
+        self.assertIn("No approved PAAF", self.post("/timesheet/save", book))                      # not approved yet
+        self.assertIn("marked as sent", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Mark sent"}))
+        self.assertIn("signed form reference is required", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Approve", "document_ref": ""}))
+        self.assertIn("approved", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Approve", "document_ref": "paaf/apache/A011.pdf", "expiry_date": ""}))
+        self.assertIn("1 entry saved", self.post("/timesheet/save", book))                        # now allowed
+
+    def test_paaf_needs_a_rate_for_the_role(self):
+        self.admin_post("/admin/add", {"t": "clients", "name": "Shell"})
+        cid = self.one("select client_id from client where name='Shell'")[0]
+        page = self.admin_post("/admin/add", {"t": "paafs", "user_id": "5", "client_id": str(cid)})
+        self.assertIn("Add the rate first", page)
+
+    def test_paaf_actions_only_allowed_from_the_right_status(self):
+        page = self.admin_post("/admin/paaf", {"paaf_id": "1", "action": "Mark sent"})   # PAAF 1 is already Approved
+        self.assertIn("not available", page)
+
+    def test_new_rate_applies_from_its_date_and_old_hours_keep_old_price(self):
+        self.assertIn("Rate added", self.admin_post("/admin/add", {"t": "rates", "client_id": "1", "role_id": "4",
+                                                                 "sales_rate": "100", "effective_from": "2026-11-05"}))
+        self.assertIn("is not a number" if False else "Sales rate must be a number",
+                      self.admin_post("/admin/add", {"t": "rates", "client_id": "1", "role_id": "4", "sales_rate": "abc", "effective_from": "2026-11-05"}))
+        self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft", "h_1_4_2026-11-06": "8", "reason": ""})
+        self.assertEqual(self.one("select rt.sales_rate from time_entry t join rate rt on rt.rate_id=t.rate_id "
+                                  "where t.user_id=5 and t.work_date='2026-11-06'")[0], 100)
+        self.assertEqual(self.one("select rt.sales_rate from time_entry t join rate rt on rt.rate_id=t.rate_id "
+                                  "where t.user_id=5 and t.work_date='2026-11-02'")[0], 95)
+
+    def test_add_scope_with_approver_and_change_approver(self):
+        self.assertIn("Scope added", self.admin_post("/admin/add", {"t": "scopes", "scope_code": "BB0003", "project_id": "1",
+                                                                  "description": "New Study", "status": "Open", "approver_user_id": "8"}))
+        sid = self.one("select scope_id from scope where scope_code='BB0003'")[0]
+        self.assertEqual(self.one("select count(*) from phase where scope_id=? and name='General'", sid)[0], 1)
+        self.assertEqual(self.one("select approver_user_id from scope where scope_id=?", sid)[0], 8)
+        self.assertIn("Saved", self.admin_post("/admin/save", {"t": "scopes", "id": str(sid), "description": "New Study", "status": "Closed", "approver_user_id": "6"}))
+        self.assertEqual(tuple(self.one("select status, approver_user_id from scope where scope_id=?", sid)), ("Closed", 6))
+
+    def test_deactivated_role_is_hidden_from_new_timesheet_rows(self):
+        self.admin_post("/admin/save", {"t": "roles", "id": "2", "skill_code": "EM-01", "name": "Engineering Manager", "active": "0"})
+        page = self.get("/timesheet?u=5&w=2026-11-02")
+        self.assertNotIn("EM-01 Engineering Manager", page)
+        self.assertIn("PL-02 Lead Planner", page)
+
+
+
+    # ---------- Paul's demo feedback ----------
+    def queue_ids(self, approver):
+        con = app.db()
+        try:
+            where = "" if approver == 7 else "and s.approver_user_id=%d" % approver
+            return [r[0] for r in con.execute("select t.entry_id from time_entry t join scope s on s.scope_id=t.scope_id "
+                                              "where t.status='Submitted' %s" % where)]
+        finally:
+            con.close()
+
+    def test_bulk_approve_selected_and_untick_one(self):
+        ids = self.queue_ids(6)
+        self.assertGreaterEqual(len(ids), 2)
+        page = self.get("/approvals?u=6")
+        self.assertIn("Select all", page)
+        self.assertIn("Approve selected", page)
+        keep = ids[0]                                           # "untick" one: leave it out of the post
+        page = self.post("/approvals/act", {"u": "6", "entry_id": [str(i) for i in ids[1:]], "action": "Approve selected"})
+        self.assertIn("%d entries approved" % (len(ids) - 1), page)
+        self.assertEqual(self.one("select status from time_entry where entry_id=?", keep)[0], "Submitted")
+        self.assertEqual(self.one("select count(*) from time_entry where entry_id in (%s) and status='Approved'"
+                                  % ",".join(str(i) for i in ids[1:]))[0], len(ids) - 1)
+
+    def test_bulk_reject_needs_reason_and_ticks(self):
+        ids = self.queue_ids(6)
+        self.assertIn("Tick at least one", self.post("/approvals/act", {"u": "6", "action": "Reject selected", "reason": "x"}))
+        self.assertIn("Give a reason", self.post("/approvals/act", {"u": "6", "entry_id": [str(ids[0])], "action": "Reject selected", "reason": ""}))
+        self.assertIn("sent back to draft", self.post("/approvals/act", {"u": "6", "entry_id": [str(i) for i in ids], "action": "Reject selected", "reason": "Wrong scope"}))
+        self.assertEqual(self.one("select status, reject_reason from time_entry where entry_id=?", ids[0])[:], ("Draft", "Wrong scope"))
+
+    def test_bulk_approve_reports_wrong_approver_without_stopping(self):
+        ids = self.queue_ids(6)
+        page = self.post("/approvals/act", {"u": "1", "entry_id": [str(i) for i in ids], "action": "Approve selected"})
+        self.assertIn("scope approver or an admin", page)
+
+    def test_timesheet_shows_total_for_all_statuses(self):
+        page = self.get("/timesheet?u=5&w=2026-11-02")
+        self.assertIn("all statuses", page)
+        self.assertRegex(page, r"Approved [\d.]+, Edited [\d.]+, Submitted [\d.]+, Draft [\d.]+")
+
+    def test_report_subtotals_sit_in_the_columns(self):
+        page = self.get("/reports?u=5")
+        self.assertIn("Grand total", page)
+        self.assertIn("Actual booked hrs", page)
+        self.assertIn("Subtotal week commencing 2026-11-02", page)
+        # period total for the full range equals the CTR grand total
+        con = app.db()
+        try:
+            ctr = con.execute("select sum(total) from v_ctr").fetchone()[0]
+            per = con.execute("select sum(total) from v_period_report").fetchone()[0]
+        finally:
+            con.close()
+        self.assertAlmostEqual(ctr, per, places=2)
+        self.assertIn("%.2f" % per, page)
+        self.assertIn("<b>%.2f</b>" % ctr, page.split("Grand total")[1])
+
+    def test_reports_tree_goes_client_project_scope_phase_skill_person_entry(self):
+        page = self.get("/reports?u=5")
+        for kind in ["Client", "Project", "Scope", "Phase", "Skill code", "Person", "Entry"]:
+            self.assertIn("<td>%s</td>" % kind, page)
+        for name in ["Wellbay Decommissioning", "BB0001 Wellbay Clearance", "Execute", "Ewan Mackay", "2026-11-03", "Morecambe Hub"]:
+            self.assertIn(name, page)
+        self.assertIn("Show to entries", page)
+
+    def test_reports_tree_rolls_up_to_the_ctr_figures(self):
+        con = app.db()
+        try:
+            rows, g_h, g_t, g_p = app.ctr_tree_rows(con)
+            self.assertAlmostEqual(g_t, con.execute("select sum(total) from v_ctr").fetchone()[0], places=2)
+            self.assertAlmostEqual(g_h, con.execute("select sum(hours) from v_ctr").fetchone()[0], places=2)
+            self.assertAlmostEqual(g_p, con.execute("select sum(pending_hours) from v_ctr").fetchone()[0], places=2)
+        finally:
+            con.close()
+
+    def test_timesheet_shows_project_and_phase_and_can_book_to_another_phase(self):
+        page = self.get("/timesheet?u=9&w=2026-11-02")
+        self.assertIn("<th>Project</th>", page)
+        self.assertIn("<th>Phase</th>", page)
+        self.assertIn("Apache &gt; Wellbay Decommissioning &gt; BB0001 Wellbay Clearance &gt; Execute", page)
+        # phase 2 = BB0001 Execute (Gregor has an approved Execute entry on 3 Nov), role 3 = Project Engineer
+        self.assertIn("h_2_3_2026-11-03", page)
+        self.assertIn("1 entry saved", self.post("/timesheet/save", {"u": "9", "w": "2026-11-02", "action": "Save draft",
+                                                                    "h_2_3_2026-11-06": "4", "reason": ""}))
+        self.assertEqual(self.one("select phase_id from time_entry where user_id=9 and work_date='2026-11-06'")[0], 2)
+
+    def test_closed_phase_is_not_offered_and_blocks_booking(self):
+        self.admin_post("/admin/save", {"t": "phases", "id": "2", "name": "Execute", "status": "Closed"})
+        page = self.get("/timesheet?u=9&w=2026-11-02")
+        self.assertNotIn("&gt; Execute</option>", page)
+        self.assertIn("Phase is not Open", self.post("/timesheet/save", {"u": "9", "w": "2026-11-02", "action": "Save draft",
+                                                                        "h_2_3_2026-11-06": "4", "reason": ""}))
+
+    def test_approvals_page_shows_project_and_phase(self):
+        page = self.get("/approvals?u=6")
+        self.assertIn("<th>Project</th>", page)
+        self.assertIn("<th>Phase</th>", page)
+
+    def test_admin_add_project_scope_and_phase(self):
+        self.assertIn("Project added", self.admin_post("/admin/add", {"t": "projects", "client_id": "1", "project_code": "APJ-03", "name": "Jetty Removal"}))
+        pid = self.one("select project_id from project where project_code='APJ-03'")[0]
+        self.assertIn("General phase", self.admin_post("/admin/add", {"t": "scopes", "project_id": str(pid), "scope_code": "BB0009",
+                                                                     "description": "Jetty", "status": "Open", "approver_user_id": "6"}))
+        self.assertEqual(self.one("select client_id from scope where scope_code='BB0009'")[0], 1)
+        sid = self.one("select scope_id from scope where scope_code='BB0009'")[0]
+        self.assertIn("Phase added", self.admin_post("/admin/add", {"t": "phases", "scope_id": str(sid), "name": "Execute"}))
+        self.assertEqual(self.one("select count(*) from phase where scope_id=?", sid)[0], 2)
+        self.assertIn("already exists", self.admin_post("/admin/add", {"t": "phases", "scope_id": str(sid), "name": "Execute"}))
+        self.assertIn("Saved", self.admin_post("/admin/save", {"t": "projects", "id": str(pid), "name": "Jetty Removal", "status": "Closed"}))
+
+    def test_internal_paaf_authorise_needs_no_client_form(self):
+        self.admin_post("/admin/add", {"t": "users", "nmc_id": "A012", "name": "Internal Person", "employment_type": "Staff", "role_id": "6",
+                                       "permission": "user", "start_date": "2026-11-01", "end_date": ""})
+        uid = self.one("select user_id from app_user where nmc_id='A012'")[0]
+        self.admin_post("/admin/add", {"t": "paafs", "user_id": str(uid), "client_id": "1"})
+        pid = self.one("select paaf_id from paaf where user_id=?", uid)[0]
+        self.assertIn("authorised internally", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Authorise internally"}))
+        book = {"u": str(uid), "w": "2026-11-02", "action": "Save draft", "h_1_6_2026-11-06": "4", "reason": ""}
+        self.assertIn("1 entry saved", self.post("/timesheet/save", book))
+
+
 if __name__ == "__main__":
     unittest.main()

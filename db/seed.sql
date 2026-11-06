@@ -41,53 +41,64 @@ INSERT INTO paaf (paaf_id, user_id, client_id, rate_id, status, sent_date, decid
  (9, 9, 2, 9, 'Approved','2026-02-02','2026-02-11','paaf/spirit/A009_Gregor_Munro.pdf'),
  (10,10,2, 10,'Approved','2026-02-02','2026-02-11','paaf/spirit/A010_Catriona_Duff.pdf');
 
-INSERT INTO scope (scope_id, scope_code, client_id, description, status, approver_user_id) VALUES
- (1,'BB0001',1,'Wellbay Clearance','Open',    6),
- (2,'BB0002',1,'Platform Study',   'Open',    7),
- (3,'FB0001',1,'EDC Engineering',  'Closed',  7),
- (4,'A1400', 2,'Rivers and Calder','Pipeline',8),
- (5,'A1500', 2,'PGC & NRU',        'Open',    8),
- (6,'A1600', 2,'Pipeline Removal', 'Open',    7);
+INSERT INTO project (project_id, project_code, name, client_id) VALUES
+ (1,'APJ-01','Wellbay Decommissioning',1),
+ (2,'APJ-02','Platform Decommissioning',1),
+ (3,'SPJ-01','Morecambe Hub',2);
+
+INSERT INTO scope (scope_id, scope_code, client_id, project_id, description, status, approver_user_id) VALUES
+ (1,'BB0001',1,1,'Wellbay Clearance','Open',    6),
+ (2,'BB0002',1,2,'Platform Study',   'Open',    7),
+ (3,'FB0001',1,2,'EDC Engineering',  'Closed',  7),
+ (4,'A1400', 2,3,'Rivers and Calder','Pipeline',8),
+ (5,'A1500', 2,3,'PGC & NRU',        'Open',    8),
+ (6,'A1600', 2,3,'Pipeline Removal', 'Open',    7);
+
+-- Phases. Hours are booked to a phase. Every scope has at least one.
+INSERT INTO phase (phase_id, scope_id, name) VALUES
+ (1,1,'Define'),(2,1,'Execute'),(3,2,'Define'),(4,3,'Define'),(5,4,'Define'),(6,5,'Define'),(7,6,'Define');
 
 -- Weekly periods: week of 26 Oct (to be closed later) and week of 2 Nov.
 INSERT INTO period (week_start) VALUES ('2026-10-26'),('2026-11-02');
 
--- Time entries. Columns: user, scope, paaf, worked role, rate, date, hours, created_by.
-INSERT INTO time_entry (user_id, scope_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by) VALUES
+-- Time entries. Columns: user, scope, phase, paaf, worked role, rate, date, hours, created_by.
+INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by) VALUES
  -- Week of 26 Oct
- (5,1,1,4,4,  '2026-10-26',8,5),
- (5,1,1,4,4,  '2026-10-27',8,5),
- (3,1,2,5,5,  '2026-10-28',8,3),
- (1,5,5,6,12, '2026-10-28',8,1),
- (9,2,8,3,3,  '2026-10-29',8,9),
- (10,5,10,4,10,'2026-10-27',8,10),
+ (5,1,1,1,4,4,  '2026-10-26',8,5),
+ (5,1,1,1,4,4,  '2026-10-27',8,5),
+ (3,1,1,2,5,5,  '2026-10-28',8,3),
+ (1,5,6,5,6,12, '2026-10-28',8,1),
+ (9,2,3,8,3,3,  '2026-10-29',8,9),
+ (10,5,6,10,4,10,'2026-10-27',8,10),
  -- Week of 2 Nov. Ewan Mackay (Senior Planner): own role Mon-Tue, covering Lead Planner Wed-Thu
- (5,1,1,4,4, '2026-11-02',8,5),
- (5,1,1,4,4, '2026-11-03',8,5),
- (5,1,1,5,5, '2026-11-04',8,5),
- (5,1,1,5,5, '2026-11-05',8,5),
+ (5,1,1,1,4,4, '2026-11-02',8,5),
+ (5,1,1,1,4,4, '2026-11-03',8,5),
+ (5,1,1,1,5,5, '2026-11-04',8,5),
+ (5,1,1,1,5,5, '2026-11-05',8,5),
  -- Morag Sinclair (Lead Planner): two Apache scopes in one day, then Spirit
- (3,1,2,5,5, '2026-11-02',6,3),
- (3,2,2,5,5, '2026-11-02',2,3),
- (3,5,6,5,11,'2026-11-03',8,3),
- (3,5,6,5,11,'2026-11-04',8,3),
- (3,2,2,5,5, '2026-11-05',4,3),
- (3,6,6,5,11,'2026-11-05',4,3),
+ (3,1,1,2,5,5, '2026-11-02',6,3),
+ (3,2,3,2,5,5, '2026-11-02',2,3),
+ (3,5,6,6,5,11,'2026-11-03',8,3),
+ (3,5,6,6,5,11,'2026-11-04',8,3),
+ (3,2,3,2,5,5, '2026-11-05',4,3),
+ (3,6,7,6,5,11,'2026-11-05',4,3),
  -- Isla Fraser (Cost Engineer): Apache and Spirit
- (1,1,3,6,6, '2026-11-02',4,1),
- (1,5,5,6,12,'2026-11-02',4,1),
- (1,6,5,6,12,'2026-11-03',8,1),
- (1,2,3,6,6, '2026-11-04',8,1),
- (1,1,3,6,6, '2026-11-05',8,1),
+ (1,1,1,3,6,6, '2026-11-02',4,1),
+ (1,5,6,5,6,12,'2026-11-02',4,1),
+ (1,6,7,5,6,12,'2026-11-03',8,1),
+ (1,2,3,3,6,6, '2026-11-04',8,1),
+ (1,1,1,3,6,6, '2026-11-05',8,1),
  -- Gregor Munro (Project Engineer): Apache and Spirit
- (9,1,8,3,3, '2026-11-02',8,9),
- (9,5,9,3,9, '2026-11-03',8,9),
- (9,2,8,3,3, '2026-11-04',8,9),
- (9,6,9,3,9, '2026-11-05',8,9),
+ (9,1,1,8,3,3, '2026-11-02',8,9),
+ (9,5,6,9,3,9, '2026-11-03',8,9),
+ (9,2,3,8,3,3, '2026-11-04',8,9),
+ (9,6,7,9,3,9, '2026-11-05',8,9),
  -- Catriona Duff (Senior Planner): Spirit, covering Lead Planner on Wednesday
- (10,5,10,4,10,'2026-11-02',8,10),
- (10,5,10,4,10,'2026-11-03',8,10),
- (10,6,10,5,11,'2026-11-04',8,10);
+ (10,5,6,10,4,10,'2026-11-02',8,10),
+ (10,5,6,10,4,10,'2026-11-03',8,10),
+ (10,6,7,10,5,11,'2026-11-04',8,10),
+ -- Execute phase of BB0001: Gregor Munro (Project Engineer)
+ (9,1,2,8,3,3,'2026-11-03',8,9);
 
 -- Approvals are edits, so they name who did it (and are written to time_entry_audit).
 -- Week of 26 Oct: approved by each scope's approver.
