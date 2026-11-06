@@ -91,11 +91,11 @@ CREATE TABLE time_entry (
     last_edited_at TEXT
 );
 
--- Audit event for every create, edit and status change.
+-- Audit event for every create, edit, status change and deletion of a Draft.
 CREATE TABLE time_entry_audit (
     audit_id    INTEGER PRIMARY KEY,
     entry_id    INTEGER NOT NULL,
-    action      TEXT NOT NULL CHECK (action IN ('CREATE','UPDATE','STATUS')),
+    action      TEXT NOT NULL CHECK (action IN ('CREATE','UPDATE','STATUS','DELETE')),
     changed_by  INTEGER REFERENCES app_user(user_id),
     changed_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     reason      TEXT,
@@ -186,11 +186,24 @@ BEGIN
         OLD.scope_id, OLD.worked_role_id, OLD.rate_id, OLD.work_date);
 END;
 
--- Deletes are blocked; send back to Draft instead.
-CREATE TRIGGER trg_time_entry_no_delete
+-- Only Draft entries can be deleted ("clear draft"), and the deleter must be named first
+-- (set last_edited_by / last_edited_at, then delete). The deletion is audited.
+CREATE TRIGGER trg_time_entry_delete_rules
 BEFORE DELETE ON time_entry
 BEGIN
-    SELECT RAISE(ABORT, 'Time entries cannot be deleted');
+    SELECT RAISE(ABORT, 'Only Draft entries can be deleted')
+    WHERE OLD.status <> 'Draft';
+    SELECT RAISE(ABORT, 'Deleting an entry must name the user (set last_edited_by and last_edited_at first)')
+    WHERE OLD.last_edited_by IS NULL OR OLD.last_edited_at IS NULL;
+END;
+
+CREATE TRIGGER trg_time_entry_audit_delete
+AFTER DELETE ON time_entry
+BEGIN
+    INSERT INTO time_entry_audit(entry_id, action, changed_by, changed_at, reason,
+        old_status, old_hours, old_scope_id, old_worked_role_id, old_rate_id, old_work_date)
+    VALUES (OLD.entry_id, 'DELETE', OLD.last_edited_by, OLD.last_edited_at, 'Draft cleared',
+        OLD.status, OLD.hours, OLD.scope_id, OLD.worked_role_id, OLD.rate_id, OLD.work_date);
 END;
 
 -- CTR (Cost Time Resource): per scope, one line per role: hours x sales rate = total.

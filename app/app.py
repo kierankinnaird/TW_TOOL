@@ -182,7 +182,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
         "".join('<td align="center"><b>%s</b></td>' % fmt(day_tot[d.isoformat()]) for d in days), fmt(sum(day_tot.values())))
     b.append('<table border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s%s</table>' % (
         "".join("<th>%s</th>" % esc(h) for h in head), "".join(trs), foot))
-    b.append("<p><small>D = draft, S = submitted (locked), A = approved, E = edited, waiting for re-approval.</small></p>")
+    b.append("<p><small>D = draft, S = submitted (locked), A = approved, E = edited, waiting for re-approval. To clear a draft entry, empty its box and click Save draft.</small></p>")
     b.append('<p>Reason for changing approved hours (needed if you change a figure marked A or E): '
              '<input type="text" name="reason" size="60"></p>')
     b.append('<p><input type="submit" name="action" value="Save draft"> '
@@ -212,7 +212,7 @@ def save_timesheet(con, form):
     action = form.get("action", ["Save draft"])[0]
     reason = form.get("reason", [""])[0].strip()
     adds = parse_adds(form.get("add", []))
-    msgs, saved = [], 0
+    msgs, saved, cleared = [], 0, 0
     d0, d6 = w.isoformat(), (w + datetime.timedelta(days=6)).isoformat()
     for key, vals in form.items():
         if not key.startswith("h_"):
@@ -224,8 +224,16 @@ def save_timesheet(con, form):
         existing = con.execute("select * from time_entry where user_id=? and scope_id=? and worked_role_id=? and work_date=?",
                                (u, sid, rid, date)).fetchone()
         if raw == "":
-            if existing:
-                msgs.append("%s: cannot clear a saved entry yet (not supported in this version)." % label)
+            if existing and existing["status"] == "Draft":
+                try:
+                    con.execute("update time_entry set last_edited_by=?, last_edited_at=? where entry_id=?",
+                                (u, stamp(), existing["entry_id"]))
+                    con.execute("delete from time_entry where entry_id=?", (existing["entry_id"],))
+                    cleared += 1
+                except sqlite3.DatabaseError as e:
+                    msgs.append("%s: %s" % (label, e))
+            elif existing and existing["status"] != "Submitted":
+                msgs.append("%s: approved hours cannot be cleared. Change the hours (with a reason) or ask an admin." % label)
             continue
         try:
             hours = float(raw)
@@ -266,6 +274,8 @@ def save_timesheet(con, form):
     ok_msgs = []
     if saved:
         ok_msgs.append("%d entr%s saved." % (saved, "y" if saved == 1 else "ies"))
+    if cleared:
+        ok_msgs.append("%d draft entr%s cleared." % (cleared, "y" if cleared == 1 else "ies"))
     if action == "Submit week":
         try:
             n = con.execute("update time_entry set status='Submitted', last_edited_by=?, last_edited_at=? "

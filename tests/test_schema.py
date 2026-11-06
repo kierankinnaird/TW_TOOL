@@ -157,8 +157,28 @@ class TestLifecycle(Base):
         self.blocked("UPDATE time_entry SET status='Approved', approved_by=5, last_edited_by=5, last_edited_at='t1' "
                      "WHERE entry_id=?", (eid,), "not their own")
 
-    def test_entries_cannot_be_deleted(self):
-        self.blocked("DELETE FROM time_entry", msg="cannot be deleted")
+    def test_only_draft_entries_can_be_deleted(self):
+        self.blocked("DELETE FROM time_entry WHERE status='Approved'", msg="Only Draft entries")
+        self.blocked("DELETE FROM time_entry WHERE status='Submitted'", msg="Only Draft entries")
+        self.blocked("DELETE FROM time_entry", msg="Only Draft entries")
+
+    def test_draft_delete_must_name_the_user_and_is_audited(self):
+        self.con.execute("INSERT INTO time_entry (user_id, scope_id, paaf_id, worked_role_id, rate_id, work_date, hours, "
+                         "status, created_by) VALUES (5,1,1,4,4,'2026-11-06',8,'Draft',5)")  # new Draft, no editor yet
+        eid = self.scalar("select max(entry_id) from time_entry")
+        self.blocked("DELETE FROM time_entry WHERE entry_id=?", (eid,), "must name the user")
+        self.con.execute("UPDATE time_entry SET last_edited_by=5, last_edited_at='t9' WHERE entry_id=?", (eid,))
+        self.con.execute("DELETE FROM time_entry WHERE entry_id=?", (eid,))
+        self.assertEqual(self.scalar("select count(*) from time_entry where entry_id=?", eid), 0)
+        row = self.con.execute("select action, changed_by, old_status, old_hours from time_entry_audit "
+                               "where entry_id=? order by audit_id desc limit 1", (eid,)).fetchone()
+        self.assertEqual(tuple(row), ("DELETE", 5, "Draft", 8))
+
+    def test_rejected_entry_back_in_draft_can_be_cleared(self):
+        eid = self.scalar("select entry_id from time_entry where status='Draft' limit 1")  # Catriona's rejected entry
+        self.con.execute("UPDATE time_entry SET last_edited_by=10, last_edited_at='t9' WHERE entry_id=?", (eid,))
+        self.con.execute("DELETE FROM time_entry WHERE entry_id=?", (eid,))
+        self.assertEqual(self.scalar("select count(*) from time_entry"), 27)
 
     def test_every_status_change_is_audited(self):
         n_status = self.scalar("select count(*) from time_entry_audit where action='STATUS'")

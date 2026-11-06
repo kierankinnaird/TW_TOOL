@@ -95,6 +95,21 @@ class TestApp(unittest.TestCase):
                                              "h_1_4_2026-11-06": "8", "reason": ""})
         self.assertIn("No approved PAAF for this user and client", page)
 
+    def test_clear_draft_entry_but_not_approved_or_submitted(self):
+        self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft",
+                                      "h_1_4_2026-11-06": "7", "reason": ""})
+        page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft",
+                                             "h_1_4_2026-11-06": "", "reason": ""})
+        self.assertIn("1 draft entry cleared", page)
+        con = app.db()
+        self.assertEqual(con.execute("select count(*) from time_entry where user_id=5 and work_date='2026-11-06'").fetchone()[0], 0)
+        self.assertEqual(con.execute("select count(*) from time_entry_audit where action='DELETE'").fetchone()[0], 1)
+        con.close()
+        # approved entry (Ewan, Tue 3 Nov) cannot be cleared
+        page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft",
+                                             "h_1_4_2026-11-03": "", "reason": ""})
+        self.assertIn("approved hours cannot be cleared", page)
+
     def test_admin_only_pages_and_period_actions(self):
         self.assertIn("Admin only", self.get("/admin?u=5"))
         page = self.post("/admin/period", {"u": "7", "action": "open", "week_start": "2026-11-09"})
