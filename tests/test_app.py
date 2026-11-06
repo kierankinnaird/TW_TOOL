@@ -1,3 +1,4 @@
+import sqlite3
 """Front-end smoke tests. Run from the repo root: python -m unittest discover -s tests -v"""
 import os
 import sys
@@ -355,6 +356,27 @@ class TestApp(unittest.TestCase):
         self.assertIn("authorised internally", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Authorise internally"}))
         book = {"u": str(uid), "w": "2026-11-02", "action": "Save draft", "h_1_6_2026-11-06": "4", "reason": ""}
         self.assertIn("1 entry saved", self.post("/timesheet/save", book))
+
+    def test_ctr_page(self):
+        con = sqlite3.connect(app.DB_PATH)
+        con.row_factory = sqlite3.Row
+        ph = con.execute("select phase_id from phase where name='Define' and scope_id=(select scope_id from scope where scope_code='BB0001')").fetchone()[0]
+        fams = [r[0] for r in con.execute("select distinct r.family from time_entry t join rate rt on rt.rate_id=t.rate_id join role r on r.role_id=rt.role_id "
+                                          "where t.phase_id=? and t.status<>'Draft'", (ph,))]
+        v = con.execute("select coalesce(sum(hours),0), coalesce(sum(total),0) from v_ctr where phase_id=?", (ph,)).fetchone()
+        con.close()
+        self.assertTrue(fams)
+        page = self.get("/ctr?u=1&phase=%d" % ph)
+        self.assertIn("CTR summary", page)
+        self.assertIn("%.2f" % v[1], page)
+        for f in fams:
+            self.assertIn(f, page)
+            tab = self.get("/ctr?u=1&phase=%d&family=%s" % (ph, f.replace(" ", "%20")))
+            self.assertIn("Resources", tab)
+            self.assertIn("Timesheet entries", tab)
+        self.assertIn("Open CTR", self.get("/reports?u=1"))
+        self.assertIn("CTR not found", self.get("/ctr?u=1&phase=9999"))
+        self.assertIn("CTR summary", self.get("/ctr?u=1&phase=%d&family=Nonsense" % ph))
 
 
 if __name__ == "__main__":

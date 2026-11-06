@@ -10,7 +10,7 @@ import os
 import sqlite3
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
@@ -400,7 +400,7 @@ window.onload=function(){openTo(3);};
 </script>"""
 
 
-def ctr_tree_rows(con):
+def ctr_tree_rows(con, u=None):
     """Client > Project > Scope > Phase > Skill code > Person > Entry. Hours/Total are approved only; Pending = Submitted + Edited."""
     ents = con.execute(
         "select c.name as client, pr.project_code, pr.name as project, s.scope_code, s.description, ph.phase_id, ph.name as phase, "
@@ -436,7 +436,9 @@ def ctr_tree_rows(con):
         path = [node(root, e["client"], e["client"], "Client")]
         path.append(node(path[-1]["kids"], e["project"], e["project"], "Project"))
         path.append(node(path[-1]["kids"], e["scope_code"], "%s %s" % (e["scope_code"], e["description"]), "Scope"))
-        path.append(node(path[-1]["kids"], e["phase_id"], e["phase"], "Phase"))
+        ph = node(path[-1]["kids"], e["phase_id"], e["phase"], "Phase")
+        ph["phase_id"] = e["phase_id"]
+        path.append(ph)
         sk = node(path[-1]["kids"], e["rate_id"], "%s %s" % (e["skill_code"], e["role"]), "Skill code")
         sk["skill"], sk["rate"] = e["skill_code"], e["sales_rate"]
         path.append(sk)
@@ -453,7 +455,12 @@ def ctr_tree_rows(con):
         c = node(root, e["client"], e["client"], "Client")
         p = node(c["kids"], e["project"], e["project"], "Project")
         s = node(p["kids"], e["scope_code"], "%s %s" % (e["scope_code"], e["description"]), "Scope")
-        node(s["kids"], e["phase_id"], e["phase"], "Phase")
+        node(s["kids"], e["phase_id"], e["phase"], "Phase")["phase_id"] = e["phase_id"]
+
+    def label_html(n):
+        if n.get("phase_id") and u is not None:
+            return '%s &nbsp;<a href="/ctr?u=%d&amp;phase=%d">Open CTR</a>' % (esc(n["label"]), u, n["phase_id"])
+        return esc(n["label"])
 
     out, counter = [], [0]
     levels = ["Client", "Project", "Scope", "Phase", "Skill code", "Person", "Entry"]
@@ -470,7 +477,7 @@ def ctr_tree_rows(con):
             '<tr data-id="%s" data-parent="%s" data-level="%d" data-kids="%d" data-open="1">'
             '<td>%s</td><td style="padding-left:%dpx"><%s>%s%s</%s></td><td>%s</td><td align="right">%s</td>'
             '<td align="right"><%s>%s</%s></td><td align="right"><%s>%.2f</%s></td><td align="right"><%s>%s</%s></td><td>%s</td></tr>' % (
-                rid, parent, level, 1 if kids else 0, n["kind"], pad, weight, tg, esc(n["label"]), weight, esc(n["skill"]),
+                rid, parent, level, 1 if kids else 0, n["kind"], pad, weight, tg, label_html(n), weight, esc(n["skill"]),
                 ("%.2f" % n["rate"]) if n["rate"] is not None else "",
                 weight, fmt(n["h"]), weight, weight, n["t"], weight, weight, fmt(n["p"]), weight, esc(status)))
         for k in kids:
@@ -490,7 +497,7 @@ def view_reports(con, u, q):
     per = con.execute("select week_start, client, project, scope_code, phase, skill_code, role, hours, total from v_period_report "
                       "where week_start between ? and ? order by week_start, client, project, scope_code, phase, skill_code",
                       (d_from, d_to)).fetchall()
-    tree_rows, g_h, g_t, g_p = ctr_tree_rows(con)
+    tree_rows, g_h, g_t, g_p = ctr_tree_rows(con, u)
     head = ("<tr><th>Level</th><th>Name</th><th>Skill code</th><th>Sales rate</th><th>Actual booked hrs</th>"
             "<th>Total</th><th>Pending hrs</th><th>Status</th></tr>")
     foot = sub_row(["", "Grand total", "", "", fmt(g_h), "%.2f" % g_t, fmt(g_p), ""], right_from=4)
@@ -527,6 +534,99 @@ def view_reports(con, u, q):
          '<input type="submit" value="Show"></form>' % (u, esc(d_from), esc(d_to)),
          '<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(t2)]
     return layout(con, u, "Reports", "".join(b))
+
+
+def view_ctr(con, u, q):
+    """One CTR (a phase): a Summary tab plus one tab per job family, like the tabs in the CTR workbook."""
+    try:
+        pid = int(q.get("phase", ["0"])[0])
+    except ValueError:
+        pid = 0
+    ph = con.execute("select ph.phase_id, ph.name as phase, ph.status as phase_status, s.scope_code, s.description, s.status as scope_status, "
+                     "pr.project_code, pr.name as project, c.name as client, a.name as approver "
+                     "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
+                     "join client c on c.client_id=s.client_id join app_user a on a.user_id=s.approver_user_id "
+                     "where ph.phase_id=?", (pid,)).fetchone()
+    if not ph:
+        return layout(con, u, "CTR", "<p>CTR not found. Open one from the <a href=\"/reports?u=%d\">Reports</a> page.</p>" % u)
+    ents = con.execute(
+        "select t.entry_id, t.work_date, t.hours, t.status, t.approved_at, r.family, r.skill_code, r.name as title, rt.sales_rate, "
+        "u.name as person, ap.name as approved_by "
+        "from time_entry t join rate rt on rt.rate_id=t.rate_id join role r on r.role_id=rt.role_id "
+        "join app_user u on u.user_id=t.user_id left join app_user ap on ap.user_id=t.approved_by "
+        "where t.phase_id=? and t.status<>'Draft' order by r.family, r.skill_code, u.name, t.work_date", (pid,)).fetchall()
+
+    def tot(rows):
+        h = sum(e["hours"] for e in rows if e["status"] == "Approved")
+        t = sum(e["hours"] * e["sales_rate"] for e in rows if e["status"] == "Approved")
+        p = sum(e["hours"] for e in rows if e["status"] != "Approved")
+        return h, t, p
+
+    families = sorted({e["family"] for e in ents})
+    fam = q.get("family", ["Summary"])[0]
+    if fam != "Summary" and fam not in families:
+        fam = "Summary"
+    base = "/ctr?u=%d&amp;phase=%d" % (u, pid)
+    tabs = ['<b>[Summary]</b>' if fam == "Summary" else '<a href="%s&amp;family=Summary">Summary</a>' % base]
+    for f in families:
+        tabs.append("<b>[%s]</b>" % esc(f) if f == fam else '<a href="%s&amp;family=%s">%s</a>' % (base, quote(f), esc(f)))
+
+    head = ('<p><a href="/reports?u=%d">&lt;&lt; Back to Reports</a></p>'
+            "<table border=\"0\" cellpadding=\"2\"><tr><td>Client</td><td><b>%s</b></td></tr><tr><td>Project</td><td><b>%s %s</b></td></tr>"
+            "<tr><td>Scope</td><td><b>%s %s</b> (%s)</td></tr><tr><td>Phase</td><td><b>%s</b> (%s)</td></tr>"
+            "<tr><td>Approver</td><td>%s</td></tr></table>" % (
+                u, esc(ph["client"]), esc(ph["project_code"]), esc(ph["project"]), esc(ph["scope_code"]), esc(ph["description"]),
+                esc(ph["scope_status"]), esc(ph["phase"]), esc(ph["phase_status"]), esc(ph["approver"])))
+    b = [head, "<p>CTR tabs: %s</p>" % " | ".join(tabs)]
+    if not ents:
+        b.append("<p>No hours have been submitted to this phase yet.</p>")
+        return layout(con, u, "CTR", "".join(b))
+
+    if fam == "Summary":
+        b.append("<h4>CTR summary - %s %s, %s</h4><p><small>Actual booked hrs are approved hours. Pending hrs are submitted or edited hours waiting for approval. "
+                 "Click a job family tab for its resources, people and timesheet entries.</small></p>" % (esc(ph["scope_code"]), esc(ph["description"]), esc(ph["phase"])))
+        rows = []
+        for f in families:
+            h, t, p = tot([e for e in ents if e["family"] == f])
+            rows.append("<tr><td><a href=\"%s&amp;family=%s\">%s</a></td><td align=\"right\">%s</td><td align=\"right\">%.2f</td><td align=\"right\">%s</td></tr>"
+                        % (base, quote(f), esc(f), fmt(h), t, fmt(p)))
+        h, t, p = tot(ents)
+        rows.append(sub_row(["Total", fmt(h), "%.2f" % t, fmt(p)], right_from=1))
+        b.append('<table border="1" cellpadding="3" cellspacing="0"><tr><th>Job family</th><th>Actual booked hrs</th><th>Total</th><th>Pending hrs</th></tr>%s</table>' % "".join(rows))
+    else:
+        fe = [e for e in ents if e["family"] == fam]
+        b.append("<h4>%s</h4>" % esc(fam))
+        # resources: one line per job title
+        rows = []
+        for key in dict.fromkeys((e["skill_code"], e["title"], e["sales_rate"]) for e in fe):
+            part = [e for e in fe if (e["skill_code"], e["title"], e["sales_rate"]) == key]
+            h, t, p = tot(part)
+            rows.append("<tr><td>%s</td><td>%s</td><td align=\"right\">%.2f</td><td align=\"right\">%s</td><td align=\"right\">%.2f</td><td align=\"right\">%s</td></tr>"
+                        % (esc(key[0]), esc(key[1]), key[2], fmt(h), t, fmt(p)))
+        h, t, p = tot(fe)
+        rows.append(sub_row(["", "Sub-total", "", fmt(h), "%.2f" % t, fmt(p)], right_from=3))
+        b.append('<p><b>Resources</b></p><table border="1" cellpadding="3" cellspacing="0"><tr><th>Skill code</th><th>Job title</th><th>Sales rate</th>'
+                 '<th>Actual booked hrs</th><th>Total</th><th>Pending hrs</th></tr>%s</table>' % "".join(rows))
+        # people
+        rows = []
+        for key in dict.fromkeys((e["person"], e["skill_code"], e["title"], e["sales_rate"]) for e in fe):
+            part = [e for e in fe if (e["person"], e["skill_code"], e["title"], e["sales_rate"]) == key]
+            h, t, p = tot(part)
+            rows.append("<tr><td>%s</td><td>%s</td><td align=\"right\">%s</td><td align=\"right\">%.2f</td><td align=\"right\">%s</td></tr>"
+                        % (esc(key[0]), esc("%s %s" % (key[1], key[2])), fmt(h), t, fmt(p)))
+        rows.append(sub_row(["Sub-total", "", fmt(tot(fe)[0]), "%.2f" % tot(fe)[1], fmt(tot(fe)[2])], right_from=2))
+        b.append('<p><b>People</b></p><table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>Booked as</th><th>Actual booked hrs</th>'
+                 '<th>Total</th><th>Pending hrs</th></tr>%s</table>' % "".join(rows))
+        # entries
+        rows = []
+        for e in sorted(fe, key=lambda x: (x["work_date"], x["person"])):
+            rows.append("<tr><td>%s</td><td>%s</td><td>%s</td><td align=\"right\">%s</td><td align=\"right\">%.2f</td><td>%s</td><td>%s</td></tr>" % (
+                esc(e["work_date"]), esc(e["person"]), esc("%s %s" % (e["skill_code"], e["title"])), fmt(e["hours"]),
+                e["hours"] * e["sales_rate"], esc(e["status"]), esc(e["approved_by"] or "")))
+        b.append('<p><b>Timesheet entries</b> <small>(value = hours x sales rate; only Approved entries count towards the CTR)</small></p>'
+                 '<table border="1" cellpadding="3" cellspacing="0"><tr><th>Date</th><th>Person</th><th>Booked as</th><th>Hours</th><th>Value</th>'
+                 '<th>Status</th><th>Approved by</th></tr>%s</table>' % "".join(rows))
+    return layout(con, u, "CTR - %s %s - %s" % (ph["scope_code"], ph["description"], ph["phase"]), "".join(b))
 
 
 # ---------- Admin ----------
@@ -975,6 +1075,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html(view_approvals(con, u))
             elif url.path == "/reports":
                 self.send_html(view_reports(con, u, q))
+            elif url.path == "/ctr":
+                self.send_html(view_ctr(con, u, q))
             elif url.path == "/admin":
                 self.send_html(view_admin(con, u, q.get("t", ["periods"])[0]))
             elif url.path == "/admin/edit":

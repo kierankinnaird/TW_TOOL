@@ -54,3 +54,7 @@ SELECT * FROM v_period_report
 - Lifecycle: Draft, Submitted, Approved, Edited. Reject returns to Draft with a reason. Editing an approved entry sets Edited, needs a reason, and needs re-approval.
 - Approval is by the scope's approver or an admin, never the entry owner.
 - Every edit names its editor; every create, edit, status change and deletion is audited. Only Draft entries can be deleted (clear draft).
+
+## CTR page
+
+On the Reports tree, each Phase row has an "Open CTR" link to `/ctr?phase=<id>`. The CTR page shows the phase header (client, project, scope, phase, approver) and tabs like the CTR workbook: a Summary tab (one line per job family, Actual booked hrs / Total / Pending hrs) and one tab per job family with its resources (job title, skill code, sales rate), people and timesheet entries. Only Approved hours count towards Actual booked hrs and Total.
