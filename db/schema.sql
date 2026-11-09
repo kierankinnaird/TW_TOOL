@@ -10,9 +10,12 @@ CREATE TABLE role (
     active      INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1))
 );
 
+-- is_internal = 1 marks NMC's own "Internal" client: hours booked to its codes are paid by NMC, not billed to a client.
+-- They need no PAAF and have no rate, and are left out of the client CTR and period reports.
 CREATE TABLE client (
     client_id   INTEGER PRIMARY KEY,
-    name        TEXT NOT NULL UNIQUE
+    name        TEXT NOT NULL UNIQUE,
+    is_internal INTEGER NOT NULL DEFAULT 0 CHECK (is_internal IN (0,1))
 );
 
 -- Client rate card: one row per client + role + effective date.
@@ -92,7 +95,20 @@ BEGIN
     WHERE (SELECT client_id FROM project WHERE project_id = NEW.project_id) <> NEW.client_id;
 END;
 
+-- The internal client has no rate card and needs no PAAFs.
+CREATE TRIGGER trg_rate_not_internal BEFORE INSERT ON rate
+BEGIN
+    SELECT RAISE(ABORT, 'Internal codes have no rate card')
+    WHERE (SELECT is_internal FROM client WHERE client_id = NEW.client_id) = 1;
+END;
+CREATE TRIGGER trg_paaf_not_internal BEFORE INSERT ON paaf
+BEGIN
+    SELECT RAISE(ABORT, 'Internal codes do not need a PAAF')
+    WHERE (SELECT is_internal FROM client WHERE client_id = NEW.client_id) = 1;
+END;
+
 -- Weekly periods (Mon-Sun), identified by the Monday. An entry's week is derived from work_date.
+-- The app opens the current week automatically; admin can still open a missed week or close a week.
 CREATE TABLE period (
     week_start  TEXT PRIMARY KEY CHECK (strftime('%w', week_start) = '1'),
     status      TEXT NOT NULL DEFAULT 'Open' CHECK (status IN ('Open','Closed')),
@@ -107,9 +123,9 @@ CREATE TABLE time_entry (
     user_id     INTEGER NOT NULL REFERENCES app_user(user_id),
     scope_id    INTEGER NOT NULL REFERENCES scope(scope_id),
     phase_id    INTEGER NOT NULL REFERENCES phase(phase_id), -- lowest booking level; must belong to scope_id
-    paaf_id     INTEGER NOT NULL REFERENCES paaf(paaf_id),
+    paaf_id     INTEGER REFERENCES paaf(paaf_id),            -- required for client work, NULL for internal hours
     worked_role_id INTEGER NOT NULL REFERENCES role(role_id), -- skill code booked under (defaults to user's role)
-    rate_id     INTEGER NOT NULL REFERENCES rate(rate_id),   -- client sales rate for worked role, snapshot at booking
+    rate_id     INTEGER REFERENCES rate(rate_id),            -- client sales rate for worked role, snapshot at booking; NULL for internal hours
     work_date   TEXT NOT NULL,
     hours       NUMERIC NOT NULL CHECK (hours > 0 AND hours <= 24),
     status      TEXT NOT NULL DEFAULT 'Submitted' CHECK (status IN ('Draft','Submitted','Approved','Edited')),
@@ -151,16 +167,22 @@ BEGIN
     WHERE (SELECT pr.status FROM scope sc JOIN project pr ON pr.project_id = sc.project_id WHERE sc.scope_id = NEW.scope_id) <> 'Open';
     SELECT RAISE(ABORT, 'Phase is not Open')
     WHERE (SELECT status FROM phase WHERE phase_id = NEW.phase_id) <> 'Open';
+    -- Client work: needs an approved PAAF and a matching rate. Internal hours: neither.
     SELECT RAISE(ABORT, 'No approved PAAF for this user and client')
-    WHERE NOT EXISTS (
+    WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 0
+      AND NOT EXISTS (
         SELECT 1 FROM paaf p JOIN scope s ON s.client_id = p.client_id
         WHERE p.paaf_id = NEW.paaf_id AND p.user_id = NEW.user_id
           AND s.scope_id = NEW.scope_id AND p.status = 'Approved');
     SELECT RAISE(ABORT, 'Rate does not match the scope client and worked role')
-    WHERE NOT EXISTS (
+    WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 0
+      AND NOT EXISTS (
         SELECT 1 FROM rate r JOIN scope s ON s.client_id = r.client_id
         WHERE r.rate_id = NEW.rate_id AND s.scope_id = NEW.scope_id
           AND r.role_id = NEW.worked_role_id);
+    SELECT RAISE(ABORT, 'Internal hours have no PAAF and no rate')
+    WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 1
+      AND (NEW.paaf_id IS NOT NULL OR NEW.rate_id IS NOT NULL);
     SELECT RAISE(ABORT, 'Weekly period is not open')
     WHERE NOT EXISTS (
         SELECT 1 FROM period

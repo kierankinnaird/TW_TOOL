@@ -33,6 +33,8 @@ INSERT INTO role (role_id, skill_code, name, family) VALUES
  (29,'QC-02','Senior QA/QC Inspector','QA/QC');
 
 INSERT INTO client (client_id, name) VALUES (1,'Apache'),(2,'Spirit');
+-- NMC's own client for internal hours (paid by NMC, not billed). Its codes are scopes under one project; admin can add more.
+INSERT INTO client (client_id, name, is_internal) VALUES (3,'Internal',1);
 
 -- Rate cards. Spirit rates are the estimate's GBP/hr by job title; Apache rates are example figures (Spirit x 0.95, nearest 0.50).
 -- rate_id: roles 1-6 are Apache 1-6 and Spirit 7-12; roles 7-29 are Apache 13-35 and Spirit 36-58.
@@ -167,7 +169,8 @@ INSERT INTO paaf (paaf_id, user_id, client_id, rate_id, status, sent_date, decid
 INSERT INTO project (project_id, project_code, name, client_id) VALUES
  (1,'APJ-01','Wellbay Decommissioning',1),
  (2,'APJ-02','Platform Decommissioning',1),
- (3,'SPJ-01','Morecambe Hub',2);
+ (3,'SPJ-01','Morecambe Hub',2),
+ (4,'INT','Internal',3);
 
 INSERT INTO scope (scope_id, scope_code, client_id, project_id, description, status, approver_user_id) VALUES
  (1,'BB0001',1,1,'Wellbay Clearance','Open',    6),
@@ -175,11 +178,16 @@ INSERT INTO scope (scope_id, scope_code, client_id, project_id, description, sta
  (3,'FB0001',1,2,'EDC Engineering',  'Closed',  7),
  (4,'A1400', 2,3,'Rivers and Calder','Pipeline',8),
  (5,'A1500', 2,3,'PGC & NRU',        'Open',    8),
- (6,'A1600', 2,3,'Pipeline Removal', 'Open',    7);
+ (6,'A1600', 2,3,'Pipeline Removal', 'Open',    7),
+ -- Internal codes (no PAAF, no rate)
+ (7,'INT01',3,4,'Business Services',   'Open', 7),
+ (8,'INT02',3,4,'Training',            'Open', 7),
+ (9,'INT03',3,4,'Business Development','Open', 7);
 
 -- Phases. Hours are booked to a phase. Every scope has at least one.
 INSERT INTO phase (phase_id, scope_id, name) VALUES
- (1,1,'Define'),(2,1,'Execute'),(3,2,'Define'),(4,3,'Define'),(5,4,'Define'),(6,5,'Define'),(7,6,'Define');
+ (1,1,'Define'),(2,1,'Execute'),(3,2,'Define'),(4,3,'Define'),(5,4,'Define'),(6,5,'Define'),(7,6,'Define'),
+ (8,7,'General'),(9,8,'General'),(10,9,'General');
 
 -- Weekly periods: week of 26 Oct (to be closed later) and week of 2 Nov.
 INSERT INTO period (week_start) VALUES ('2026-10-26'),('2026-11-02');

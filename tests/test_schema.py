@@ -269,5 +269,53 @@ class TestViews(Base):
         self.assertIn(("PM-02",), lines)
 
 
+class TestInternalHours(Base):
+    """Internal hours: paid by NMC, booked to Internal codes. No PAAF, no rate, kept out of the client reports."""
+    # Fraser Gordon (user 4) has no approved PAAF for any client. INT01 Business Services is scope 7, phase 8.
+    def book(self, paaf=None, rate=None, scope=7, phase=8, date="2026-11-04"):
+        return self.con.execute(NEW_ENTRY, (4, scope, phase, paaf, 4, rate, date, 3, 4))
+
+    def test_the_internal_client_and_its_codes_are_seeded_without_rates(self):
+        self.assertEqual(self.scalar("select count(*) from client where is_internal=1"), 1)
+        self.assertEqual(self.scalar("select count(*) from scope s join client c using(client_id) where c.is_internal=1"), 3)
+        self.assertEqual(self.scalar("select count(*) from rate r join client c using(client_id) where c.is_internal=1"), 0)
+
+    def test_anyone_can_book_internal_hours_with_no_paaf_and_no_rate(self):
+        self.book()
+        row = self.con.execute("select paaf_id, rate_id, status from time_entry where user_id=4").fetchone()
+        self.assertEqual(tuple(row), (None, None, "Submitted"))  # the column default; the app saves drafts
+
+    def test_internal_hours_cannot_carry_a_paaf_or_a_rate(self):
+        self.blocked(NEW_ENTRY, (5, 7, 8, 1, 4, None, "2026-11-04", 3, 5), msg="Internal hours have no PAAF and no rate")
+        self.blocked(NEW_ENTRY, (5, 7, 8, None, 4, 4, "2026-11-04", 3, 5), msg="Internal hours have no PAAF and no rate")
+
+    def test_client_hours_still_need_a_paaf_and_a_rate(self):
+        self.blocked(NEW_ENTRY, (5, 1, 1, None, 4, 4, "2026-11-06", 3, 5), msg="No approved PAAF")
+        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, None, "2026-11-06", 3, 5), msg="Rate does not match")
+
+    def test_internal_codes_get_no_rate_card_and_no_paaf(self):
+        internal = self.scalar("select client_id from client where is_internal=1")
+        self.blocked("INSERT INTO rate (client_id, role_id, sales_rate) VALUES (?,?,?)", (internal, 1, 10), msg="Internal codes have no rate card")
+        self.blocked("INSERT INTO paaf (user_id, client_id, rate_id) VALUES (?,?,?)", (4, internal, 1), msg="Internal codes do not need a PAAF")
+
+    def test_the_usual_booking_rules_still_apply_to_internal_codes(self):
+        self.blocked(NEW_ENTRY, (4, 7, 8, None, 4, None, "2026-10-28", 3, 4), msg="Weekly period is not open")  # closed week
+        self.con.execute("UPDATE scope SET status='Closed' WHERE scope_id=7")
+        self.blocked(NEW_ENTRY, (4, 7, 8, None, 4, None, "2026-11-04", 3, 4), msg="Scope is not Open")
+
+    def test_approved_internal_hours_are_not_in_the_client_ctr_or_period_report(self):
+        ctr_before = self.scalar("select sum(hours) from v_ctr")
+        period_before = self.scalar("select sum(hours) from v_period_report")
+        eid = self.book().lastrowid
+        # approved by the scope approver (7), who is not the owner
+        self.con.execute("UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-05 09:00', "
+                         "last_edited_by=7, last_edited_at='2026-11-05 09:00' WHERE entry_id=?", (eid,))
+        self.assertEqual(self.scalar("select status from time_entry where entry_id=?", eid), "Approved")
+        self.assertEqual(self.scalar("select sum(hours) from v_ctr"), ctr_before)
+        self.assertEqual(self.scalar("select sum(hours) from v_period_report"), period_before)
+        self.assertEqual(self.scalar("select count(*) from v_ctr where client='Internal'"), 0)
+        self.assertEqual(self.scalar("select count(*) from v_period_report where client='Internal'"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

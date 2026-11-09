@@ -1,5 +1,6 @@
 import sqlite3
 """Front-end smoke tests. Run from the repo root: python -m unittest discover -s tests -v"""
+import datetime
 import os
 import sys
 import tempfile
@@ -113,9 +114,12 @@ class TestApp(unittest.TestCase):
 
     def test_admin_only_pages_and_period_actions(self):
         self.assertIn("Admin only", self.get("/admin?u=5"))
-        page = self.post("/admin/period", {"u": "7", "action": "open", "week_start": "2026-11-09"})
+        # a far-future Monday, so it is never the current week (the current week opens by itself)
+        page = self.post("/admin/period", {"u": "7", "action": "open", "week_start": "2030-01-07"})
         self.assertIn("opened", page)
-        page = self.post("/admin/period", {"u": "7", "action": "open", "week_start": "2026-11-10"})  # not a Monday
+        page = self.post("/admin/period", {"u": "7", "action": "open", "week_start": "2030-01-07"})  # already there
+        self.assertIn("already exists", page)
+        page = self.post("/admin/period", {"u": "7", "action": "open", "week_start": "2030-01-08"})  # not a Monday
         self.assertNotIn("opened", page)
 
     def test_reports_date_range(self):
@@ -167,6 +171,67 @@ class TestApp(unittest.TestCase):
         self.assertEqual(self.period_part(base + "&client=abc&scope=999"), self.period_part(base))
 
 
+    # ---------- internal hours, automatic periods, live totals ----------
+    def test_internal_hours_booked_without_a_paaf_and_reported_separately(self):
+        # Fraser Gordon (4) has no approved PAAF for any client, but can still book to INT01 Business Services (phase 8)
+        page = self.get("/timesheet?u=4&w=2026-11-02")
+        self.assertIn("Internal - Business Services", page)
+        self.assertNotIn("Apache &gt;", page)
+        page = self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "h_8_4_2026-11-04": "3.5", "reason": ""})
+        self.assertIn("1 entry saved", page)
+        self.assertEqual(tuple(self.one("select paaf_id, rate_id, status from time_entry where user_id=4 and work_date='2026-11-04'")),
+                         (None, None, "Draft"))
+        self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Submit week", "reason": ""})
+        eid = self.one("select entry_id from time_entry where user_id=4 and work_date='2026-11-04'")[0]
+        self.assertIn("approved", self.post("/approvals/act", {"u": "7", "entry_id": str(eid), "action": "Approve"}))
+        page = self.get("/reports?u=7&from=2026-01-01&to=2026-12-31")
+        tree, rest = page.split("Period reports")
+        internal = rest.split("Internal hours")[1]
+        self.assertIn("INT01 Business Services", internal)
+        self.assertIn("Fraser Gordon", internal)
+        self.assertIn('<td align="right">3.5</td>', internal)
+        self.assertNotIn("INT01", tree)  # not in the CTR tree
+        self.assertNotIn("Business Services", rest.split("Internal hours")[0])  # nor the period report
+        self.assertNotIn(">Internal</option>", page)  # nor the client filter
+
+    def test_admin_adds_and_edits_internal_codes(self):
+        page = self.admin_post("/admin/add", {"t": "internal", "description": "IT Support", "approver_user_id": "7"})
+        self.assertIn("Internal code INT04 added", page)
+        self.assertIn("Internal - IT Support", self.get("/timesheet?u=4&w=2026-11-02"))
+        sid = self.one("select scope_id from scope where scope_code='INT04'")[0]
+        self.assertEqual(self.one("select count(*) from phase where scope_id=?", sid)[0], 1)  # a General phase came with it
+        self.admin_post("/admin/save", {"t": "internal", "id": str(sid), "description": "IT Services", "status": "Closed", "approver_user_id": "7"})
+        page = self.get("/timesheet?u=4&w=2026-11-02")
+        self.assertNotIn("IT Services", page)  # closed codes stop taking bookings
+        self.assertNotIn("IT Support", page)
+        self.assertIn("IT Services", self.get("/admin?u=7&t=internal"))
+        self.assertIn("IT Services", self.get("/admin/edit?u=7&t=internal&id=%d" % sid))
+        self.assertIn("Internal (not billed)", self.get("/admin?u=7&t=clients"))
+        for t in ("rates", "paafs"):  # the internal client is not offered for rate cards or PAAFs
+            self.assertNotIn(">Internal</option>", self.get("/admin?u=7&t=" + t))
+        before = self.one("select count(*) from scope")[0]
+        self.admin_post("/admin/add", {"t": "internal", "description": "Sneaky", "approver_user_id": "7"}, u="5")
+        self.assertEqual(self.one("select count(*) from scope")[0], before)
+
+    def test_current_week_opens_automatically_and_closed_weeks_stay_closed(self):
+        week = app.monday(datetime.date.today()).isoformat()
+        con = app.db()
+        con.execute("delete from period where week_start=?", (week,))
+        con.commit()
+        con.close()
+        self.get("/")
+        self.assertEqual(self.one("select status from period where week_start=?", week)[0], "Open")
+        self.admin_post("/admin/period", {"action": "close", "week_start": week})
+        self.get("/")
+        self.assertEqual(self.one("select status from period where week_start=?", week)[0], "Closed")  # not reopened
+
+    def test_timesheet_has_what_the_live_totals_need(self):
+        page = self.get("/timesheet?u=5&w=2026-11-02")
+        self.assertIn("function recalc", page)
+        for marker in ('class="row"', 'class="c" data-day="2026-11-02"', 'class="rt"', 'class="dt" data-day="2026-11-02"', 'class="gt"'):
+            self.assertIn(marker, page)
+        self.assertIn('data-h="8"', page)  # a submitted (locked) cell still counts, as text
+
     # ---------- admin forms ----------
     def admin_post(self, path, data, u="7"):
         d = {"u": u}
@@ -190,8 +255,8 @@ class TestApp(unittest.TestCase):
         before = self.one("select count(*) from client")[0]
         self.admin_post("/admin/add", {"t": "clients", "name": "Sneaky"}, u="5")
         self.assertEqual(self.one("select count(*) from client")[0], before)
-        self.admin_post("/admin/period", {"action": "open", "week_start": "2026-11-09"}, u="5")
-        self.assertIsNone(self.one("select 1 from period where week_start='2026-11-09'"))
+        self.admin_post("/admin/period", {"action": "open", "week_start": "2030-01-07"}, u="5")
+        self.assertIsNone(self.one("select 1 from period where week_start='2030-01-07'"))
         self.assertIn("Admin only", self.get("/admin/edit?u=5&t=users&id=1"))
 
     def test_add_client_role_and_reject_duplicates_and_blanks(self):
