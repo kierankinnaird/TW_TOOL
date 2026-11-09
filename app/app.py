@@ -30,7 +30,15 @@ def esc(v):
 
 
 def stamp():
+    # Stored with microseconds on purpose: the database rejects an edit whose last_edited_at is the same as the previous
+    # edit by the same person (e.g. Save draft then Submit week in one click), so whole seconds are not unique enough.
+    # Screens show it with fmt_time().
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def fmt_time(v):
+    """A stored timestamp as yyyy-mm-dd HH:MM:SS (no fractions of a second)."""
+    return "" if v is None else str(v)[:19]
 
 
 def fmt(h):
@@ -821,7 +829,7 @@ def admin_body(con, u, t):
     b = []
     if t == "periods":
         rows = [list(r) for r in con.execute("select week_start, status, closed_by, closed_at from period order by week_start")]
-        b.append(table(["week_start", "status", "closed_by", "closed_at"], rows))
+        b.append(table(["week_start", "status", "closed_by", "closed_at"], [r[:3] + [fmt_time(r[3])] for r in rows]))
         closes = "".join('<form method="post" action="/admin/period" style="display:inline">%s'
                          '<input type="submit" value="Close week %s"></form> ' % (hidden(u=u, week_start=r[0], action="close"), r[0])
                          for r in rows if r[1] == "Open")
@@ -1177,7 +1185,8 @@ def view_audit(con, u):
         "left join app_user ch on ch.user_id=a.changed_by join scope s on s.scope_id=t.scope_id "
         "order by a.audit_id desc limit 200").fetchall()
     heads = ["#", "When", "Changed by", "Action", "Booked by", "Scope", "Date", "Old status", "New status", "Old hours", "New hours", "Reason"]
-    return layout(con, u, "Audit trail (latest 200)", table(heads, [[fmt(v) if i in (9, 10) else v for i, v in enumerate(r)] for r in rows]))
+    return layout(con, u, "Audit trail (latest 200)", table(heads, [[fmt(v) if i in (9, 10) else fmt_time(v) if i == 1 else v
+                                                                    for i, v in enumerate(r)] for r in rows]))
 
 
 # ---------- server ----------

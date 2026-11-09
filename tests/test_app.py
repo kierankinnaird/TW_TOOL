@@ -232,6 +232,30 @@ class TestApp(unittest.TestCase):
             self.assertIn(marker, page)
         self.assertIn('data-h="8"', page)  # a submitted (locked) cell still counts, as text
 
+    # ---------- timestamps ----------
+    def test_audit_and_periods_show_times_to_the_second_only(self):
+        self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft", "h_1_4_2026-11-06": "7.5", "reason": ""})
+        self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Submit week", "reason": ""})
+        self.admin_post("/admin/period", {"action": "close", "week_start": "2026-11-02"})
+        for path in ("/audit?u=7", "/admin?u=7&t=periods"):
+            page = self.get(path)
+            self.assertRegex(page, r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?!\.\d)", path)  # a time to the second is there...
+            self.assertNotRegex(page, r"\d\d:\d\d:\d\d\.\d", path)  # ...and no fractions of a second
+        stored = self.one("select last_edited_at from time_entry where user_id=5 and work_date='2026-11-06'")[0]
+        self.assertRegex(stored, r"\d\d:\d\d:\d\d\.\d+")  # still stored precisely, see stamp()
+
+    def test_save_and_submit_in_one_click_is_not_refused_as_a_repeat_edit(self):
+        # Two edits of one entry by the same person within the same second need different last_edited_at values,
+        # which is why stamp() keeps fractions of a second.
+        self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft", "h_1_4_2026-11-06": "7.5", "reason": ""})
+        # an existing draft: changing its hours and submitting in one click updates the same entry twice in the same second
+        page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Submit week",
+                                             "h_1_4_2026-11-06": "6", "reason": ""})
+        self.assertIn("1 entry saved", page)
+        self.assertIn("submitted for approval", page)
+        self.assertNotIn("Edits must set", page)
+        self.assertEqual(tuple(self.one("select hours, status from time_entry where user_id=5 and work_date='2026-11-06'")), (6, "Submitted"))
+
     # ---------- admin forms ----------
     def admin_post(self, path, data, u="7"):
         d = {"u": u}
