@@ -123,6 +123,49 @@ class TestApp(unittest.TestCase):
         self.assertIn("2026-10-26", page)
         self.assertNotIn("2026-11-02</td>", page.split("Period reports")[1])
 
+    def period_part(self, path):
+        return self.get(path).split("Period reports")[1]
+
+    def test_period_report_filters_by_client_project_scope_and_phase(self):
+        con = app.db()
+        spirit = con.execute("select client_id from client where name='Spirit'").fetchone()[0]
+        apache = con.execute("select client_id from client where name='Apache'").fetchone()[0]
+        # a Spirit phase that has approved hours, so there are rows to show
+        ph = con.execute("select ph.phase_id, ph.name, ph.scope_id from phase ph join scope s on s.scope_id=ph.scope_id "
+                         "where s.client_id=? and exists (select 1 from time_entry t where t.phase_id=ph.phase_id and t.status='Approved') "
+                         "order by ph.phase_id limit 1", (spirit,)).fetchone()
+        sp = con.execute("select scope_id, scope_code, project_id from scope where scope_id=?", (ph["scope_id"],)).fetchone()
+        ap_code = con.execute("select scope_code from scope where client_id=? limit 1", (apache,)).fetchone()[0]
+        con.close()
+        base = "/reports?u=5&from=2026-01-01&to=2026-12-31"
+        everything = self.period_part(base)
+        self.assertIn(">Spirit</td>", everything)
+        self.assertIn(">Apache</td>", everything)
+        only_spirit = self.period_part(base + "&client=%d" % spirit)
+        self.assertIn(">Spirit</td>", only_spirit)
+        self.assertNotIn(">Apache</td>", only_spirit)
+        self.assertIn("Filtered to", only_spirit)
+        self.assertNotIn("Filtered to", everything)
+        # narrowing further keeps only that scope
+        one_scope = self.period_part(base + "&client=%d&project=%d&scope=%d" % (spirit, sp["project_id"], sp["scope_id"]))
+        self.assertNotIn(">%s</td>" % ap_code, one_scope)
+        one_phase = self.period_part(base + "&client=%d&scope=%d&phase=%d" % (spirit, sp["scope_id"], ph["phase_id"]))
+        self.assertIn(">%s</td>" % ph["name"], one_phase)
+
+    def test_period_report_has_a_reset_button_back_to_the_unfiltered_page(self):
+        page = self.get("/reports?u=5&client=2")
+        self.assertIn("value=\"Reset\" onclick=\"location.href='/reports?u=5'\"", page)
+
+    def test_period_report_drops_a_filter_that_does_not_fit_the_client(self):
+        con = app.db()
+        spirit = con.execute("select client_id from client where name='Spirit'").fetchone()[0]
+        apache_project = con.execute("select project_id from project where client_id<>? limit 1", (spirit,)).fetchone()[0]
+        con.close()
+        base = "/reports?u=5&from=2026-01-01&to=2026-12-31"
+        page = self.period_part(base + "&client=%d&project=%d" % (spirit, apache_project))
+        self.assertIn(">Spirit</td>", page)  # the stray project is ignored, so Spirit still shows
+        self.assertEqual(self.period_part(base + "&client=abc&scope=999"), self.period_part(base))
+
 
     # ---------- admin forms ----------
     def admin_post(self, path, data, u="7"):

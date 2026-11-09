@@ -491,12 +491,47 @@ def ctr_tree_rows(con, u=None):
     return "".join(out), g_h, g_t, g_p
 
 
+def period_filters(con, q):
+    """Client > Project > Scope > Phase filter for the period report. Each dropdown only lists what fits the choices above it,
+    and a choice that no longer fits (e.g. a project of another client) is dropped. Returns (chosen ids, option lists)."""
+    def pick(name, options):
+        try:
+            v = int(q.get(name, [""])[0])
+        except ValueError:
+            return None
+        return v if v in [o[0] for o in options] else None
+
+    clients = [tuple(r) for r in con.execute("select client_id, name from client order by name")]
+    client = pick("client", clients)
+    projects = [(r["project_id"], r["name"] if client else "%s - %s" % (r["client"], r["name"])) for r in con.execute(
+        "select p.project_id, p.name, c.name as client from project p join client c on c.client_id=p.client_id "
+        "where (? is null or p.client_id=?) order by c.name, p.name", (client, client))]
+    project = pick("project", projects)
+    scopes = [(r["scope_id"], "%s %s" % (r["scope_code"], r["description"])) for r in con.execute(
+        "select scope_id, scope_code, description from scope where (? is null or client_id=?) and (? is null or project_id=?) "
+        "order by scope_code", (client, client, project, project))]
+    scope = pick("scope", scopes)
+    phases = [(r["phase_id"], r["name"] if scope else "%s - %s" % (r["scope_code"], r["name"])) for r in con.execute(
+        "select ph.phase_id, ph.name, s.scope_code from phase ph join scope s on s.scope_id=ph.scope_id "
+        "where (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?) "
+        "order by s.scope_code, ph.name", (client, client, project, project, scope, scope))]
+    phase = pick("phase", phases)
+    return (client, project, scope, phase), (clients, projects, scopes, phases)
+
+
 def view_reports(con, u, q):
     d_from = q.get("from", ["2026-10-01"])[0]
     d_to = q.get("to", ["2026-12-31"])[0]
+    (client, project, scope, phase), (clients, projects, scopes, phases) = period_filters(con, q)
     per = con.execute("select week_start, client, project, scope_code, phase, skill_code, role, hours, total from v_period_report "
-                      "where week_start between ? and ? order by week_start, client, project, scope_code, phase, skill_code",
-                      (d_from, d_to)).fetchall()
+                      "where week_start between ? and ? and (scope_code, phase) in "
+                      "(select s.scope_code, ph.name from phase ph join scope s on s.scope_id=ph.scope_id "
+                      "where (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?) "
+                      "and (? is null or ph.phase_id=?)) "
+                      "order by week_start, client, project, scope_code, phase, skill_code",
+                      (d_from, d_to, client, client, project, project, scope, scope, phase, phase)).fetchall()
+    auto = ' onchange="this.form.submit()"'
+    filtered = any(x is not None for x in (client, project, scope, phase))
     tree_rows, g_h, g_t, g_p = ctr_tree_rows(con, u)
     head = ("<tr><th>Level</th><th>Name</th><th>Skill code</th><th>Sales rate</th><th>Actual booked hrs</th>"
             "<th>Total</th><th>Pending hrs</th><th>Status</th></tr>")
@@ -529,9 +564,15 @@ def view_reports(con, u, q):
          "<h4>Period reports (weekly) - approved hours</h4>",
          "<p><small>These are the same approved hours as the CTR, split by week. Each line here is one week of a CTR line above, "
          "so it is smaller than the all-weeks figure. When the date range covers every week, the total for range matches the CTR grand total.</small></p>",
-         '<form method="get" action="/reports"><input type="hidden" name="u" value="%d">From (yyyy-mm-dd) '
-         '<input type="text" name="from" size="10" value="%s"> To <input type="text" name="to" size="10" value="%s"> '
-         '<input type="submit" value="Show"></form>' % (u, esc(d_from), esc(d_to)),
+         '<form method="get" action="/reports">%s<p>Client %s Project %s Scope %s Phase %s</p>'
+         '<p>From (yyyy-mm-dd) <input type="text" name="from" size="10" value="%s"> To <input type="text" name="to" size="10" value="%s"> '
+         '<input type="submit" value="Show"> <input type="button" value="Reset" onclick="location.href=\'/reports?u=%d\'"></p></form>' % (
+             hidden(u=u),
+             sel("client", clients, client, True, "All clients", auto), sel("project", projects, project, True, "All projects", auto),
+             sel("scope", scopes, scope, True, "All scopes", auto), sel("phase", phases, phase, True, "All phases", auto),
+             esc(d_from), esc(d_to), u),
+         "<p><small>Filtered to the client, project, scope or phase chosen above, so the total for range is only part of the CTR grand total.</small></p>"
+         if filtered else "",
          '<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(t2)]
     return layout(con, u, "Reports", "".join(b))
 
@@ -639,10 +680,10 @@ def is_admin(con, u):
     return bool(me and me["permission"] == "admin")
 
 
-def sel(name, options, selected=None, blank=False):
-    out = ['<select name="%s">' % name]
+def sel(name, options, selected=None, blank=False, blank_label="-", attrs=""):
+    out = ['<select name="%s"%s>' % (name, attrs)]
     if blank:
-        out.append('<option value="">-</option>')
+        out.append('<option value="">%s</option>' % esc(blank_label))
     for val, label in options:
         out.append('<option value="%s"%s>%s</option>' % (esc(val), " selected" if str(val) == str(selected) else "", esc(label)))
     out.append("</select>")
