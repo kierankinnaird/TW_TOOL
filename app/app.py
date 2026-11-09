@@ -14,7 +14,6 @@ from urllib.parse import parse_qs, quote, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
-LETTER = {"Draft": "D", "Submitted": "S", "Approved": "A", "Edited": "E"}
 
 
 # ---------- helpers ----------
@@ -212,12 +211,11 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
             else:
                 rt += e["hours"]
                 day_tot[iso] += e["hours"]
-                st = LETTER[e["status"]]
                 if e["status"] == "Submitted" or (e["status"] == "Draft" and not open_week):
-                    cell = "%s <small>%s</small>" % (fmt(e["hours"]), st)
+                    cell = fmt(e["hours"])
                     fixed = ' data-h="%s"' % fmt(e["hours"])
                 else:
-                    cell = '<input type="text" size="4" name="%s" value="%s"> <small>%s</small>' % (name, fmt(e["hours"]), st)
+                    cell = '<input type="text" size="4" name="%s" value="%s">' % (name, fmt(e["hours"]))
             tds.append('<td align="center" class="c" data-day="%s"%s>%s</td>' % (iso, fixed, cell))
         tds.append('<td align="right" class="rt">%s</td>' % fmt(rt))
         trs.append('<tr class="row">%s</tr>' % "".join(tds))
@@ -234,8 +232,8 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
         by_status[e["status"]] += e["hours"]
     b.append("<p><b>Hours this week (all statuses): %s</b> &nbsp; Approved %s, Edited %s, Submitted %s, Draft %s</p>" % (
         fmt(sum(by_status.values())), fmt(by_status["Approved"]), fmt(by_status["Edited"]), fmt(by_status["Submitted"]), fmt(by_status["Draft"])))
-    b.append("<p><small>D = draft, S = submitted (locked), A = approved, E = edited, waiting for re-approval. To clear a draft entry, empty its box and click Save draft.</small></p>")
-    b.append('<p>Reason for changing approved hours (needed if you change a figure marked A or E): '
+    b.append("<p><small>To clear a draft entry, empty its box and click Save draft.</small></p>")
+    b.append('<p>Reason for changing approved hours (needed if you change hours that have already been approved): '
              '<input type="text" name="reason" size="60"></p>')
     b.append('<p><input type="submit" name="action" value="Save draft"> '
              '<input type="submit" name="action" value="Submit week"></p></form>')
@@ -575,8 +573,8 @@ def period_filters(con, q):
 
 
 def view_reports(con, u, q):
-    d_from = q.get("from", ["2026-10-01"])[0]
-    d_to = q.get("to", ["2026-12-31"])[0]
+    d_from = q.get("from", [""])[0] or "2026-10-01"
+    d_to = q.get("to", [""])[0] or "2026-12-31"
     (client, project, scope, phase), (clients, projects, scopes, phases) = period_filters(con, q)
     per = con.execute("select week_start, client, project, scope_code, phase, skill_code, role, hours, total from v_period_report "
                       "where week_start between ? and ? and (scope_code, phase) in "
@@ -620,12 +618,12 @@ def view_reports(con, u, q):
          "<p><small>These are the same approved hours as the CTR, split by week. Each line here is one week of a CTR line above, "
          "so it is smaller than the all-weeks figure. When the date range covers every week, the total for range matches the CTR grand total.</small></p>",
          '<form method="get" action="/reports">%s<p>Client %s Project %s Scope %s Phase %s</p>'
-         '<p>From (yyyy-mm-dd) <input type="text" name="from" size="10" value="%s"> To <input type="text" name="to" size="10" value="%s"> '
+         '<p>From %s To %s '
          '<input type="submit" value="Show"> <input type="button" value="Reset" onclick="location.href=\'/reports?u=%d\'"></p></form>' % (
              hidden(u=u),
              sel("client", clients, client, True, "All clients", auto), sel("project", projects, project, True, "All projects", auto),
              sel("scope", scopes, scope, True, "All scopes", auto), sel("phase", phases, phase, True, "All phases", auto),
-             esc(d_from), esc(d_to), u),
+             date_input("from", d_from), date_input("to", d_to), u),
          "<p><small>Filtered to the client, project, scope or phase chosen above, so the total for range is only part of the CTR grand total.</small></p>"
          if filtered else "",
          '<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(t2)]
@@ -773,6 +771,11 @@ def txt(name, value="", size=20):
     return '<input type="text" name="%s" size="%d" value="%s">' % (name, size, esc(value))
 
 
+def date_input(name, value=""):
+    """A date box that opens the browser's calendar picker. It sends yyyy-mm-dd, which is what the server expects."""
+    return '<input type="date" name="%s" value="%s">' % (name, esc(value))
+
+
 def hidden(**kw):
     return "".join('<input type="hidden" name="%s" value="%s">' % (k, esc(v)) for k, v in kw.items())
 
@@ -835,8 +838,8 @@ def admin_body(con, u, t):
                          for r in rows if r[1] == "Open")
         b.append("<p>%s</p>" % closes)
         b.append("<p><small>Each week opens automatically when the week starts. Close a week here when it should stop taking new hours.</small></p>")
-        b.append('<form method="post" action="/admin/period">%s<b>Open a missed week</b> - Monday date (yyyy-mm-dd) %s '
-                 '<input type="submit" value="Open week"></form>' % (hidden(u=u, action="open"), txt("week_start", "", 10)))
+        b.append('<form method="post" action="/admin/period">%s<b>Open a missed week</b> - Monday date %s '
+                 '<input type="submit" value="Open week"></form>' % (hidden(u=u, action="open"), date_input("week_start")))
     elif t == "users":
         rows = [[r["nmc_id"], r["name"], r["employment_type"], r["skill_code"] + " " + r["role"], r["permission"], r["start_date"],
                  r["end_date"], edit_link(u, "users", r["user_id"])]
@@ -849,8 +852,8 @@ def admin_body(con, u, t):
                  "<tr><td>End date (optional)</td><td>%s</td></tr></table><input type=\"submit\" value=\"Add user\"></form>"
                  % (hidden(u=u, t="users"), txt("nmc_id", "", 8), txt("name", "", 30),
                     sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")]), sel("role_id", opts_roles(con)),
-                    sel("permission", [("user", "user"), ("admin", "admin")]), txt("start_date", datetime.date.today().isoformat(), 10),
-                    txt("end_date", "", 10)))
+                    sel("permission", [("user", "user"), ("admin", "admin")]), date_input("start_date", datetime.date.today().isoformat()),
+                    date_input("end_date")))
     elif t == "roles":
         rows = [[r["family"], r["skill_code"], r["name"], "Yes" if r["active"] else "No", edit_link(u, "roles", r["role_id"])]
                 for r in con.execute("select * from role order by family, skill_code")]
@@ -871,10 +874,10 @@ def admin_body(con, u, t):
         b.append(table(["Client", "Skill code", "Role", "Sales rate", "Effective from"], rows))
         b.append('<h4>Add a rate</h4><p><small>Rates are never edited. To change a rate, add a new row with a later effective date. '
                  "Old rows stay, so hours already booked keep the price they were booked at.</small></p>"
-                 '<form method="post" action="/admin/add">%s Client %s Skill code %s Sales rate %s Effective from (yyyy-mm-dd) %s '
+                 '<form method="post" action="/admin/add">%s Client %s Skill code %s Sales rate %s Effective from %s '
                  '<input type="submit" value="Add rate"></form>'
                  % (hidden(u=u, t="rates"), sel("client_id", opts_clients(con, True)), sel("role_id", opts_roles(con)),
-                    txt("sales_rate", "", 8), txt("effective_from", datetime.date.today().isoformat(), 10)))
+                    txt("sales_rate", "", 8), date_input("effective_from", datetime.date.today().isoformat())))
     elif t == "paafs":
         rows = []
         for r in con.execute("select p.*, u.name as uname, c.name as client, ro.skill_code, rt.sales_rate "
@@ -886,7 +889,7 @@ def admin_body(con, u, t):
                       '<input type="submit" name="action" value="Mark sent"> <small>(sent = formal client approval)</small>')
             elif r["status"] == "Sent":
                 f += ('Signed form ref %s Expiry (optional) %s <input type="submit" name="action" value="Approve"> '
-                      '<input type="submit" name="action" value="Reject">' % (txt("document_ref", "", 28), txt("expiry_date", "", 10)))
+                      '<input type="submit" name="action" value="Reject">' % (txt("document_ref", "", 28), date_input("expiry_date")))
             elif r["status"] == "Rejected":
                 f += '<input type="submit" name="action" value="Reopen as draft">'
             f += "</form>"
@@ -966,7 +969,7 @@ def view_admin_edit(con, u, t, i, msgs=None):
                 "<tr><td>End date</td><td>%s</td></tr>" % (
                     esc(r["nmc_id"]), txt("name", r["name"], 30), sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")], r["employment_type"]),
                     sel("role_id", opts_roles(con, active_only=False), r["role_id"]),
-                    sel("permission", [("user", "user"), ("admin", "admin")], r["permission"]), esc(r["start_date"]), txt("end_date", r["end_date"] or "", 10)))
+                    sel("permission", [("user", "user"), ("admin", "admin")], r["permission"]), esc(r["start_date"]), date_input("end_date", r["end_date"] or "")))
         note = "<p><small>Changing someone's role does not change their existing PAAFs or booked hours.</small></p>"
     elif t == "roles":
         r = con.execute("select * from role where role_id=?", (i,)).fetchone()

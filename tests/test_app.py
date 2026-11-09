@@ -232,6 +232,34 @@ class TestApp(unittest.TestCase):
             self.assertIn(marker, page)
         self.assertIn('data-h="8"', page)  # a submitted (locked) cell still counts, as text
 
+    def test_timesheet_cells_have_no_status_letters_or_key(self):
+        # Locked (submitted) hours are plain text and editable ones are boxes, so no D/S/A/E letters and no key.
+        page = self.get("/timesheet?u=5&w=2026-11-02")
+        self.assertNotRegex(page, r"<small>[DSAE]</small>")
+        self.assertNotIn("D = draft", page)
+        self.assertNotIn("marked A or E", page)
+        self.assertIn("To clear a draft entry", page)  # the one useful hint from that line stays
+
+    # ---------- date pickers ----------
+    def test_every_date_box_is_a_calendar_picker(self):
+        page = self.get("/reports?u=5&from=2026-10-26&to=2026-11-02")
+        self.assertIn('<input type="date" name="from" value="2026-10-26">', page)
+        self.assertIn('<input type="date" name="to" value="2026-11-02">', page)
+        self.assertNotIn("(yyyy-mm-dd)", page)
+        for path, names in (("/admin?u=7&t=periods", ["week_start"]), ("/admin?u=7&t=users", ["start_date", "end_date"]),
+                            ("/admin?u=7&t=rates", ["effective_from"]), ("/admin/edit?u=7&t=users&id=1", ["end_date"])):
+            page = self.get(path)
+            for name in names:
+                self.assertIn('<input type="date" name="%s"' % name, page, path)
+            self.assertNotIn('type="text" name="%s"' % names[0], page, path)
+
+    def test_a_cleared_report_date_falls_back_to_the_default_range(self):
+        page = self.get("/reports?u=5&from=&to=")
+        self.assertIn('<input type="date" name="from" value="2026-10-01">', page)
+        self.assertIn('<input type="date" name="to" value="2026-12-31">', page)
+        self.assertIn("Total for range", page)
+        self.assertNotIn("<b>Total for range</b></td><td><b></b></td><td><b></b></td><td><b></b></td><td><b></b></td><td><b></b></td><td align=\"right\"><b>0</b>", page)
+
     # ---------- timestamps ----------
     def test_audit_and_periods_show_times_to_the_second_only(self):
         self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft", "h_1_4_2026-11-06": "7.5", "reason": ""})
