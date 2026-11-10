@@ -2,7 +2,7 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;  -- 2: a cost controller approves the hours a scope approver books to their own scope
 
 -- Controlled list of job titles, grouped into job families. Editable by admin/superuser.
 CREATE TABLE role (

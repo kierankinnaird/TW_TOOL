@@ -45,12 +45,12 @@ Pages: My Timesheet (weekly grid), Approvals (approvers only), Reports (CTR and 
 
 ## Roles
 
-Each person has one permission level: `user`, `controller` (cost controller) or `admin` (IT). Everyone can enter, save and submit their own time. Approver is not a level: it means being named as the approver on a scope, and only standard users can be named. Cost controllers and admins never approve hours.
+Each person has one permission level: `user`, `controller` (cost controller) or `admin` (IT). Everyone can enter, save and submit their own time. Approver is not a level: it means being named as the approver on a scope, and only standard users can be named. Approvers book their own time like anyone else, including to the scopes they approve (they hold a PAAF for that client); nobody approves their own hours, so a cost controller approves the hours an approver books to their own scope. Apart from that, cost controllers and admins never approve hours.
 
 | | Standard user | Approver (a user named on a scope) | Cost controller | Admin (IT) |
 |---|---|---|---|---|
 | Own timesheet | Yes | Yes | Yes | Yes |
-| Approvals page, approve or reject | No | Yes, for their scopes only, never their own hours | No | No |
+| Approvals page, approve or reject | No | Yes, for their scopes only, never their own hours | Only hours an approver booked to their own scope | No |
 | Reports | Own hours only, no values | Own hours plus everyone's hours on their scopes, no values | Everything, with £ values and sales rates | No |
 | £ values and sales rates | No | No | Yes | No |
 | Admin tabs | None | None | Weekly periods, clients, rate cards, PAAFs, projects / scopes / phases, internal codes | Weekly periods, users, job roles |
@@ -86,7 +86,7 @@ SELECT * FROM v_period_report
 
 - Booking is to a phase and needs an Open project, scope and phase, an Approved PAAF for the scope's client, a rate that matches the client and worked role, and an Open weekly period. Internal codes need none of the PAAF and rate, and cannot carry them.
 - Lifecycle: Draft, Submitted, Approved, Edited. Reject returns to Draft with a reason. Editing an approved entry sets Edited, needs a reason, and needs re-approval.
-- Approval is only by the person named as the scope's approver, never the entry owner. Cost controllers and admins never approve, and cannot be named as an approver.
+- Approval is by the person named as the scope's approver, never the entry owner. The one exception: hours booked by the scope's own approver are approved by a cost controller. Admins never approve, and neither controllers nor admins can be named as an approver.
 - Every edit names its editor; every create, edit, status change and deletion is audited. Only Draft entries can be deleted (clear draft).
 
 ## CTR page
