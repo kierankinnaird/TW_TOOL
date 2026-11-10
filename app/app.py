@@ -14,6 +14,8 @@ from urllib.parse import parse_qs, quote, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
+# Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
+REQUIRED_SCHEMA = 1
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
 ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "TASAOrbiterVF.woff2"), "font/woff2")}
 
@@ -86,10 +88,34 @@ def is_approver(con, u):
     return con.execute("select 1 from scope where approver_user_id=? limit 1", (u,)).fetchone() is not None
 
 
+def approval_queue(con, u):
+    """What this person approves, as SQL on time entries (t) and scopes (s) with its arguments, or None if they approve nothing.
+    A named approver approves hours booked to their scopes, but never their own. Hours booked by a scope's approver have nobody else
+    who may approve them, so a cost controller approves those."""
+    if permission_of(con, u) == "controller":
+        return " and t.user_id = s.approver_user_id", ()
+    if is_approver(con, u):
+        return " and s.approver_user_id=? and t.user_id<>?", (u, u)
+    return None
+
+
+def may_action(con, u, eid):
+    """Can this person approve or reject this entry? The scope's approver can (the database refuses their own hours);
+    a cost controller can, but only for hours booked by the scope's approver."""
+    row = con.execute("select s.approver_user_id, t.user_id from time_entry t join scope s on s.scope_id=t.scope_id where t.entry_id=?", (eid,)).fetchone()
+    if not row:
+        return False
+    if permission_of(con, u) == "controller":
+        return row[1] == row[0]
+    return row[0] == u
+
+
 def pending_for(con, u):
-    return con.execute(
-        "select count(*) from time_entry t join scope s on s.scope_id=t.scope_id "
-        "where t.status in ('Submitted','Edited') and s.approver_user_id=?", (u,)).fetchone()[0]
+    queue = approval_queue(con, u)
+    if queue is None:
+        return 0
+    return con.execute("select count(*) from time_entry t join scope s on s.scope_id=t.scope_id "
+                       "where t.status in ('Submitted','Edited')" + queue[0], queue[1]).fetchone()[0]
 
 
 STYLE = """
@@ -170,7 +196,7 @@ def layout(con, u, title, body):
     me = me_row(con, u)
     perm = me["permission"] if me else None
     items = [("timesheet", "My Timesheet", "/timesheet?u=%d" % u)]
-    if is_approver(con, u):
+    if approval_queue(con, u) is not None:
         items.append(("approvals", "Approvals (%d)" % pending_for(con, u), "/approvals?u=%d" % u))
     if perm != "admin":  # Admin (IT) manages users and job roles only: no reports
         items.append(("reports", "Reports", "/reports?u=%d" % u))
@@ -447,10 +473,11 @@ def save_timesheet(con, form):
 
 # ---------- Approvals ----------
 def view_approvals(con, u, msgs=None, ok=False):
-    if not is_approver(con, u):
+    queue = approval_queue(con, u)
+    if queue is None:
         return layout(con, u, "Approvals", msgs_html(msgs, ok) + "<p>Hours are approved by the approver named on each booking code. "
                       "You are not named as an approver on any code, so there is nothing for you to approve.</p>")
-    where = "and s.approver_user_id=%d" % u
+    where, wargs = queue
     rows = con.execute(
         "select t.entry_id, bu.name as booked_by, c.name as client, pr.name as project, s.scope_code, ph.name as phase, ro.skill_code, t.work_date, t.hours, "
         "t.status, t.last_change_reason, (select old_hours from time_entry_audit a where a.entry_id=t.entry_id "
@@ -458,8 +485,11 @@ def view_approvals(con, u, msgs=None, ok=False):
         "from time_entry t join scope s on s.scope_id=t.scope_id join phase ph on ph.phase_id=t.phase_id "
         "join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
         "join app_user bu on bu.user_id=t.user_id join role ro on ro.role_id=t.worked_role_id "
-        "where t.status in ('Submitted','Edited') %s order by bu.name, t.work_date" % where).fetchall()
+        "where t.status in ('Submitted','Edited')" + where + " order by bu.name, t.work_date", wargs).fetchall()
     body = msgs_html(msgs, ok)
+    if permission_of(con, u) == "controller":
+        body += ("<p><small>These are hours booked by approvers to the scopes they approve. Nobody else may approve them "
+                 "(not even the approver, who never approves their own hours), so a cost controller does.</small></p>")
     if not rows:
         return layout(con, u, "Approvals", body + "<p>Nothing waiting for your approval.</p>")
     trs = []
@@ -486,7 +516,7 @@ def act_approval(con, form):
     ids = [int(x) for x in form.get("entry_id", [])]
     action, reason = form["action"][0], form.get("reason", [""])[0].strip()
     approve = action.startswith("Approve")
-    if not is_approver(con, u):
+    if approval_queue(con, u) is None:
         return view_approvals(con, u)
     if not ids:
         return view_approvals(con, u, ["Tick at least one entry first."])
@@ -494,9 +524,9 @@ def act_approval(con, form):
         return view_approvals(con, u, ["Give a reason to reject."])
     done, msgs = 0, []
     for eid in ids:
-        owner = con.execute("select s.approver_user_id from time_entry t join scope s on s.scope_id=t.scope_id where t.entry_id=?", (eid,)).fetchone()
-        if not owner or owner[0] != u:
-            msgs.append("Entry %d: only the approver named on its booking code can approve or reject it." % eid)
+        if not may_action(con, u, eid):
+            msgs.append("Entry %d: only the approver named on its booking code can approve or reject it "
+                        "(a cost controller can, for hours the approver booked themselves)." % eid)
             continue
         try:
             if approve:
@@ -547,21 +577,45 @@ window.onload=function(){openTo(3);};
 </script>"""
 
 
-def ctr_tree_rows(con, u=None):
-    """Client > Project > Scope > Phase > Skill code > Person > Entry. Hours/Total are approved only; Pending = Submitted + Edited."""
+def report_view(con, u):
+    """What this person may see in the reports. Cost controllers see everything, with £ values and rates. Everyone else sees
+    hours only, limited to their own hours plus, if they approve any scopes, the hours booked to those scopes."""
+    ctl = permission_of(con, u) == "controller"
+    return {"money": ctl, "all": ctl}
+
+
+ALL_REPORTS = {"money": True, "all": True}
+# scopes a person can see hours for: the ones they approve and the ones they have booked to (arguments: user, user)
+VISIBLE_SCOPES = "(select scope_id from scope where approver_user_id=? union select scope_id from time_entry where user_id=?)"
+
+
+def visible_to(rv, u):
+    """SQL limiting time entries (t) on scopes (s) to what this person may see, and its arguments."""
+    if rv["all"]:
+        return "", ()
+    return " and (t.user_id=? or s.approver_user_id=?)", (u, u)
+
+
+def ctr_tree_rows(con, u=None, rv=ALL_REPORTS):
+    """Client > Project > Scope > Phase > Skill code > Person > Entry. Hours/Total are approved only; Pending = Submitted + Edited.
+    Sales rates and totals are only put in the page for people who may see £ values."""
+    money = rv["money"]
+    vis, vargs = visible_to(rv, u)
     ents = con.execute(
         "select c.name as client, pr.project_code, pr.name as project, s.scope_code, s.description, ph.phase_id, ph.name as phase, "
         "ro.skill_code, ro.name as role, rt.rate_id, rt.sales_rate, u.name as person, t.entry_id, t.work_date, t.hours, t.status "
         "from time_entry t join phase ph on ph.phase_id=t.phase_id join scope s on s.scope_id=ph.scope_id "
         "join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
         "join rate rt on rt.rate_id=t.rate_id join role ro on ro.role_id=rt.role_id join app_user u on u.user_id=t.user_id "
-        "where t.status<>'Draft' order by c.name, pr.name, s.scope_code, ph.name, ro.skill_code, u.name, t.work_date").fetchall()
-    # also list phases that have no booked hours yet, so the structure is visible
+        "where t.status<>'Draft'" + vis + " order by c.name, pr.name, s.scope_code, ph.name, ro.skill_code, u.name, t.work_date", vargs).fetchall()
+    # also list phases that have no booked hours yet, so the structure is visible: all of them for cost controllers,
+    # only the scopes they approve for everyone else
     empty = con.execute(
         "select c.name as client, pr.name as project, s.scope_code, s.description, ph.phase_id, ph.name as phase "
         "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
         "join client c on c.client_id=s.client_id where s.status='Open' and c.is_internal=0 and ph.phase_id not in "
-        "(select phase_id from time_entry where status<>'Draft')").fetchall()
+        "(select phase_id from time_entry where status<>'Draft')" + ("" if rv["all"] else " and s.approver_user_id=?"),
+        () if rv["all"] else (u,)).fetchall()
 
     def mk(label, kind):
         return {"label": label, "kind": kind, "kids": {}, "h": 0.0, "t": 0.0, "p": 0.0, "skill": "", "rate": None, "status": ""}
@@ -586,7 +640,8 @@ def ctr_tree_rows(con, u=None):
         ph = node(path[-1]["kids"], e["phase_id"], e["phase"], "Phase")
         ph["phase_id"] = e["phase_id"]
         path.append(ph)
-        sk = node(path[-1]["kids"], e["rate_id"], "%s %s" % (e["skill_code"], e["role"]), "Skill code")
+        # one line per rate for cost controllers; without rates on show, one line per skill code
+        sk = node(path[-1]["kids"], e["rate_id"] if money else e["skill_code"], "%s %s" % (e["skill_code"], e["role"]), "Skill code")
         sk["skill"], sk["rate"] = e["skill_code"], e["sales_rate"]
         path.append(sk)
         pe = node(sk["kids"], e["person"], e["person"], "Person")
@@ -610,7 +665,6 @@ def ctr_tree_rows(con, u=None):
         return esc(n["label"])
 
     out, counter = [], [0]
-    levels = ["Client", "Project", "Scope", "Phase", "Skill code", "Person", "Entry"]
 
     def walk(n, level, parent):
         counter[0] += 1
@@ -619,14 +673,16 @@ def ctr_tree_rows(con, u=None):
         tg = '<span class="tg" style="cursor:pointer;font-family:monospace" onclick="tog(this)">[-]</span> ' if kids else "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; "
         weight = "b" if level < 5 else "span"
         pad = 4 + level * 16
-        status = n["status"]
-        out.append(
-            '<tr data-id="%s" data-parent="%s" data-level="%d" data-kids="%d" data-open="1">'
-            '<td>%s</td><td style="padding-left:%dpx"><%s>%s%s</%s></td><td>%s</td><td align="right">%s</td>'
-            '<td align="right"><%s>%s</%s></td><td align="right"><%s>%.2f</%s></td><td align="right"><%s>%s</%s></td><td>%s</td></tr>' % (
-                rid, parent, level, 1 if kids else 0, n["kind"], pad, weight, tg, label_html(n), weight, esc(n["skill"]),
-                ("%.2f" % n["rate"]) if n["rate"] is not None else "",
-                weight, fmt(n["h"]), weight, weight, n["t"], weight, weight, fmt(n["p"]), weight, esc(status)))
+        row = ('<tr data-id="%s" data-parent="%s" data-level="%d" data-kids="%d" data-open="1">'
+               '<td>%s</td><td style="padding-left:%dpx"><%s>%s%s</%s></td><td>%s</td>' % (
+                   rid, parent, level, 1 if kids else 0, n["kind"], pad, weight, tg, label_html(n), weight, esc(n["skill"])))
+        if money:
+            row += '<td align="right">%s</td>' % (("%.2f" % n["rate"]) if n["rate"] is not None else "")
+        row += '<td align="right"><%s>%s</%s></td>' % (weight, fmt(n["h"]), weight)
+        if money:
+            row += '<td align="right"><%s>%.2f</%s></td>' % (weight, n["t"], weight)
+        row += '<td align="right"><%s>%s</%s></td><td>%s</td></tr>' % (weight, fmt(n["p"]), weight, esc(n["status"]))
+        out.append(row)
         for k in kids:
             walk(k, level + 1, rid)
 
@@ -638,9 +694,10 @@ def ctr_tree_rows(con, u=None):
     return "".join(out), g_h, g_t, g_p
 
 
-def period_filters(con, q):
+def period_filters(con, q, u=None, rv=ALL_REPORTS):
     """Client > Project > Scope > Phase filter for the period report. Each dropdown only lists what fits the choices above it,
-    and a choice that no longer fits (e.g. a project of another client) is dropped. Returns (chosen ids, option lists)."""
+    and a choice that no longer fits (e.g. a project of another client) is dropped. Returns (chosen ids, option lists).
+    People who may not see everything are only offered the scopes they approve or have booked to."""
     def pick(name, options):
         try:
             v = int(q.get(name, [""])[0])
@@ -648,23 +705,31 @@ def period_filters(con, q):
             return None
         return v if v in [o[0] for o in options] else None
 
+    allowed = rv["all"]
+    vargs = () if allowed else (u, u)
+    in_scopes = "" if allowed else " and s.scope_id in " + VISIBLE_SCOPES
     # Client work only: internal hours have no sales value, so they are not part of the period report (see the Internal hours section).
-    clients = [tuple(r) for r in con.execute("select client_id, name from client where is_internal=0 order by name")]
+    clients = [tuple(r) for r in con.execute(
+        "select client_id, name from client where is_internal=0"
+        + ("" if allowed else " and client_id in (select client_id from scope where scope_id in " + VISIBLE_SCOPES + ")")
+        + " order by name", vargs)]
     client = pick("client", clients)
     projects = [(r["project_id"], r["name"] if client else "%s - %s" % (r["client"], r["name"])) for r in con.execute(
         "select p.project_id, p.name, c.name as client from project p join client c on c.client_id=p.client_id "
-        "where c.is_internal=0 and (? is null or p.client_id=?) order by c.name, p.name", (client, client))]
+        "where c.is_internal=0 and (? is null or p.client_id=?)"
+        + ("" if allowed else " and p.project_id in (select project_id from scope where scope_id in " + VISIBLE_SCOPES + ")")
+        + " order by c.name, p.name", (client, client) + vargs)]
     project = pick("project", projects)
     scopes = [(r["scope_id"], "%s %s" % (r["scope_code"], r["description"])) for r in con.execute(
         "select s.scope_id, s.scope_code, s.description from scope s join client c on c.client_id=s.client_id "
-        "where c.is_internal=0 and (? is null or s.client_id=?) and (? is null or s.project_id=?) "
-        "order by s.scope_code", (client, client, project, project))]
+        "where c.is_internal=0 and (? is null or s.client_id=?) and (? is null or s.project_id=?)" + in_scopes
+        + " order by s.scope_code", (client, client, project, project) + vargs)]
     scope = pick("scope", scopes)
     phases = [(r["phase_id"], r["name"] if scope else "%s - %s" % (r["scope_code"], r["name"])) for r in con.execute(
         "select ph.phase_id, ph.name, s.scope_code from phase ph join scope s on s.scope_id=ph.scope_id "
         "join client c on c.client_id=s.client_id "
-        "where c.is_internal=0 and (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?) "
-        "order by s.scope_code, ph.name", (client, client, project, project, scope, scope))]
+        "where c.is_internal=0 and (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?)" + in_scopes
+        + " order by s.scope_code, ph.name", (client, client, project, project, scope, scope) + vargs)]
     phase = pick("phase", phases)
     return (client, project, scope, phase), (clients, projects, scopes, phases)
 
@@ -672,50 +737,84 @@ def period_filters(con, q):
 def view_reports(con, u, q):
     if permission_of(con, u) == "admin":  # Admin (IT) has no reports
         return no_access(con, u, "Reports")
+    rv = report_view(con, u)
+    money = rv["money"]
     d_from = q.get("from", [""])[0] or "2026-10-01"
     d_to = q.get("to", [""])[0] or "2026-12-31"
-    (client, project, scope, phase), (clients, projects, scopes, phases) = period_filters(con, q)
-    per = con.execute("select week_start, client, project, scope_code, phase, skill_code, role, hours, total from v_period_report "
-                      "where week_start between ? and ? and (scope_code, phase) in "
-                      "(select s.scope_code, ph.name from phase ph join scope s on s.scope_id=ph.scope_id "
-                      "where (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?) "
-                      "and (? is null or ph.phase_id=?)) "
-                      "order by week_start, client, project, scope_code, phase, skill_code",
-                      (d_from, d_to, client, client, project, project, scope, scope, phase, phase)).fetchall()
+    (client, project, scope, phase), (clients, projects, scopes, phases) = period_filters(con, q, u, rv)
+    chosen = (client, client, project, project, scope, scope, phase, phase)
+    if money:
+        per = con.execute("select week_start, client, project, scope_code, phase, skill_code, role, hours, total from v_period_report "
+                          "where week_start between ? and ? and (scope_code, phase) in "
+                          "(select s.scope_code, ph.name from phase ph join scope s on s.scope_id=ph.scope_id "
+                          "where (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?) "
+                          "and (? is null or ph.phase_id=?)) "
+                          "order by week_start, client, project, scope_code, phase, skill_code",
+                          (d_from, d_to) + chosen).fetchall()
+    else:
+        # the view above adds everyone's hours together, so for everyone else the same figures are built from their own entries only
+        per = con.execute(
+            "select date(t.work_date,'weekday 0','-6 days') as week_start, c.name as client, p.name as project, s.scope_code, "
+            "ph.name as phase, r.skill_code, r.name as role, sum(t.hours) as hours, 0 as total "
+            "from time_entry t join phase ph on ph.phase_id=t.phase_id join scope s on s.scope_id=ph.scope_id "
+            "join project p on p.project_id=s.project_id join client c on c.client_id=s.client_id "
+            "join rate rt on rt.rate_id=t.rate_id join role r on r.role_id=rt.role_id "
+            "where t.status='Approved' and date(t.work_date,'weekday 0','-6 days') between ? and ? "
+            "and (t.user_id=? or s.approver_user_id=?) "
+            "and (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?) and (? is null or ph.phase_id=?) "
+            "group by week_start, ph.phase_id, rt.rate_id order by week_start, client, project, s.scope_code, phase, r.skill_code",
+            (d_from, d_to, u, u) + chosen).fetchall()
     auto = ' onchange="this.form.submit()"'
     filtered = any(x is not None for x in (client, project, scope, phase))
-    tree_rows, g_h, g_t, g_p = ctr_tree_rows(con, u)
-    head = ("<tr><th>Level</th><th>Name</th><th>Skill code</th><th>Sales rate</th><th>Actual booked hrs</th>"
-            "<th>Total</th><th>Pending hrs</th><th>Status</th></tr>")
-    foot = sub_row(["", "Grand total", "", "", fmt(g_h), "%.2f" % g_t, fmt(g_p), ""], right_from=4)
+    tree_rows, g_h, g_t, g_p = ctr_tree_rows(con, u, rv)
+    if money:
+        head = ("<tr><th>Level</th><th>Name</th><th>Skill code</th><th>Sales rate</th><th>Actual booked hrs</th>"
+                "<th>Total</th><th>Pending hrs</th><th>Status</th></tr>")
+        foot = sub_row(["", "Grand total", "", "", fmt(g_h), "%.2f" % g_t, fmt(g_p), ""], right_from=4)
+    else:
+        head = ("<tr><th>Level</th><th>Name</th><th>Skill code</th><th>Actual booked hrs</th>"
+                "<th>Pending hrs</th><th>Status</th></tr>")
+        foot = sub_row(["", "Grand total", "", fmt(g_h), fmt(g_p), ""], right_from=3)
 
     t2 = ["<tr><th>Week commencing</th><th>Client</th><th>Project</th><th>Scope</th><th>Phase</th><th>Skill code</th>"
-          "<th>Role</th><th>Hours</th><th>Total</th></tr>"]
+          "<th>Role</th><th>Hours</th>%s</tr>" % ("<th>Total</th>" if money else "")]
     r_h = r_t = 0.0
     for wk in dict.fromkeys(r["week_start"] for r in per):
         lines = [r for r in per if r["week_start"] == wk]
         wh = wt = 0.0
         for r in lines:
-            t2.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td align=\"right\">%s</td><td align=\"right\">%.2f</td></tr>" % (
+            t2.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td align=\"right\">%s</td>%s</tr>" % (
                 esc(r["week_start"]), esc(r["client"]), esc(r["project"]), esc(r["scope_code"]), esc(r["phase"]),
-                esc(r["skill_code"]), esc(r["role"]), fmt(r["hours"]), r["total"]))
+                esc(r["skill_code"]), esc(r["role"]), fmt(r["hours"]), ('<td align="right">%.2f</td>' % r["total"]) if money else ""))
             wh += r["hours"]; wt += r["total"]
-        t2.append(sub_row(["", "Subtotal week commencing %s" % wk, "", "", "", "", "", fmt(wh), "%.2f" % wt], right_from=7))
+        t2.append(sub_row(["", "Subtotal week commencing %s" % wk, "", "", "", "", "", fmt(wh)] + (["%.2f" % wt] if money else []), right_from=7))
         r_h += wh; r_t += wt
-    t2.append(sub_row(["", "Total for range", "", "", "", "", "", fmt(r_h), "%.2f" % r_t], right_from=7))
+    t2.append(sub_row(["", "Total for range", "", "", "", "", "", fmt(r_h)] + (["%.2f" % r_t] if money else []), right_from=7))
+
+    if money:
+        tree_note = ("Actual booked hrs are approved hours only. Pending hrs are submitted or edited hours still waiting for approval. "
+                     "Click [+] / [-] to open a row down to the person and their timesheet entries. Hours and Total roll up at every level. "
+                     "Each phase is that phase's CTR, priced from the client rate card by skill code. All weeks to date.")
+        period_note = ("These are the same approved hours as the CTR, split by week. Each line here is one week of a CTR line above, "
+                       "so it is smaller than the all-weeks figure. When the date range covers every week, the total for range matches the CTR grand total.")
+        filtered_note = "Filtered to the client, project, scope or phase chosen above, so the total for range is only part of the CTR grand total."
+    else:
+        tree_note = ("Actual booked hrs are approved hours only. Pending hrs are submitted or edited hours still waiting for approval. "
+                     "Click [+] / [-] to open a row down to the person and their timesheet entries. You see your own hours and, for any scope you approve, "
+                     "everyone's hours on it. All weeks to date.")
+        period_note = ("These are the same approved hours as the CTR, split by week. Each line here is one week of a CTR line above, "
+                       "so it is smaller than the all-weeks figure.")
+        filtered_note = "Filtered to the client, project, scope or phase chosen above, so the total for range is only part of your hours."
 
     b = ["<h4>CTR (Cost Time Resource) - by client, project, scope and phase</h4>",
-         "<p><small>Actual booked hrs are approved hours only. Pending hrs are submitted or edited hours still waiting for approval. "
-         "Click [+] / [-] to open a row down to the person and their timesheet entries. Hours and Total roll up at every level. "
-         "Each phase is that phase's CTR, priced from the client rate card by skill code. All weeks to date.</small></p>",
+         "<p><small>%s</small></p>" % tree_note,
          '<p><input type="button" value="Expand all" onclick="openTo(9)"> <input type="button" value="Collapse all" onclick="openTo(0)"> '
          '<input type="button" value="Show to phase" onclick="openTo(3)"> <input type="button" value="Show to skill code" onclick="openTo(4)"> '
          '<input type="button" value="Show to person" onclick="openTo(5)"> <input type="button" value="Show to entries" onclick="openTo(6)"></p>',
          '<table id="ctr" border="1" cellpadding="3" cellspacing="0">%s%s%s</table>' % (head, tree_rows, foot),
          REPORT_JS,
          "<h4>Period reports (weekly) - approved hours</h4>",
-         "<p><small>These are the same approved hours as the CTR, split by week. Each line here is one week of a CTR line above, "
-         "so it is smaller than the all-weeks figure. When the date range covers every week, the total for range matches the CTR grand total.</small></p>",
+         "<p><small>%s</small></p>" % period_note,
          '<form method="get" action="/reports">%s<p>Client %s Project %s Scope %s Phase %s</p>'
          '<p>From %s To %s '
          '<input type="submit" value="Show"> <input type="button" value="Reset" onclick="location.href=\'/reports?u=%d\'"></p></form>' % (
@@ -723,19 +822,19 @@ def view_reports(con, u, q):
              sel("client", clients, client, True, "All clients", auto), sel("project", projects, project, True, "All projects", auto),
              sel("scope", scopes, scope, True, "All scopes", auto), sel("phase", phases, phase, True, "All phases", auto),
              date_input("from", d_from), date_input("to", d_to), u),
-         "<p><small>Filtered to the client, project, scope or phase chosen above, so the total for range is only part of the CTR grand total.</small></p>"
-         if filtered else "",
+         "<p><small>%s</small></p>" % filtered_note if filtered else "",
          '<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(t2)]
 
     # Internal hours: paid by NMC, not billed, so no rate and no total. Same date range, not affected by the client filters above.
+    ivis, iargs = visible_to(rv, u)
     internal = con.execute(
         "select date(t.work_date,'weekday 0','-6 days') as week_start, s.scope_code, s.description, u.name as person, ro.skill_code, "
         "sum(case when t.status='Approved' then t.hours else 0 end) as approved, "
         "sum(case when t.status in ('Submitted','Edited') then t.hours else 0 end) as pending "
         "from time_entry t join scope s on s.scope_id=t.scope_id join client c on c.client_id=s.client_id "
         "join app_user u on u.user_id=t.user_id join role ro on ro.role_id=t.worked_role_id "
-        "where c.is_internal=1 and t.status<>'Draft' and date(t.work_date,'weekday 0','-6 days') between ? and ? "
-        "group by week_start, s.scope_id, u.user_id, ro.role_id order by week_start, s.scope_code, u.name", (d_from, d_to)).fetchall()
+        "where c.is_internal=1 and t.status<>'Draft' and date(t.work_date,'weekday 0','-6 days') between ? and ?" + ivis +
+        " group by week_start, s.scope_id, u.user_id, ro.role_id order by week_start, s.scope_code, u.name", (d_from, d_to) + iargs).fetchall()
     b.append("<h4>Internal hours (paid by NMC, not billed to a client)</h4>")
     b.append("<p><small>Hours booked to Internal codes, for the date range above. They have no sales rate, so there is no total value, "
              "and they are not part of the CTR or the period report. Approved hrs are approved; pending hrs are submitted or edited and waiting for approval.</small></p>")
@@ -753,9 +852,13 @@ def view_reports(con, u, q):
 
 
 def view_ctr(con, u, q):
-    """One CTR (a phase): a Summary tab plus one tab per job family, like the tabs in the CTR workbook."""
+    """One CTR (a phase): a Summary tab plus one tab per job family, like the tabs in the CTR workbook.
+    Sales rates and values are only shown to cost controllers; everyone else sees hours, limited to what they may see."""
     if permission_of(con, u) == "admin":  # Admin (IT) has no reports
         return no_access(con, u, "CTR")
+    rv = report_view(con, u)
+    money = rv["money"]
+    vis, vargs = visible_to(rv, u)
     try:
         pid = int(q.get("phase", ["0"])[0])
     except ValueError:
@@ -770,15 +873,20 @@ def view_ctr(con, u, q):
     ents = con.execute(
         "select t.entry_id, t.work_date, t.hours, t.status, t.approved_at, r.family, r.skill_code, r.name as title, rt.sales_rate, "
         "u.name as person, ap.name as approved_by "
-        "from time_entry t join rate rt on rt.rate_id=t.rate_id join role r on r.role_id=rt.role_id "
+        "from time_entry t join scope s on s.scope_id=t.scope_id join rate rt on rt.rate_id=t.rate_id join role r on r.role_id=rt.role_id "
         "join app_user u on u.user_id=t.user_id left join app_user ap on ap.user_id=t.approved_by "
-        "where t.phase_id=? and t.status<>'Draft' order by r.family, r.skill_code, u.name, t.work_date", (pid,)).fetchall()
+        "where t.phase_id=? and t.status<>'Draft'" + vis + " order by r.family, r.skill_code, u.name, t.work_date", (pid,) + vargs).fetchall()
+    if not rv["all"] and not ents:  # nothing here is theirs to see, so say nothing about the CTR itself
+        return layout(con, u, "CTR", "<p>There are no hours you can see in this CTR. Open one from the <a href=\"/reports?u=%d\">Reports</a> page.</p>" % u)
 
     def tot(rows):
         h = sum(e["hours"] for e in rows if e["status"] == "Approved")
         t = sum(e["hours"] * e["sales_rate"] for e in rows if e["status"] == "Approved")
         p = sum(e["hours"] for e in rows if e["status"] != "Approved")
         return h, t, p
+
+    def td(v, right=False):
+        return '<td align="right">%s</td>' % v if right else "<td>%s</td>" % v
 
     families = sorted({e["family"] for e in ents})
     fam = q.get("family", ["Summary"])[0]
@@ -800,50 +908,55 @@ def view_ctr(con, u, q):
         b.append("<p>No hours have been submitted to this phase yet.</p>")
         return layout(con, u, "CTR", "".join(b))
 
+    tcol = "<th>Total</th>" if money else ""
     if fam == "Summary":
         b.append("<h4>CTR summary - %s %s, %s</h4><p><small>Actual booked hrs are approved hours. Pending hrs are submitted or edited hours waiting for approval. "
                  "Click a job family tab for its resources, people and timesheet entries.</small></p>" % (esc(ph["scope_code"]), esc(ph["description"]), esc(ph["phase"])))
         rows = []
         for f in families:
             h, t, p = tot([e for e in ents if e["family"] == f])
-            rows.append("<tr><td><a href=\"%s&amp;family=%s\">%s</a></td><td align=\"right\">%s</td><td align=\"right\">%.2f</td><td align=\"right\">%s</td></tr>"
-                        % (base, quote(f), esc(f), fmt(h), t, fmt(p)))
+            rows.append("<tr><td><a href=\"%s&amp;family=%s\">%s</a></td>%s%s%s</tr>" % (
+                base, quote(f), esc(f), td(fmt(h), True), td("%.2f" % t, True) if money else "", td(fmt(p), True)))
         h, t, p = tot(ents)
-        rows.append(sub_row(["Total", fmt(h), "%.2f" % t, fmt(p)], right_from=1))
-        b.append('<table border="1" cellpadding="3" cellspacing="0"><tr><th>Job family</th><th>Actual booked hrs</th><th>Total</th><th>Pending hrs</th></tr>%s</table>' % "".join(rows))
+        rows.append(sub_row(["Total", fmt(h)] + (["%.2f" % t] if money else []) + [fmt(p)], right_from=1))
+        b.append('<table border="1" cellpadding="3" cellspacing="0"><tr><th>Job family</th><th>Actual booked hrs</th>%s<th>Pending hrs</th></tr>%s</table>' % (tcol, "".join(rows)))
     else:
         fe = [e for e in ents if e["family"] == fam]
         b.append("<h4>%s</h4>" % esc(fam))
-        # resources: one line per job title
+        # resources: one line per job title (and per rate, for cost controllers)
         rows = []
-        for key in dict.fromkeys((e["skill_code"], e["title"], e["sales_rate"]) for e in fe):
-            part = [e for e in fe if (e["skill_code"], e["title"], e["sales_rate"]) == key]
+        rate_of = (lambda e: e["sales_rate"]) if money else (lambda e: None)
+        for key in dict.fromkeys((e["skill_code"], e["title"], rate_of(e)) for e in fe):
+            part = [e for e in fe if (e["skill_code"], e["title"], rate_of(e)) == key]
             h, t, p = tot(part)
-            rows.append("<tr><td>%s</td><td>%s</td><td align=\"right\">%.2f</td><td align=\"right\">%s</td><td align=\"right\">%.2f</td><td align=\"right\">%s</td></tr>"
-                        % (esc(key[0]), esc(key[1]), key[2], fmt(h), t, fmt(p)))
+            rows.append("<tr>%s%s%s%s%s%s</tr>" % (td(esc(key[0])), td(esc(key[1])), td("%.2f" % key[2], True) if money else "",
+                                                   td(fmt(h), True), td("%.2f" % t, True) if money else "", td(fmt(p), True)))
         h, t, p = tot(fe)
-        rows.append(sub_row(["", "Sub-total", "", fmt(h), "%.2f" % t, fmt(p)], right_from=3))
-        b.append('<p><b>Resources</b></p><table border="1" cellpadding="3" cellspacing="0"><tr><th>Skill code</th><th>Job title</th><th>Sales rate</th>'
-                 '<th>Actual booked hrs</th><th>Total</th><th>Pending hrs</th></tr>%s</table>' % "".join(rows))
+        if money:
+            rows.append(sub_row(["", "Sub-total", "", fmt(h), "%.2f" % t, fmt(p)], right_from=3))
+        else:
+            rows.append(sub_row(["", "Sub-total", fmt(h), fmt(p)], right_from=2))
+        b.append('<p><b>Resources</b></p><table border="1" cellpadding="3" cellspacing="0"><tr><th>Skill code</th><th>Job title</th>%s'
+                 '<th>Actual booked hrs</th>%s<th>Pending hrs</th></tr>%s</table>' % ("<th>Sales rate</th>" if money else "", tcol, "".join(rows)))
         # people
         rows = []
-        for key in dict.fromkeys((e["person"], e["skill_code"], e["title"], e["sales_rate"]) for e in fe):
-            part = [e for e in fe if (e["person"], e["skill_code"], e["title"], e["sales_rate"]) == key]
+        for key in dict.fromkeys((e["person"], e["skill_code"], e["title"], rate_of(e)) for e in fe):
+            part = [e for e in fe if (e["person"], e["skill_code"], e["title"], rate_of(e)) == key]
             h, t, p = tot(part)
-            rows.append("<tr><td>%s</td><td>%s</td><td align=\"right\">%s</td><td align=\"right\">%.2f</td><td align=\"right\">%s</td></tr>"
-                        % (esc(key[0]), esc("%s %s" % (key[1], key[2])), fmt(h), t, fmt(p)))
-        rows.append(sub_row(["Sub-total", "", fmt(tot(fe)[0]), "%.2f" % tot(fe)[1], fmt(tot(fe)[2])], right_from=2))
+            rows.append("<tr>%s%s%s%s%s</tr>" % (td(esc(key[0])), td(esc("%s %s" % (key[1], key[2]))), td(fmt(h), True),
+                                                 td("%.2f" % t, True) if money else "", td(fmt(p), True)))
+        rows.append(sub_row(["Sub-total", "", fmt(tot(fe)[0])] + (["%.2f" % tot(fe)[1]] if money else []) + [fmt(tot(fe)[2])], right_from=2))
         b.append('<p><b>People</b></p><table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>Booked as</th><th>Actual booked hrs</th>'
-                 '<th>Total</th><th>Pending hrs</th></tr>%s</table>' % "".join(rows))
+                 '%s<th>Pending hrs</th></tr>%s</table>' % (tcol, "".join(rows)))
         # entries
         rows = []
         for e in sorted(fe, key=lambda x: (x["work_date"], x["person"])):
-            rows.append("<tr><td>%s</td><td>%s</td><td>%s</td><td align=\"right\">%s</td><td align=\"right\">%.2f</td><td>%s</td><td>%s</td></tr>" % (
-                esc(e["work_date"]), esc(e["person"]), esc("%s %s" % (e["skill_code"], e["title"])), fmt(e["hours"]),
-                e["hours"] * e["sales_rate"], esc(e["status"]), esc(e["approved_by"] or "")))
-        b.append('<p><b>Timesheet entries</b> <small>(value = hours x sales rate; only Approved entries count towards the CTR)</small></p>'
-                 '<table border="1" cellpadding="3" cellspacing="0"><tr><th>Date</th><th>Person</th><th>Booked as</th><th>Hours</th><th>Value</th>'
-                 '<th>Status</th><th>Approved by</th></tr>%s</table>' % "".join(rows))
+            rows.append("<tr>%s%s%s%s%s%s%s</tr>" % (
+                td(esc(e["work_date"])), td(esc(e["person"])), td(esc("%s %s" % (e["skill_code"], e["title"]))), td(fmt(e["hours"]), True),
+                td("%.2f" % (e["hours"] * e["sales_rate"]), True) if money else "", td(esc(e["status"])), td(esc(e["approved_by"] or ""))))
+        b.append('<p><b>Timesheet entries</b> <small>(%sonly Approved entries count towards the CTR)</small></p>'
+                 '<table border="1" cellpadding="3" cellspacing="0"><tr><th>Date</th><th>Person</th><th>Booked as</th><th>Hours</th>%s'
+                 '<th>Status</th><th>Approved by</th></tr>%s</table>' % ("value = hours x sales rate; " if money else "", "<th>Value</th>" if money else "", "".join(rows)))
     return layout(con, u, "CTR - %s %s - %s" % (ph["scope_code"], ph["description"], ph["phase"]), "".join(b))
 
 
@@ -1414,9 +1527,27 @@ def make_server(port=8000):
     return Server(("127.0.0.1", port), Handler)
 
 
+def schema_problem(path):
+    """A message if the database at path was built with an older schema than this app needs, otherwise None."""
+    con = sqlite3.connect(path)
+    try:
+        have = con.execute("pragma user_version").fetchone()[0]
+    finally:
+        con.close()
+    if have >= REQUIRED_SCHEMA:
+        return None
+    return ("The database %s was built with an older schema (version %d, this app needs %d), so pages would fail.\n"
+            "Build a fresh one with:  python scripts/build.py\n"
+            "That makes build/timewriting.db and leaves this file alone. If TW_DB is set, clear it to use the new file "
+            "(PowerShell: Remove-Item Env:TW_DB)." % (path, have, REQUIRED_SCHEMA))
+
+
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     if not os.path.exists(DB_PATH):
         sys.exit("No database at %s. Run: python scripts/build.py" % DB_PATH)
+    problem = schema_problem(DB_PATH)
+    if problem:
+        sys.exit(problem)
     print("Timewriting mock running at http://localhost:%d  (Ctrl+C to stop)" % port)
     make_server(port).serve_forever()

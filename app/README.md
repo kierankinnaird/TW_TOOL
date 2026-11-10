@@ -1,13 +1,13 @@
 # NMC Timewriting System: v1 mock database
 
-SQLite mock of the v1 data model for the in-house timesheet system (CMAP replacement). All data is fake.
+SQLite mock of the v1 data model for the in-house timesheet system (CMAP replacement). The people and job titles in the demo data are real NMC staff, a selection taken from the staff directory (the rest are left out so they can be used to test onboarding); rates, projects, codes and hours are made up.
 
 ## Layout
 
 ```
 db/
   schema.sql      tables, triggers (business rules), views
-  seed.sql        fake data (2 clients plus the Internal client with 3 internal codes, 29 job titles in job families, 30 users, 4 projects, 9 scopes, 10 phases, 52 entries over 2 weeks)
+  seed.sql        demo data (2 clients plus the Internal client with 3 internal codes, 32 job titles in job families (3 with no rate card), 30 users, 4 projects, 9 scopes, 10 phases, 52 entries over 2 weeks)
 app/
   app.py          front end (plain HTML and one inline stylesheet, standard library only, no framework)
   static/         the TASA Orbiter font file, the only static file the app serves
@@ -39,6 +39,8 @@ python scripts/build.py
 python app/app.py                            # then open http://localhost:8000
 ```
 
+The app checks the database's schema version when it starts (`PRAGMA user_version` in `db/schema.sql`, `REQUIRED_SCHEMA` in `app/app.py`; raise both together when a schema change would break older databases). If it says the database was built with an older schema, run `python scripts/build.py` to make a fresh `build/timewriting.db`. That leaves any other database file alone, so a database you pointed `TW_DB` at keeps its data; clear `TW_DB` (PowerShell: `Remove-Item Env:TW_DB`) to use the new one.
+
 Pages: My Timesheet (weekly grid), Approvals (approvers only), Reports (CTR and weekly period reports), Admin and Audit trail (cost controllers and the IT admin, each seeing their own tabs). Rebuilding the database resets the data.
 
 ## Roles
@@ -49,11 +51,12 @@ Each person has one permission level: `user`, `controller` (cost controller) or 
 |---|---|---|---|---|
 | Own timesheet | Yes | Yes | Yes | Yes |
 | Approvals page, approve or reject | No | Yes, for their scopes only, never their own hours | No | No |
-| Reports | Yes | Yes | Yes | No |
+| Reports | Own hours only, no values | Own hours plus everyone's hours on their scopes, no values | Everything, with £ values and sales rates | No |
+| £ values and sales rates | No | No | Yes | No |
 | Admin tabs | None | None | Weekly periods, clients, rate cards, PAAFs, projects / scopes / phases, internal codes | Weekly periods, users, job roles |
 | Audit trail | No | No | Yes | Yes |
 
-The demo accounts are Eilidh Rankin (controller) and Hugh Calder (admin). Alasdair Murray is a standard user who approves several scopes. Still to come from the roles matrix: reports limited to a person's own hours or codes and values hidden from everyone but cost controllers, a missing-timesheets view, reopening a timesheet, transaction controls, and more. Who owns weekly periods and the audit trail is still to be confirmed with the cost team, so for now both controllers and admins can use them.
+In the demo data, Alisdair Woodhead approves for Apache and Kenneth Nicolson for Spirit (both standard users). The cost controllers are the two cost engineers, Emma Noble and Abbi Murray, and Stephanie Apedaile (commercial lead), who is not a cost engineer: cost permission is set per person on the Users tab, never taken from a job title, so anyone can be given it when the system goes live. NMC Admin is the IT account. Sales rates and £ values are never put in the page for anyone but a cost controller; the reports, their filters and the CTR page only show other people what they may see. Still to come from the roles matrix: a missing-timesheets view, reopening a timesheet, transaction controls, and more. Who owns weekly periods and the audit trail is still to be confirmed with the cost team, so for now both controllers and admins can use them.
 
 Admin tabs: weekly periods (close a week, or open a missed one), users, roles / skill codes, clients, client rate cards, PAAFs (raise, mark sent, approve with the signed form reference, reject), projects, scopes (each needs an approver) and phases, and internal codes. Users, roles, scopes and internal codes can be edited; rates are never edited, you add a new one with a later effective date.
 

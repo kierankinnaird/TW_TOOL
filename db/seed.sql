@@ -1,4 +1,5 @@
--- Fake seed data for the v1 mock database. All names, rates and codes are examples.
+-- Seed data for the v1 mock database. The people and their job titles come from the NMC staff directory (a selection, so the rest
+-- can be used to test onboarding). Rates, codes, projects and hours are examples.
 
 -- Job titles come from the resource tables in the Morecambe Hub estimate (NMC-A0100-PM-EST-0001), grouped into job families.
 INSERT INTO role (role_id, skill_code, name, family) VALUES
@@ -30,14 +31,19 @@ INSERT INTO role (role_id, skill_code, name, family) VALUES
  (26,'ME-02','Senior Mechanical Engineer','Mechanical Engineering'),
  (27,'ME-03','Senior Mechanical Designer','Mechanical Engineering'),
  (28,'QC-01','Lead QA/QC Engineer','QA/QC'),
- (29,'QC-02','Senior QA/QC Inspector','QA/QC');
+ (29,'QC-02','Senior QA/QC Inspector','QA/QC'),
+ -- Head of Projects is priced like a Project Manager (a placeholder until the cost team sets a rate). The other two titles never
+ -- bill a client, so they have no rate card (internal codes only).
+ (30,'PM-08','Head of Projects','Project Management'),
+ (31,'BS-01','System Administrator','Business Services'),
+ (32,'BS-02','Commercial Lead','Business Services');
 
 INSERT INTO client (client_id, name) VALUES (1,'Apache'),(2,'Spirit');
 -- NMC's own client for internal hours (paid by NMC, not billed). Its codes are scopes under one project; admin can add more.
 INSERT INTO client (client_id, name, is_internal) VALUES (3,'Internal',1);
 
 -- Rate cards. Spirit rates are the estimate's GBP/hr by job title; Apache rates are example figures (Spirit x 0.95, nearest 0.50).
--- rate_id: roles 1-6 are Apache 1-6 and Spirit 7-12; roles 7-29 are Apache 13-35 and Spirit 36-58.
+-- rate_id: roles 1-6 are Apache 1-6 and Spirit 7-12; roles 7-29 are Apache 13-35 and Spirit 36-58. Head of Projects (role 30) is Apache 59, Spirit 60.
 INSERT INTO rate (rate_id, client_id, role_id, sales_rate) VALUES
  (1,1,1,114.00),
  (2,1,2,104.50),
@@ -96,54 +102,57 @@ INSERT INTO rate (rate_id, client_id, role_id, sales_rate) VALUES
  (55,2,26,80.00),
  (56,2,27,68.00),
  (57,2,28,80.00),
- (58,2,29,65.00);
+ (58,2,29,65.00),
+ (59,1,30,114.00),
+ (60,2,30,120.00);
 
 INSERT INTO app_user (user_id, nmc_id, employment_type, name, role_id, permission, start_date, end_date) VALUES
- (1, 'A001','Staff',   'Isla Fraser',       6,'user', '2026-01-01',NULL),
- (2, 'A002','Staff',   'Callum Reid',       6,'user', '2026-01-01',NULL),
- (3, 'A003','Contract','Morag Sinclair',    5,'user', '2026-01-01',NULL),
- (4, 'A004','Staff',   'Fraser Gordon',     4,'user', '2026-01-01',NULL),
- (5, 'A005','Contract','Ewan Mackay',       4,'user', '2026-03-01',NULL),
- (6, 'A006','Staff',   'Rhona Campbell',    1,'user', '2026-01-01',NULL),
- (7, 'A007','Staff',   'Alasdair Murray',   2,'user', '2026-01-01',NULL),
- (8, 'A008','Staff',   'Niall Robertson',   1,'user', '2026-01-01',NULL),
- (9, 'A009','Staff',   'Gregor Munro',      3,'user', '2026-02-01',NULL),
- (10,'A010','Staff',   'Catriona Duff',     4,'user', '2026-02-01',NULL),
- (11,'A011','Staff','Hamish Lennox',7,'user','2026-01-01',NULL),
- (12,'A012','Staff','Eilidh Stewart',15,'user','2026-01-01',NULL),
- (13,'A013','Contract','Duncan Baird',16,'user','2026-01-01',NULL),
- (14,'A014','Staff','Kirsty Imrie',17,'user','2026-01-01',NULL),
- (15,'A015','Staff','Struan Fyfe',19,'user','2026-01-01',NULL),
- (16,'A016','Staff','Ailsa Menzies',18,'user','2026-01-01',NULL),
- (17,'A017','Contract','Calum Dunbar',20,'user','2026-01-01',NULL),
- (18,'A018','Staff','Rory Cattanach',21,'user','2026-01-01',NULL),
- (19,'A019','Staff','Mairi Thomson',23,'user','2026-01-01',NULL),
- (20,'A020','Contract','Lachlan Rennie',22,'user','2026-01-01',NULL),
- (21,'A021','Staff','Fiona Gillespie',11,'user','2026-01-01',NULL),
- (22,'A022','Staff','Alan Weir',13,'user','2026-01-01',NULL),
- (23,'A023','Staff','Shona Barclay',10,'user','2026-01-01',NULL),
- (24,'A024','Staff','Euan Drummond',24,'user','2026-01-01',NULL),
- (25,'A025','Staff','Bethany Cruickshank',9,'user','2026-01-01',NULL),
- (26,'A026','Contract','Murdo Ferrier',8,'user','2026-01-01',NULL),
- (27,'A027','Staff','Gavin Ross',29,'user','2026-01-01',NULL),
- (28,'A028','Staff','Isobel Hay',25,'user','2026-01-01',NULL),
- -- Demo accounts for the other permission levels. Cost controllers manage codes, scopes, rates and PAAFs and see all reports with values;
- -- the admin (IT) account manages users and job roles only. Neither approves hours.
- (29,'A029','Staff','Eilidh Rankin',5,'controller','2026-01-01',NULL),
- (30,'A030','Staff','Hugh Calder',10,'admin','2026-01-01',NULL);
+ (1, 'A001','Staff',   'Emma Noble',        6,'controller','2026-01-01',NULL),
+ (2, 'A002','Staff',   'Abbi Murray',       6,'controller','2026-01-01',NULL),
+ (3, 'A003','Contract','Stuart Sherwood',   5,'user', '2026-01-01',NULL),
+ (4, 'A004','Staff',   'David Hart',        4,'user', '2026-01-01',NULL),
+ (5, 'A005','Contract','Ewan Shaw',         4,'user', '2026-03-01',NULL),
+ (6, 'A006','Staff',   'Jamie Ireland',     1,'user', '2026-01-01',NULL),
+ (7, 'A007','Staff',   'Alisdair Woodhead', 2,'user', '2026-01-01',NULL),
+ (8, 'A008','Staff',   'Kenneth Nicolson',  30,'user','2026-01-01',NULL),
+ (9, 'A009','Staff',   'Daniel Evans',      3,'user', '2026-02-01',NULL),
+ (10,'A010','Staff',   'Ajin Sabu',         4,'user', '2026-02-01',NULL),
+ (11,'A011','Staff','Louis Ducharme',7,'user','2026-01-01',NULL),
+ (12,'A012','Staff','Gary Martin',15,'user','2026-01-01',NULL),
+ (13,'A013','Contract','Ken Smart',16,'user','2026-01-01',NULL),
+ (14,'A014','Staff','Andy Gray',17,'user','2026-01-01',NULL),
+ (15,'A015','Staff','Peter McConnachie',19,'user','2026-01-01',NULL),
+ (16,'A016','Staff','Craig Mahoney',18,'user','2026-01-01',NULL),
+ (17,'A017','Contract','Barry Philp',20,'user','2026-01-01',NULL),
+ (18,'A018','Staff','Lloyd Quinn',21,'user','2026-01-01',NULL),
+ (19,'A019','Staff','Janis Watt',23,'user','2026-01-01',NULL),
+ (20,'A020','Contract','Gary Davidson',22,'user','2026-01-01',NULL),
+ (21,'A021','Staff','Neil Pennock',11,'user','2026-01-01',NULL),
+ (22,'A022','Staff','Jason Pang',13,'user','2026-01-01',NULL),
+ (23,'A023','Staff','Arlene Chalmers',10,'user','2026-01-01',NULL),
+ (24,'A024','Staff','Rob Millman',24,'user','2026-01-01',NULL),
+ (25,'A025','Staff','Gary Bridge',9,'user','2026-01-01',NULL),
+ (26,'A026','Contract','Greig McAndrew',8,'user','2026-01-01',NULL),
+ (27,'A027','Staff','Jai Hart',10,'user','2026-01-01',NULL),
+ (28,'A028','Staff','Jamie McNab',25,'user','2026-01-01',NULL),
+ -- Permission levels. Cost controllers manage codes, scopes, rates and PAAFs and see all reports with values; they do not have to be
+ -- cost engineers (Stephanie Apedaile is the commercial lead). The admin (IT) account manages users and job roles only.
+ -- Neither approves hours. Alisdair Woodhead approves for Apache and Kenneth Nicolson for Spirit (see the scopes below).
+ (29,'A029','Staff','Stephanie Apedaile',32,'controller','2026-01-01',NULL),
+ (30,'A030','Staff','NMC Admin',31,'admin','2026-01-01',NULL);
 
 -- PAAFs: one per user per client. Rate = client sales rate for the user's own role.
 INSERT INTO paaf (paaf_id, user_id, client_id, rate_id, status, sent_date, decided_date, document_ref) VALUES
- (1, 5, 1, 4, 'Approved','2026-03-02','2026-03-09','paaf/apache/A005_Ewan_Mackay.pdf'),
- (2, 3, 1, 5, 'Approved','2026-01-05','2026-01-12','paaf/apache/A003_Morag_Sinclair.pdf'),
- (3, 1, 1, 6, 'Approved','2026-01-05','2026-01-12','paaf/apache/A001_Isla_Fraser.pdf'),
+ (1, 5, 1, 4, 'Approved','2026-03-02','2026-03-09','paaf/apache/A005_Ewan_Shaw.pdf'),
+ (2, 3, 1, 5, 'Approved','2026-01-05','2026-01-12','paaf/apache/A003_Stuart_Sherwood.pdf'),
+ (3, 1, 1, 6, 'Approved','2026-01-05','2026-01-12','paaf/apache/A001_Emma_Noble.pdf'),
  (4, 4, 1, 4, 'Sent',    '2026-11-04',NULL,        NULL),
- (5, 1, 2, 12,'Approved','2026-01-06','2026-01-14','paaf/spirit/A001_Isla_Fraser.pdf'),
- (6, 3, 2, 11,'Approved','2026-01-06','2026-01-14','paaf/spirit/A003_Morag_Sinclair.pdf'),
+ (5, 1, 2, 12,'Approved','2026-01-06','2026-01-14','paaf/spirit/A001_Emma_Noble.pdf'),
+ (6, 3, 2, 11,'Approved','2026-01-06','2026-01-14','paaf/spirit/A003_Stuart_Sherwood.pdf'),
  (7, 2, 2, 12,'Draft',   NULL,        NULL,        NULL),
- (8, 9, 1, 3, 'Approved','2026-02-02','2026-02-10','paaf/apache/A009_Gregor_Munro.pdf'),
- (9, 9, 2, 9, 'Approved','2026-02-02','2026-02-11','paaf/spirit/A009_Gregor_Munro.pdf'),
- (10,10,2, 10,'Approved','2026-02-02','2026-02-11','paaf/spirit/A010_Catriona_Duff.pdf'),
+ (8, 9, 1, 3, 'Approved','2026-02-02','2026-02-10','paaf/apache/A009_Daniel_Evans.pdf'),
+ (9, 9, 2, 9, 'Approved','2026-02-02','2026-02-11','paaf/spirit/A009_Daniel_Evans.pdf'),
+ (10,10,2, 10,'Approved','2026-02-02','2026-02-11','paaf/spirit/A010_Ajin_Sabu.pdf'),
  (11,11,1,13,'Approved','2026-02-02','2026-02-10','paaf/apache/A011.pdf'),
  (12,12,1,21,'Approved','2026-02-02','2026-02-10','paaf/apache/A012.pdf'),
  (13,13,1,22,'Approved','2026-02-02','2026-02-10','paaf/apache/A013.pdf'),
@@ -159,7 +168,7 @@ INSERT INTO paaf (paaf_id, user_id, client_id, rate_id, status, sent_date, decid
  (23,23,1,16,'Approved','2026-02-02','2026-02-10','paaf/apache/A023.pdf'),
  (24,24,1,30,'Approved','2026-02-02','2026-02-10','paaf/apache/A024.pdf'),
  (25,26,1,14,'Approved','2026-02-02','2026-02-10','paaf/apache/A026.pdf'),
- (26,27,1,35,'Approved','2026-02-02','2026-02-10','paaf/apache/A027.pdf'),
+ (26,27,1,16,'Approved','2026-02-02','2026-02-10','paaf/apache/A027.pdf'),
  (27,28,1,31,'Approved','2026-02-02','2026-02-10','paaf/apache/A028.pdf'),
  (28,11,2,36,'Approved','2026-02-02','2026-02-11','paaf/spirit/A011.pdf'),
  (29,12,2,44,'Approved','2026-02-02','2026-02-11','paaf/spirit/A012.pdf'),
@@ -168,7 +177,11 @@ INSERT INTO paaf (paaf_id, user_id, client_id, rate_id, status, sent_date, decid
  (32,19,2,52,'Approved','2026-02-02','2026-02-11','paaf/spirit/A019.pdf'),
  (33,20,2,51,'Approved','2026-02-02','2026-02-11','paaf/spirit/A020.pdf'),
  (34,25,2,38,'Approved','2026-02-02','2026-02-11','paaf/spirit/A025.pdf'),
- (35,26,2,37,'Approved','2026-02-02','2026-02-11','paaf/spirit/A026.pdf');
+ (35,26,2,37,'Approved','2026-02-02','2026-02-11','paaf/spirit/A026.pdf'),
+ -- The approvers hold a PAAF for the client they approve, so they can book hours to its scopes too. Their own hours are approved
+ -- by a cost controller, since nobody may approve their own and the scope has no other approver.
+ (36,8,2,60,'Approved','2026-02-02','2026-02-11','paaf/spirit/A008.pdf'),
+ (37,7,1,2, 'Approved','2026-02-02','2026-02-10','paaf/apache/A007.pdf');
 
 INSERT INTO project (project_id, project_code, name, client_id) VALUES
  (1,'APJ-01','Wellbay Decommissioning',1),
@@ -177,12 +190,12 @@ INSERT INTO project (project_id, project_code, name, client_id) VALUES
  (4,'INT','Internal',3);
 
 INSERT INTO scope (scope_id, scope_code, client_id, project_id, description, status, approver_user_id) VALUES
- (1,'BB0001',1,1,'Wellbay Clearance','Open',    6),
+ (1,'BB0001',1,1,'Wellbay Clearance','Open',    7),
  (2,'BB0002',1,2,'Platform Study',   'Open',    7),
  (3,'FB0001',1,2,'EDC Engineering',  'Closed',  7),
  (4,'A1400', 2,3,'Rivers and Calder','Pipeline',8),
  (5,'A1500', 2,3,'PGC & NRU',        'Open',    8),
- (6,'A1600', 2,3,'Pipeline Removal', 'Open',    7),
+ (6,'A1600', 2,3,'Pipeline Removal', 'Open',    8),
  -- Internal codes (no PAAF, no rate)
  (7,'INT01',3,4,'Business Services',   'Open', 7),
  (8,'INT02',3,4,'Training',            'Open', 7),
@@ -205,34 +218,34 @@ INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, ra
  (1,5,6,5,6,12, '2026-10-28',8,1),
  (9,2,3,8,3,3,  '2026-10-29',8,9),
  (10,5,6,10,4,10,'2026-10-27',8,10),
- -- Week of 2 Nov. Ewan Mackay (Planner): own role Mon-Tue, covering Project Controls Manager Wed-Thu
+ -- Week of 2 Nov. Ewan Shaw (Planner): own role Mon-Tue, covering Project Controls Manager Wed-Thu
  (5,1,1,1,4,4, '2026-11-02',8,5),
  (5,1,1,1,4,4, '2026-11-03',8,5),
  (5,1,1,1,5,5, '2026-11-04',8,5),
  (5,1,1,1,5,5, '2026-11-05',8,5),
- -- Morag Sinclair (Project Controls Manager): two Apache scopes in one day, then Spirit
+ -- Stuart Sherwood (Project Controls Manager): two Apache scopes in one day, then Spirit
  (3,1,1,2,5,5, '2026-11-02',6,3),
  (3,2,3,2,5,5, '2026-11-02',2,3),
  (3,5,6,6,5,11,'2026-11-03',8,3),
  (3,5,6,6,5,11,'2026-11-04',8,3),
  (3,2,3,2,5,5, '2026-11-05',4,3),
  (3,6,7,6,5,11,'2026-11-05',4,3),
- -- Isla Fraser (Cost Engineer): Apache and Spirit
+ -- Emma Noble (Cost Engineer): Apache and Spirit
  (1,1,1,3,6,6, '2026-11-02',4,1),
  (1,5,6,5,6,12,'2026-11-02',4,1),
  (1,6,7,5,6,12,'2026-11-03',8,1),
  (1,2,3,3,6,6, '2026-11-04',8,1),
  (1,1,1,3,6,6, '2026-11-05',8,1),
- -- Gregor Munro (Project Engineer): Apache and Spirit
+ -- Daniel Evans (Project Engineer): Apache and Spirit
  (9,1,1,8,3,3, '2026-11-02',8,9),
  (9,5,6,9,3,9, '2026-11-03',8,9),
  (9,2,3,8,3,3, '2026-11-04',8,9),
  (9,6,7,9,3,9, '2026-11-05',8,9),
- -- Catriona Duff (Planner): Spirit, covering Project Controls Manager on Wednesday
+ -- Ajin Sabu (Planner): Spirit, covering Project Controls Manager on Wednesday
  (10,5,6,10,4,10,'2026-11-02',8,10),
  (10,5,6,10,4,10,'2026-11-03',8,10),
  (10,6,7,10,5,11,'2026-11-04',8,10),
- -- Execute phase of BB0001: Gregor Munro (Project Engineer)
+ -- Execute phase of BB0001: Daniel Evans (Project Engineer)
  (9,1,2,8,3,3,'2026-11-03',8,9);
 
 -- More people across job families (booked to their own job title)
@@ -263,31 +276,31 @@ INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, ra
 
 -- Approvals are edits, so they name who did it (and are written to time_entry_audit).
 -- Week of 26 Oct: approved by each scope's approver.
-UPDATE time_entry SET status='Approved', approved_by=6, approved_at='2026-11-02 09:00',
-       last_edited_by=6, last_edited_at='2026-11-02 09:00' WHERE scope_id=1 AND work_date < '2026-11-02';
+UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-02 09:00',
+       last_edited_by=7, last_edited_at='2026-11-02 09:00' WHERE scope_id=1 AND work_date < '2026-11-02';
 UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-02 09:05',
        last_edited_by=7, last_edited_at='2026-11-02 09:05' WHERE scope_id=2 AND work_date < '2026-11-02';
 UPDATE time_entry SET status='Approved', approved_by=8, approved_at='2026-11-02 09:10',
        last_edited_by=8, last_edited_at='2026-11-02 09:10' WHERE scope_id=5 AND work_date < '2026-11-02';
 
 -- Week of 2 Nov: partly approved.
-UPDATE time_entry SET status='Approved', approved_by=6, approved_at='2026-11-06 09:00',
-       last_edited_by=6, last_edited_at='2026-11-06 09:00'
+UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-06 09:00',
+       last_edited_by=7, last_edited_at='2026-11-06 09:00'
  WHERE scope_id=1 AND work_date IN ('2026-11-02','2026-11-03');
 UPDATE time_entry SET status='Approved', approved_by=8, approved_at='2026-11-06 09:15',
        last_edited_by=8, last_edited_at='2026-11-06 09:15'
  WHERE scope_id=5 AND work_date >= '2026-11-02';
 
 -- Close the week of 26 Oct.
-UPDATE period SET status='Closed', closed_by=7, closed_at='2026-11-02 12:00' WHERE week_start='2026-10-26';
+UPDATE period SET status='Closed', closed_by=29, closed_at='2026-11-02 12:00' WHERE week_start='2026-10-26';
 
 -- Controlled edit after the period closed: Approved -> Edited (reason required), then re-approved.
 UPDATE time_entry SET hours=7.5, status='Edited', edit_count=edit_count+1,
        last_change_reason='Hours corrected after Apache query on 27 Oct',
        last_edited_by=7, last_edited_at='2026-11-04 10:00'
  WHERE user_id=5 AND work_date='2026-10-27';
-UPDATE time_entry SET status='Approved', approved_by=6, approved_at='2026-11-04 14:00',
-       last_edited_by=6, last_edited_at='2026-11-04 14:00'
+UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-04 14:00',
+       last_edited_by=7, last_edited_at='2026-11-04 14:00'
  WHERE user_id=5 AND work_date='2026-10-27';
 
 -- Owner corrects an approved entry this week: now Edited, waiting for re-approval.
@@ -298,5 +311,5 @@ UPDATE time_entry SET hours=7, status='Edited', edit_count=edit_count+1,
 
 -- Rejected: back to Draft with the reason stored.
 UPDATE time_entry SET status='Draft', reject_reason='Project Controls Manager cover not agreed with client, please confirm',
-       last_edited_by=7, last_edited_at='2026-11-06 10:00'
+       last_edited_by=8, last_edited_at='2026-11-06 10:00'
  WHERE user_id=10 AND work_date='2026-11-04';

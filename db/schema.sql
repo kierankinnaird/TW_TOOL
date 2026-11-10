@@ -1,5 +1,8 @@
 -- NMC Timewriting System - v1 mock database (SQLite)
 PRAGMA foreign_keys = ON;
+-- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
+-- so raise both together whenever an older database could no longer work with the app.
+PRAGMA user_version = 1;
 
 -- Controlled list of job titles, grouped into job families. Editable by admin/superuser.
 CREATE TABLE role (
@@ -238,14 +241,18 @@ BEGIN
     WHERE OLD.status = 'Submitted' AND NEW.status = 'Draft'
       AND (NEW.reject_reason IS NULL OR NEW.reject_reason = '');
 
-    -- approval: only the person named as the scope's approver, never the entry owner.
-    -- Cost controllers and admins never approve, even if they were named approver.
-    SELECT RAISE(ABORT, 'Only the scope approver can approve (and not their own entry)')
+    -- approval: the person named as the scope's approver, never the entry owner. One exception: hours booked BY the scope's
+    -- approver have nobody else who may approve them, so a cost controller approves those. Admins never approve.
+    SELECT RAISE(ABORT, 'Only the scope approver can approve (and not their own entry); a cost controller approves hours booked by the scope approver')
     WHERE NEW.status = 'Approved' AND OLD.status <> 'Approved'
       AND (NEW.approved_by IS NULL
            OR NEW.approved_by = NEW.user_id
-           OR NEW.approved_by <> (SELECT approver_user_id FROM scope WHERE scope_id = NEW.scope_id)
-           OR (SELECT permission FROM app_user WHERE user_id = NEW.approved_by) <> 'user');
+           OR NOT (
+                (NEW.approved_by = (SELECT approver_user_id FROM scope WHERE scope_id = NEW.scope_id)
+                 AND (SELECT permission FROM app_user WHERE user_id = NEW.approved_by) = 'user')
+                OR
+                ((SELECT permission FROM app_user WHERE user_id = NEW.approved_by) = 'controller'
+                 AND NEW.user_id = (SELECT approver_user_id FROM scope WHERE scope_id = NEW.scope_id))));
 END;
 
 CREATE TRIGGER trg_time_entry_audit_insert

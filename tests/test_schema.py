@@ -34,7 +34,7 @@ class TestSeed(Base):
     def test_counts(self):
         self.assertEqual(self.scalar("select count(*) from app_user"), 30)
         self.assertEqual(self.scalar("select count(*) from time_entry"), 52)
-        self.assertEqual(self.scalar("select count(*) from rate"), 58)
+        self.assertEqual(self.scalar("select count(*) from rate"), 60)
 
     def test_rates_rise_with_seniority_for_each_client(self):
         order = ["Cost Engineer", "Planner", "Project Engineer", "Project Controls Manager",
@@ -46,7 +46,7 @@ class TestSeed(Base):
             self.assertEqual([rows[n] for n in order], sorted(rows[n] for n in order), client)
 
     def test_job_families_and_titles_from_the_estimate(self):
-        self.assertEqual(self.scalar("select count(*) from role"), 29)
+        self.assertEqual(self.scalar("select count(*) from role"), 32)
         families = {r[0] for r in self.con.execute("select family from role")}
         for f in ["Project Management", "Engineering Management", "Project Engineering", "Piping Engineering", "Technical Safety", "HSES", "QA/QC"]:
             self.assertIn(f, families)
@@ -54,7 +54,10 @@ class TestSeed(Base):
 
     def test_every_user_has_a_job_title_and_every_title_is_priced_for_both_clients(self):
         self.assertEqual(self.scalar("select count(*) from app_user where role_id not in (select role_id from role)"), 0)
-        self.assertEqual(self.scalar("select count(*) from role r where (select count(*) from rate where role_id=r.role_id)<>2"), 0)
+        self.assertEqual(self.scalar("select count(*) from role r where (select count(*) from rate where role_id=r.role_id) not in (0, 2)"), 0)
+        # the only titles without a rate card never bill a client
+        self.assertEqual({r[0] for r in self.con.execute("select name from role r where not exists (select 1 from rate where role_id=r.role_id)")},
+                         {"System Administrator", "Commercial Lead"})
 
     def test_spirit_rates_match_the_morecambe_hub_estimate(self):
         rows = dict(self.con.execute("select r.name, rt.sales_rate from rate rt join role r using(role_id) join client c using(client_id) where c.name='Spirit'"))
@@ -67,7 +70,7 @@ class TestSeed(Base):
 
 
 class TestBookingRules(Base):
-    # Seed ids: Ewan=5 (paaf 1, Apache), Fraser=4 (paaf 4 'Sent'), Isla=1 (paaf 3 Apache, 5 Spirit)
+    # Seed ids: Ewan Shaw=5 (paaf 1, Apache), David Hart=4 (paaf 4 'Sent'), Emma Noble=1 (paaf 3 Apache, 5 Spirit)
     def test_valid_booking_is_accepted_and_audited(self):
         self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 8, 5))
         self.assertEqual(self.scalar("select count(*) from time_entry_audit where action='CREATE'"), 53)
@@ -182,7 +185,7 @@ class TestLifecycle(Base):
             "last_edited_by=7, last_edited_at='t1' WHERE entry_id=?", (eid,))
         self.assertEqual(self.scalar("select status from time_entry where entry_id=?", eid), "Edited")
         self.con.execute(
-            "UPDATE time_entry SET status='Approved', approved_by=6, last_edited_by=6, last_edited_at='t2' WHERE entry_id=?",
+            "UPDATE time_entry SET status='Approved', approved_by=7, last_edited_by=7, last_edited_at='t2' WHERE entry_id=?",
             (eid,))
         row = self.con.execute("select status, hours, edit_count from time_entry where entry_id=?", (eid,)).fetchone()
         self.assertEqual(row, ("Approved", 6, 1))
@@ -196,13 +199,13 @@ class TestLifecycle(Base):
         self.assertEqual(self.scalar("select reason from time_entry_audit where entry_id=? and new_status='Draft'", eid), "No")
 
     def test_only_the_named_scope_approver_can_approve(self):
-        eid = self.first("status='Submitted' and scope_id=1")  # scope 1 approver = Rhona (6)
+        eid = self.first("status='Submitted' and scope_id=1")  # scope 1 (Apache) approver = Alisdair Woodhead (7)
         sql = "UPDATE time_entry SET status='Approved', approved_by=?, last_edited_by=?, last_edited_at='t1' WHERE entry_id=?"
-        self.blocked(sql, (1, 1, eid), "Only the scope approver")   # Isla: not an approver
-        self.blocked(sql, (7, 7, eid), "Only the scope approver")   # Alasdair approves other scopes, not this one
+        self.blocked(sql, (5, 5, eid), "Only the scope approver")   # Ewan Shaw: not an approver
+        self.blocked(sql, (8, 8, eid), "Only the scope approver")   # Kenneth Nicolson approves the Spirit scopes, not this one
         self.blocked(sql, (29, 29, eid), "Only the scope approver")  # the cost controller never approves
         self.blocked(sql, (30, 30, eid), "Only the scope approver")  # nor does the IT admin
-        self.con.execute(sql, (6, 6, eid))                          # Rhona: the named approver
+        self.con.execute(sql, (7, 7, eid))                          # Alisdair: the named approver
 
     def test_nobody_approves_their_own_entry(self):
         eid = self.scalar("select entry_id from time_entry where user_id=5 and status='Submitted' limit 1")
@@ -227,7 +230,7 @@ class TestLifecycle(Base):
         self.assertEqual(tuple(row), ("DELETE", 5, "Draft", 8))
 
     def test_rejected_entry_back_in_draft_can_be_cleared(self):
-        eid = self.scalar("select entry_id from time_entry where status='Draft' limit 1")  # Catriona's rejected entry
+        eid = self.scalar("select entry_id from time_entry where status='Draft' limit 1")  # Ajin Sabu's rejected entry
         self.con.execute("UPDATE time_entry SET last_edited_by=10, last_edited_at='t9' WHERE entry_id=?", (eid,))
         self.con.execute("DELETE FROM time_entry WHERE entry_id=?", (eid,))
         self.assertEqual(self.scalar("select count(*) from time_entry"), 51)
@@ -274,9 +277,17 @@ class TestViews(Base):
 
 class TestPermissionLevels(Base):
     """user / controller / admin. Approver is not a level: it means being named on a scope, and only standard users can be."""
-    def test_there_are_three_levels_and_the_demo_has_one_controller_and_one_admin(self):
+    def test_there_are_three_levels_and_the_demo_has_controllers_and_one_admin(self):
         levels = dict(self.con.execute("select permission, count(*) from app_user group by permission").fetchall())
-        self.assertEqual(levels, {"user": 28, "controller": 1, "admin": 1})
+        self.assertEqual(levels, {"user": 26, "controller": 3, "admin": 1})
+
+    def test_cost_permission_does_not_depend_on_job_title(self):
+        # the two cost engineers are controllers, and so is the commercial lead, who is not a cost engineer
+        controllers = {r[0]: r[1] for r in self.con.execute("select u.name, r.name from app_user u join role r using(role_id) where permission='controller'")}
+        self.assertEqual(controllers, {"Emma Noble": "Cost Engineer", "Abbi Murray": "Cost Engineer", "Stephanie Apedaile": "Commercial Lead"})
+        # and anyone can be given it, whatever their title (as long as they approve nothing)
+        self.con.execute("UPDATE app_user SET permission='controller' WHERE name='Daniel Evans'")
+        self.assertEqual(self.scalar("select permission from app_user where name='Daniel Evans'"), "controller")
         self.blocked("UPDATE app_user SET permission='superuser' WHERE user_id=1")
 
     def test_no_controller_or_admin_is_an_approver_in_the_demo_data(self):
@@ -290,15 +301,34 @@ class TestPermissionLevels(Base):
         self.con.execute(new, (6,))                 # a standard user is fine
         self.blocked("UPDATE scope SET approver_user_id=29 WHERE scope_code='BB0001'", msg="standard user")
 
+    def test_the_approvers_can_book_to_the_client_they_approve(self):
+        # Alisdair Woodhead (7, Apache) and Kenneth Nicolson (8, Spirit) each hold an approved PAAF for their client, and Head of Projects is priced
+        for user, client in ((7, "Apache"), (8, "Spirit")):
+            self.assertEqual(self.scalar("select count(*) from paaf p join client c using(client_id) where p.user_id=? and c.name=? and p.status='Approved'", user, client), 1)
+        self.assertEqual(self.scalar("select count(*) from rate r join role ro using(role_id) where ro.name='Head of Projects'"), 2)
+
+    def test_a_cost_controller_approves_hours_booked_by_the_scope_approver_and_nothing_else(self):
+        # Kenneth (8) approves A1500 (scope 5, phase 6) and books to it with his Spirit PAAF 36 and the Head of Projects rate 60
+        eid = self.con.execute(NEW_ENTRY, (8, 5, 6, 36, 30, 60, "2026-11-04", 4, 8)).lastrowid
+        sql = "UPDATE time_entry SET status='Approved', approved_by=?, last_edited_by=?, last_edited_at='t1' WHERE entry_id=?"
+        self.blocked(sql, (8, 8, eid), "not their own entry")        # never their own
+        self.blocked(sql, (7, 7, eid), "Only the scope approver")    # another approver
+        self.blocked(sql, (30, 30, eid), "Only the scope approver")  # the admin never approves
+        self.con.execute(sql, (29, 29, eid))                         # a cost controller does
+        self.assertEqual(self.scalar("select approved_by from time_entry where entry_id=?", eid), 29)
+        # ...but a controller still cannot approve anyone else's hours (Ewan Shaw's on scope 1)
+        other = self.scalar("select entry_id from time_entry where status='Submitted' and scope_id=1 limit 1")
+        self.blocked(sql, (29, 29, other), "Only the scope approver")
+
     def test_an_approver_cannot_be_made_a_controller_or_admin_while_still_named(self):
-        self.blocked("UPDATE app_user SET permission='controller' WHERE user_id=6", msg="Remove this person as scope approver")
+        self.blocked("UPDATE app_user SET permission='controller' WHERE user_id=8", msg="Remove this person as scope approver")
         self.blocked("UPDATE app_user SET permission='admin' WHERE user_id=7", msg="Remove this person as scope approver")
-        self.con.execute("UPDATE app_user SET permission='controller' WHERE user_id=1")  # Isla approves nothing, so this is fine
+        self.con.execute("UPDATE app_user SET permission='controller' WHERE user_id=5")  # Ewan Shaw approves nothing, so this is fine
 
 
 class TestInternalHours(Base):
     """Internal hours: paid by NMC, booked to Internal codes. No PAAF, no rate, kept out of the client reports."""
-    # Fraser Gordon (user 4) has no approved PAAF for any client. INT01 Business Services is scope 7, phase 8.
+    # David Hart (user 4) has no approved PAAF for any client. INT01 Business Services is scope 7, phase 8.
     def book(self, paaf=None, rate=None, scope=7, phase=8, date="2026-11-04"):
         return self.con.execute(NEW_ENTRY, (4, scope, phase, paaf, 4, rate, date, 3, 4))
 
