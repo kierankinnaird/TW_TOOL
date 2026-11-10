@@ -371,6 +371,45 @@ class TestActiveDatesAndPaafExpiry(Base):
         self.assertEqual(bad, 0)
 
 
+class TestHourTypes(Base):
+    """Every entry has a location (On site / Offshore) and an overtime flag. Overtime has no separate rate yet."""
+    def test_the_locations_are_seeded_and_new_entries_default_to_on_site_normal_time(self):
+        self.assertEqual([tuple(r) for r in self.con.execute("select location_id, name, active from location order by location_id")],
+                         [(1, "On site", 1), (2, "Offshore", 1)])
+        eid = self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 8, 5)).lastrowid
+        self.assertEqual(tuple(self.con.execute("select location_id, overtime from time_entry where entry_id=?", (eid,)).fetchone()), (1, 0))
+
+    def test_the_seed_has_an_offshore_day_and_an_overtime_day(self):
+        self.assertEqual(self.scalar("select count(*) from time_entry where location_id=2"), 1)
+        self.assertEqual(self.scalar("select count(*) from time_entry where overtime=1"), 1)
+
+    def test_location_and_overtime_must_be_valid(self):
+        sql = ("INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) "
+               "VALUES (5,1,1,1,4,4,'2026-11-06',2,5,?,?)")
+        self.blocked(sql, (99, 0))   # no such location
+        self.blocked(sql, (1, 2))    # overtime is 0 or 1
+        self.con.execute(sql, (2, 1))  # offshore overtime is fine
+
+    def test_one_person_can_book_the_same_code_and_day_as_normal_time_and_as_overtime(self):
+        self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 8, 5))
+        self.con.execute("INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by, overtime) "
+                         "VALUES (5,1,1,1,4,4,'2026-11-06',2,5,1)")
+        self.assertEqual(self.scalar("select count(*) from time_entry where user_id=5 and work_date='2026-11-06'"), 2)
+
+    def test_changing_the_location_or_overtime_of_approved_hours_is_a_controlled_edit(self):
+        eid = self.scalar("select entry_id from time_entry where status='Approved' and location_id=1 and overtime=0 limit 1")
+        stamp = "last_edited_by=7, last_edited_at='t1'"
+        self.blocked("UPDATE time_entry SET location_id=2, %s WHERE entry_id=?" % stamp, (eid,), "Changing an approved entry sets its status to Edited")
+        self.blocked("UPDATE time_entry SET overtime=1, %s WHERE entry_id=?" % stamp, (eid,), "Changing an approved entry sets its status to Edited")
+        self.con.execute("UPDATE time_entry SET location_id=2, status='Edited', edit_count=edit_count+1, last_change_reason='Was offshore', %s WHERE entry_id=?" % stamp, (eid,))
+        # the audit trail keeps what it was before
+        self.assertEqual(tuple(self.con.execute("select old_location_id, old_overtime from time_entry_audit where entry_id=? and action='STATUS' "
+                                                "order by audit_id desc limit 1", (eid,)).fetchone()), (1, 0))
+
+    def test_a_location_in_use_cannot_be_deleted(self):
+        self.blocked("DELETE FROM location WHERE location_id=2")  # the offshore example entry refers to it
+
+
 class TestInternalHours(Base):
     """Internal hours: paid by NMC, booked to Internal codes. No PAAF, no rate, kept out of the client reports."""
     # David Hart (user 4) has no approved PAAF for any client. INT01 Business Services is scope 7, phase 8.

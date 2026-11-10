@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, quote, urlparse
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
 # Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
-REQUIRED_SCHEMA = 3
+REQUIRED_SCHEMA = 4
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
 ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "TASAOrbiterVF.woff2"), "font/woff2")}
 
@@ -230,35 +230,48 @@ def msgs_html(msgs, ok=False):
 
 
 # ---------- My Timesheet ----------
+def locations(con, active_only=True):
+    """Where hours can be worked (On site, Offshore, ...): the hour types managed by the IT admin."""
+    return [tuple(r) for r in con.execute("select location_id, name from location %s order by location_id" % ("where active=1" if active_only else ""))]
+
+
 def parse_adds(vals):
+    """Rows added to the grid but not saved yet, as (phase, skill code, location, overtime). 'phase:role' alone means On site, normal time."""
     out = []
     for v in vals:
         try:
-            s, r = v.split(":")
-            out.append((int(s), int(r)))
+            p = [int(x) for x in v.split(":")]
         except ValueError:
-            pass
+            continue
+        if len(p) == 2:
+            p += [1, 0]
+        if len(p) == 4:
+            out.append(tuple(p))
     return out
 
 
 TIMESHEET_JS = """<script>
-// Keeps the row, day and week totals in step with what is typed, before anything is saved.
+// Keeps the row, day and week totals (normal time, overtime and total) in step with what is typed, before anything is saved.
 function fmtH(x){return String(parseFloat(x.toFixed(2)));}
+function fill(sel, m){var ds=document.querySelectorAll(sel), k; for(k=0;k<ds.length;k++){ds[k].firstChild.textContent=fmtH(m[ds[k].getAttribute('data-day')]||0);}}
+function put(sel, v){var g=document.querySelector(sel); if(g){g.firstChild.textContent=fmtH(v);}}
 function recalc(){
-  var rows=document.querySelectorAll('tr.row'), dt={}, gt=0, i, j, k;
+  var rows=document.querySelectorAll('tr.row'), dn={}, dO={}, dt={}, gn=0, go=0, i, j;
   for(i=0;i<rows.length;i++){
-    var cells=rows[i].querySelectorAll('td.c'), rt=0;
+    var ot=rows[i].getAttribute('data-ot')==='1', cells=rows[i].querySelectorAll('td.c'), rt=0;
     for(j=0;j<cells.length;j++){
       var inp=cells[j].querySelector('input[type=text]');
       var v=parseFloat(inp?inp.value:cells[j].getAttribute('data-h'));
       if(isNaN(v)){v=0;}
-      rt+=v; var d=cells[j].getAttribute('data-day'); dt[d]=(dt[d]||0)+v;
+      rt+=v; var d=cells[j].getAttribute('data-day');
+      dt[d]=(dt[d]||0)+v;
+      if(ot){dO[d]=(dO[d]||0)+v;}else{dn[d]=(dn[d]||0)+v;}
     }
-    rows[i].querySelector('td.rt').textContent=fmtH(rt); gt+=rt;
+    rows[i].querySelector('td.rt').textContent=fmtH(rt);
+    if(ot){go+=rt;}else{gn+=rt;}
   }
-  var ds=document.querySelectorAll('td.dt');
-  for(k=0;k<ds.length;k++){ds[k].firstChild.textContent=fmtH(dt[ds[k].getAttribute('data-day')]||0);}
-  var g=document.querySelector('td.gt'); if(g){g.firstChild.textContent=fmtH(gt);}
+  fill('td.dn', dn); fill('td.do', dO); fill('td.dt', dt);
+  put('td.gn', gn); put('td.go', go); put('td.gt', gn+go);
 }
 document.addEventListener('input',function(e){if(e.target.name&&e.target.name.indexOf('h_')===0){recalc();}});
 </script>"""
@@ -283,27 +296,30 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
 
     week_inactive = start > d6 or (end is not None and end < d0)
     entries = con.execute(
-        "select t.*, s.scope_code, s.description, c.name as client, pr.name as project, ph.name as phase, ro.skill_code "
+        "select t.*, s.scope_code, s.description, c.name as client, pr.name as project, ph.name as phase, ro.skill_code, lo.name as location_name "
         "from time_entry t join phase ph on ph.phase_id=t.phase_id join scope s on s.scope_id=ph.scope_id "
         "join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
-        "join role ro on ro.role_id=t.worked_role_id where t.user_id=? and t.work_date between ? and ? "
-        "order by c.name, pr.name, s.scope_code, ph.name, ro.skill_code", (u, d0, d6)).fetchall()
+        "join role ro on ro.role_id=t.worked_role_id join location lo on lo.location_id=t.location_id "
+        "where t.user_id=? and t.work_date between ? and ? "
+        "order by c.name, pr.name, s.scope_code, ph.name, ro.skill_code, t.location_id, t.overtime", (u, d0, d6)).fetchall()
 
     rows = {}
     for e in entries:
-        k = (e["phase_id"], e["worked_role_id"])
+        k = (e["phase_id"], e["worked_role_id"], e["location_id"], e["overtime"])  # one row per phase, skill code, location and normal / overtime
         rows.setdefault(k, {"client": e["client"], "project": e["project"], "scope": "%s %s" % (e["scope_code"], e["description"]),
-                            "phase": e["phase"], "skill": e["skill_code"], "cells": {}})["cells"][e["work_date"]] = e
-    for (pid, rid) in adds:
-        if (pid, rid) in rows:
+                            "phase": e["phase"], "skill": e["skill_code"], "location": e["location_name"], "overtime": e["overtime"],
+                            "cells": {}})["cells"][e["work_date"]] = e
+    for (pid, rid, lid, ot) in adds:
+        if (pid, rid, lid, ot) in rows:
             continue
         s = con.execute("select s.*, c.name as client, pr.name as project, ph.name as phase from phase ph "
                         "join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
                         "join client c on c.client_id=s.client_id where ph.phase_id=?", (pid,)).fetchone()
         r = con.execute("select * from role where role_id=?", (rid,)).fetchone()
-        if s and r:
-            rows[(pid, rid)] = {"client": s["client"], "project": s["project"], "scope": "%s %s" % (s["scope_code"], s["description"]),
-                                "phase": s["phase"], "skill": r["skill_code"], "cells": {}}
+        loc = con.execute("select name from location where location_id=?", (lid,)).fetchone()
+        if s and r and loc and ot in (0, 1):
+            rows[(pid, rid, lid, ot)] = {"client": s["client"], "project": s["project"], "scope": "%s %s" % (s["scope_code"], s["description"]),
+                                         "phase": s["phase"], "skill": r["skill_code"], "location": loc[0], "overtime": ot, "cells": {}}
 
     b = []
     b.append(msgs_html(msgs, ok))
@@ -324,26 +340,29 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
             "from %s" % dmy(start) if start > d0 and (end is None or end >= d6) else
             "until %s" % dmy(end) if (start <= d0) else "from %s until %s" % (dmy(start), dmy(end))))
 
-    adds_hidden = "".join('<input type="hidden" name="add" value="%d:%d">' % k for k in rows if not rows[k]["cells"])
+    adds_hidden = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"])
     b.append('<form method="post" action="/timesheet/save">'
              '<input type="hidden" name="u" value="%d"><input type="hidden" name="w" value="%s">%s' % (u, d0, adds_hidden))
-    head = ["Client", "Project", "Scope", "Phase", "Skill code"] + [d.strftime("%a %d/%m") for d in days] + ["Total"]
+    head = ["Client", "Project", "Scope", "Phase", "Skill code", "Location", "Type"] + [d.strftime("%a %d/%m") for d in days] + ["Total"]
     trs = []
     day_tot = {d.isoformat(): 0.0 for d in days}
-    for (pid, rid), r in rows.items():
-        tds = ['<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td style="white-space:nowrap">%s</td>' % (
-            esc(r["client"]), esc(r["project"]), esc(r["scope"]), esc(r["phase"]), esc(r["skill"]))]
+    day_norm, day_ot = dict(day_tot), dict(day_tot)  # the same, split into normal time and overtime
+    for (pid, rid, lid, ot), r in rows.items():
+        tds = ['<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td style="white-space:nowrap">%s</td><td style="white-space:nowrap">%s</td><td>%s</td>' % (
+            esc(r["client"]), esc(r["project"]), esc(r["scope"]), esc(r["phase"]), esc(r["skill"]), esc(r["location"]),
+            "<b>Overtime</b>" if ot else "Normal")]
         rt = 0.0
         for d in days:
             iso = d.isoformat()
             e = r["cells"].get(iso)
-            name = "h_%d_%d_%s" % (pid, rid, iso)
+            name = "h_%d_%d_%d_%d_%s" % (pid, rid, lid, ot, iso)
             fixed = ""  # hours the person cannot type over (shown as text), so the live totals can still count them
             if e is None:
                 cell = '<input type="text" size="4" name="%s" value="">' % name if open_week and active(iso) else ("&ndash;" if open_week else "&nbsp;")
             else:
                 rt += e["hours"]
                 day_tot[iso] += e["hours"]
+                (day_ot if ot else day_norm)[iso] += e["hours"]
                 if e["status"] == "Submitted" or (e["status"] == "Draft" and not open_week):
                     cell = fmt(e["hours"])
                     fixed = ' data-h="%s"' % fmt(e["hours"])
@@ -351,12 +370,14 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
                     cell = '<input type="text" size="4" name="%s" value="%s">' % (name, fmt(e["hours"]))
             tds.append('<td align="center" class="c" data-day="%s"%s>%s</td>' % (iso, fixed, cell))
         tds.append('<td align="right" class="rt">%s</td>' % fmt(rt))
-        trs.append('<tr class="row">%s</tr>' % "".join(tds))
+        trs.append('<tr class="row" data-ot="%d">%s</tr>' % (ot, "".join(tds)))
     if not trs:
         trs.append('<tr><td colspan="%d">No rows yet. Add a row below.</td></tr>' % len(head))
-    foot = '<tr><td colspan="5" align="right"><b>Total</b></td>%s<td align="right" class="gt"><b>%s</b></td></tr>' % (
-        "".join('<td align="center" class="dt" data-day="%s"><b>%s</b></td>' % (d.isoformat(), fmt(day_tot[d.isoformat()])) for d in days),
-        fmt(sum(day_tot.values())))
+    def sum_row(label, day_cls, week_cls, per_day):  # Normal time, Overtime and Total lines under the grid
+        return '<tr><td colspan="7" align="right"><b>%s</b></td>%s<td align="right" class="%s"><b>%s</b></td></tr>' % (
+            label, "".join('<td align="center" class="%s" data-day="%s"><b>%s</b></td>' % (day_cls, d.isoformat(), fmt(per_day[d.isoformat()])) for d in days),
+            week_cls, fmt(sum(per_day.values())))
+    foot = sum_row("Normal time", "dn", "gn", day_norm) + sum_row("Overtime", "do", "go", day_ot) + sum_row("Total", "dt", "gt", day_tot)
     b.append('<table border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s%s</table>' % (
         "".join("<th>%s</th>" % esc(h) for h in head), "".join(trs), foot))
     b.append(TIMESHEET_JS)
@@ -390,12 +411,15 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
             return "%s &gt; %s &gt; %s %s &gt; %s" % (esc(s["client"]), esc(s["project"]), esc(s["scope_code"]), esc(s["description"]), esc(s["phase"]))
         so = "".join('<option value="%d">%s</option>' % (s["phase_id"], label(s)) for s in scopes)
         ro = "".join('<option value="%d"%s>%s %s</option>' % (r["role_id"], " selected" if r["role_id"] == me["role_id"] else "", esc(r["skill_code"]), esc(r["name"])) for r in roles)
-        keep = "".join('<input type="hidden" name="add" value="%d:%d">' % k for k in rows if not rows[k]["cells"])
+        keep = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"])
+        lo = "".join('<option value="%d">%s</option>' % (lid, esc(name)) for lid, name in locations(con))
         b.append('<form method="get" action="/timesheet"><input type="hidden" name="u" value="%d">'
                  '<input type="hidden" name="w" value="%s">%s<b>Add row:</b> Phase <select name="add_phase">%s</select> '
-                 'Skill code <select name="add_role">%s</select> <input type="submit" value="Add row"></form>'
+                 'Skill code <select name="add_role">%s</select> Location <select name="add_loc">%s</select> '
+                 '<label><input type="checkbox" name="add_ot" value="1"> Overtime</label> <input type="submit" value="Add row"></form>'
                  "<p><small>Your own skill code is pre-selected. Choose a different one if you are covering another role. "
-                 "Hours NMC pays for itself (not billed to a client) go to an Internal code, for example Internal - Business Services.</small></p>" % (u, d0, keep, so, ro))
+                 "Hours NMC pays for itself (not billed to a client) go to an Internal code, for example Internal - Business Services. "
+                 "Tick Overtime for overtime hours: they go on their own line and have no separate rate yet.</small></p>" % (u, d0, keep, so, ro, lo))
     else:
         b.append("<p>You have no approved PAAF for any client with open scopes, so there is nothing to book to.</p>")
     return layout(con, u, "My Timesheet", "".join(b))
@@ -411,8 +435,11 @@ def save_timesheet(con, form):
     for key, vals in form.items():
         if not key.startswith("h_"):
             continue
-        _, pid, rid, date = key.split("_", 3)
-        pid, rid = int(pid), int(rid)
+        try:
+            _, pid, rid, lid, ot, date = key.split("_", 5)
+            pid, rid, lid, ot = int(pid), int(rid), int(lid), int(ot)
+        except ValueError:
+            continue
         raw = vals[0].strip()
         info = con.execute("select s.scope_id, s.scope_code, ph.name as phase from phase ph join scope s on s.scope_id=ph.scope_id "
                            "where ph.phase_id=?", (pid,)).fetchone()
@@ -420,8 +447,8 @@ def save_timesheet(con, form):
             continue
         sid = info["scope_id"]
         label = "%s %s, %s" % (info["scope_code"], info["phase"], date)
-        existing = con.execute("select * from time_entry where user_id=? and phase_id=? and worked_role_id=? and work_date=?",
-                               (u, pid, rid, date)).fetchone()
+        existing = con.execute("select * from time_entry where user_id=? and phase_id=? and worked_role_id=? and work_date=? "
+                               "and location_id=? and overtime=?", (u, pid, rid, date, lid, ot)).fetchone()
         if raw == "":
             if existing and existing["status"] == "Draft":
                 try:
@@ -454,6 +481,10 @@ def save_timesheet(con, form):
                                 "last_change_reason=?, last_edited_by=?, last_edited_at=? where entry_id=?",
                                 (hours, reason, u, stamp(), existing["entry_id"]))
             else:
+                loc = con.execute("select active from location where location_id=?", (lid,)).fetchone()
+                if not loc or not loc[0] or ot not in (0, 1):
+                    msgs.append("%s: that location is not available." % label)
+                    continue
                 client_id, internal = con.execute("select s.client_id, c.is_internal from scope s join client c on c.client_id=s.client_id "
                                                   "where s.scope_id=?", (sid,)).fetchone()
                 if internal:  # NMC pays for these hours: no PAAF, no sales rate
@@ -470,8 +501,8 @@ def save_timesheet(con, form):
                         continue
                     paaf_id, rate_id = paaf[0], rate[0]
                 con.execute("insert into time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, "
-                            "status, created_by) values (?,?,?,?,?,?,?,?, 'Draft', ?)",
-                            (u, sid, pid, paaf_id, rid, rate_id, date, hours, u))
+                            "status, created_by, location_id, overtime) values (?,?,?,?,?,?,?,?, 'Draft', ?, ?, ?)",
+                            (u, sid, pid, paaf_id, rid, rate_id, date, hours, u, lid, ot))
             saved += 1
         except sqlite3.DatabaseError as e:
             msgs.append("%s: %s" % (label, e))
@@ -500,12 +531,12 @@ def view_approvals(con, u, msgs=None, ok=False):
                       "You are not named as an approver on any code, so there is nothing for you to approve.</p>")
     where, wargs = queue
     rows = con.execute(
-        "select t.entry_id, bu.name as booked_by, c.name as client, pr.name as project, s.scope_code, ph.name as phase, ro.skill_code, t.work_date, t.hours, "
+        "select t.entry_id, bu.name as booked_by, c.name as client, pr.name as project, s.scope_code, ph.name as phase, ro.skill_code, lo.name as location, t.overtime, t.work_date, t.hours, "
         "t.status, t.last_change_reason, (select old_hours from time_entry_audit a where a.entry_id=t.entry_id "
         "and a.new_status='Edited' order by a.audit_id desc limit 1) as was "
         "from time_entry t join scope s on s.scope_id=t.scope_id join phase ph on ph.phase_id=t.phase_id "
         "join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
-        "join app_user bu on bu.user_id=t.user_id join role ro on ro.role_id=t.worked_role_id "
+        "join app_user bu on bu.user_id=t.user_id join role ro on ro.role_id=t.worked_role_id join location lo on lo.location_id=t.location_id "
         "where t.status in ('Submitted','Edited')" + where + " order by bu.name, t.work_date", wargs).fetchall()
     body = msgs_html(msgs, ok)
     if permission_of(con, u) == "controller":
@@ -516,12 +547,13 @@ def view_approvals(con, u, msgs=None, ok=False):
     trs = []
     for r in rows:
         trs.append("<tr><td align=\"center\"><input type=\"checkbox\" name=\"entry_id\" value=\"%d\"></td><td>%s</td><td>%s</td><td>%s</td>"
-                   "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td align=\"right\">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                       r["entry_id"], esc(r["booked_by"]), esc(r["client"]), esc(r["project"]), esc(r["scope_code"]), esc(r["phase"]), esc(r["skill_code"]), esc(r["work_date"]),
+                   "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td align=\"right\">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                       r["entry_id"], esc(r["booked_by"]), esc(r["client"]), esc(r["project"]), esc(r["scope_code"]), esc(r["phase"]), esc(r["skill_code"]),
+                       esc(r["location"]), "<b>Overtime</b>" if r["overtime"] else "Normal", esc(r["work_date"]),
                        fmt(r["hours"]), esc(r["status"]), esc(fmt(r["was"]) if r["was"] is not None else ""), esc(r["last_change_reason"] or "")))
     head = ("<tr><th><input type=\"checkbox\" title=\"Select all\" onclick=\"var c=document.getElementsByName('entry_id');"
             "for(var i=0;i<c.length;i++){c[i].checked=this.checked;}\"></th><th>Booked by</th><th>Client</th><th>Project</th><th>Scope</th>"
-            "<th>Phase</th><th>Skill code</th><th>Date</th><th>Hours</th><th>Status</th><th>Was</th><th>Edit reason</th></tr>")
+            "<th>Phase</th><th>Skill code</th><th>Location</th><th>Type</th><th>Date</th><th>Hours</th><th>Status</th><th>Was</th><th>Edit reason</th></tr>")
     body += ('<form method="post" action="/approvals/act">%s<p><small>Tick the entries to action, or tick the box in the header to select all '
              'and then untick any you have an issue with. Entries left unticked stay in your queue.</small></p>'
              '<table border="1" cellpadding="3" cellspacing="0">%s%s</table>'
@@ -957,6 +989,28 @@ def view_reports(con, u, q):
         b.append('<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(t3))
     else:
         b.append("<p>No internal hours in this date range.</p>")
+
+    # Hours by where they were worked and whether they were overtime (hours only). Client and internal hours, approved, same date range.
+    lvis, largs = visible_to(rv, u)
+    by_loc = con.execute(
+        "select lo.name as location, sum(case when t.overtime=0 then t.hours else 0 end) as normal, "
+        "sum(case when t.overtime=1 then t.hours else 0 end) as ot "
+        "from time_entry t join scope s on s.scope_id=t.scope_id join location lo on lo.location_id=t.location_id "
+        "where t.status='Approved' and date(t.work_date,'weekday 0','-6 days') between ? and ?" + lvis +
+        " group by lo.location_id order by lo.location_id", (d_from, d_to) + largs).fetchall()
+    b.append("<h4>Hours by location and overtime (approved)</h4>")
+    b.append("<p><small>All approved hours in the date range above, client and internal, by where they were worked and whether they were overtime.%s</small></p>" % (
+        " Overtime has no separate rate yet, so overtime hours are valued at the normal rate in the totals earlier on this page." if money else ""))
+    if by_loc:
+        t4 = ["<tr><th>Location</th><th>Normal hrs</th><th>Overtime hrs</th><th>Total hrs</th></tr>"]
+        for r in by_loc:
+            t4.append('<tr><td>%s</td><td align="right">%s</td><td align="right">%s</td><td align="right">%s</td></tr>' % (
+                esc(r["location"]), fmt(r["normal"]), fmt(r["ot"]), fmt(r["normal"] + r["ot"])))
+        n_all, o_all = sum(r["normal"] for r in by_loc), sum(r["ot"] for r in by_loc)
+        t4.append(sub_row(["Total", fmt(n_all), fmt(o_all), fmt(n_all + o_all)], right_from=1))
+        b.append('<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(t4))
+    else:
+        b.append("<p>No approved hours in this date range.</p>")
     return layout(con, u, "Reports", "".join(b))
 
 
@@ -981,8 +1035,9 @@ def view_ctr(con, u, q):
         return layout(con, u, "CTR", "<p>CTR not found. Open one from the <a href=\"/reports?u=%d\">Reports</a> page.</p>" % u)
     ents = con.execute(
         "select t.entry_id, t.work_date, t.hours, t.status, t.approved_at, r.family, r.skill_code, r.name as title, rt.sales_rate, "
-        "u.name as person, ap.name as approved_by "
+        "u.name as person, ap.name as approved_by, lo.name as location, t.overtime "
         "from time_entry t join scope s on s.scope_id=t.scope_id join rate rt on rt.rate_id=t.rate_id join role r on r.role_id=rt.role_id "
+        "join location lo on lo.location_id=t.location_id "
         "join app_user u on u.user_id=t.user_id left join app_user ap on ap.user_id=t.approved_by "
         "where t.phase_id=? and t.status<>'Draft'" + vis + " order by r.family, r.skill_code, u.name, t.work_date", (pid,) + vargs).fetchall()
     if not rv["all"] and not ents:  # nothing here is theirs to see, so say nothing about the CTR itself
@@ -1060,11 +1115,12 @@ def view_ctr(con, u, q):
         # entries
         rows = []
         for e in sorted(fe, key=lambda x: (x["work_date"], x["person"])):
-            rows.append("<tr>%s%s%s%s%s%s%s</tr>" % (
-                td(esc(e["work_date"])), td(esc(e["person"])), td(esc("%s %s" % (e["skill_code"], e["title"]))), td(fmt(e["hours"]), True),
+            rows.append("<tr>%s%s%s%s%s%s%s%s%s</tr>" % (
+                td(esc(e["work_date"])), td(esc(e["person"])), td(esc("%s %s" % (e["skill_code"], e["title"]))),
+                td(esc(e["location"])), td("<b>Overtime</b>" if e["overtime"] else "Normal"), td(fmt(e["hours"]), True),
                 td("%.2f" % (e["hours"] * e["sales_rate"]), True) if money else "", td(esc(e["status"])), td(esc(e["approved_by"] or ""))))
         b.append('<p><b>Timesheet entries</b> <small>(%sonly Approved entries count towards the CTR)</small></p>'
-                 '<table border="1" cellpadding="3" cellspacing="0"><tr><th>Date</th><th>Person</th><th>Booked as</th><th>Hours</th>%s'
+                 '<table border="1" cellpadding="3" cellspacing="0"><tr><th>Date</th><th>Person</th><th>Booked as</th><th>Location</th><th>Type</th><th>Hours</th>%s'
                  '<th>Status</th><th>Approved by</th></tr>%s</table>' % ("value = hours x sales rate; " if money else "", "<th>Value</th>" if money else "", "".join(rows)))
     return layout(con, u, "CTR - %s %s - %s" % (ph["scope_code"], ph["description"], ph["phase"]), "".join(b))
 
@@ -1072,13 +1128,14 @@ def view_ctr(con, u, q):
 # ---------- Admin ----------
 ADMIN_TABS = [("periods", "Weekly periods"), ("users", "Users"), ("roles", "Job families / titles"),
               ("clients", "Clients"), ("rates", "Client rate cards"), ("paafs", "PAAFs"), ("scopes", "Projects / scopes / phases"),
-              ("internal", "Internal codes")]
+              ("internal", "Internal codes"), ("locations", "Locations (hour types)")]
 
 
 # Who may use each Admin tab. IT manages users and job roles; cost controllers manage clients, rate cards, PAAFs, scopes and internal codes.
 # Weekly periods is open to both controllers and admins until the cost team confirms who owns it (the audit trail is handled the same way).
 TAB_ACCESS = {"periods": ("controller", "admin"), "users": ("admin",), "roles": ("admin",), "clients": ("controller",),
-              "rates": ("controller",), "paafs": ("controller",), "scopes": ("controller",), "internal": ("controller",)}
+              "rates": ("controller",), "paafs": ("controller",), "scopes": ("controller",), "internal": ("controller",),
+              "locations": ("admin",)}
 PERMISSION_OPTIONS = [("user", "user"), ("controller", "controller (cost controller)"), ("admin", "admin (IT)")]
 
 
@@ -1243,6 +1300,14 @@ def admin_body(con, u, t):
                  "client's rate card. Mark it sent when it goes to the client, then approve it once the signed form comes back.</small></p>"
                  '<form method="post" action="/admin/add">%s Person %s Client %s <input type="submit" value="Raise PAAF"></form>'
                  % (hidden(u=u, t="paafs"), sel("user_id", opts_users(con)), sel("client_id", opts_clients(con, True))))
+    elif t == "locations":
+        b.append("<p><small>Where hours are worked. People pick one on each timesheet row (and tick Overtime for overtime). "
+                 "Rename a location or switch it off to stop new bookings to it; hours already booked keep it. At least one must stay active.</small></p>")
+        rows = [[r["name"], "Yes" if r["active"] else "No", edit_link(u, "locations", r["location_id"])]
+                for r in con.execute("select * from location order by location_id")]
+        b.append(table(["Location", "Active", ""], rows, raw_cols=(2,)))
+        b.append('<h4>Add a location</h4><form method="post" action="/admin/add">%s Name %s <input type="submit" value="Add location"></form>'
+                 % (hidden(u=u, t="locations"), txt("name", "", 24)))
     elif t == "internal":
         b.append("<p><small>Internal codes are for hours NMC pays for itself, such as Business Services or Training. People pick one in their "
                  "timesheet (shown as Internal - name). They need no PAAF and have no rate, and they are kept out of the client reports. "
@@ -1321,6 +1386,13 @@ def view_admin_edit(con, u, t, i, msgs=None):
         form = ("<tr><td>Job family</td><td>%s</td></tr><tr><td>Skill code</td><td>%s</td></tr><tr><td>Job title</td><td>%s</td></tr><tr><td>Active</td><td>%s</td></tr>"
                 % (txt("family", r["family"], 24), txt("skill_code", r["skill_code"], 8), txt("name", r["name"], 30), sel("active", [("1", "Yes"), ("0", "No")], str(r["active"]))))
         note = "<p><small>Deactivating a role hides it from new users and new timesheet rows. It does not affect past entries.</small></p>"
+    elif t == "locations":
+        r = con.execute("select * from location where location_id=?", (i,)).fetchone()
+        if not r:
+            return layout(con, u, "Admin", "<p>Not found.</p>")
+        form = ("<tr><td>Name</td><td>%s</td></tr><tr><td>Active</td><td>%s</td></tr>" % (
+            txt("name", r["name"], 24), sel("active", [("1", "Yes"), ("0", "No")], str(r["active"]))))
+        note = "<p><small>Switching a location off stops new bookings to it. Hours already booked keep it.</small></p>"
     elif t in ("scopes", "internal"):  # an internal code is a scope of the Internal client
         r = con.execute("select s.*, c.name as client from scope s join client c on c.client_id=s.client_id where scope_id=?", (i,)).fetchone()
         if not r:
@@ -1394,6 +1466,9 @@ def admin_add(con, form):
         elif t == "phases":
             con.execute("insert into phase (scope_id, name) values (?,?)", (int(g("scope_id")), need_text(g("name"), "Phase name")))
             msg = "Phase added."
+        elif t == "locations":
+            con.execute("insert into location (name) values (?)", (need_text(g("name"), "Location name"),))
+            msg = "Location added."
         elif t == "internal":
             # An internal code is a scope (with a General phase) under the Internal client's project. The code is numbered for you.
             pr = con.execute("select p.project_id, p.client_id from project p join client c on c.client_id=p.client_id "
@@ -1446,6 +1521,11 @@ def admin_save(con, form):
         elif t == "roles":
             con.execute("update role set skill_code=?, name=?, family=?, active=? where role_id=?",
                         (need_text(g("skill_code"), "Skill code"), need_text(g("name"), "Job title"), need_text(g("family"), "Job family"), int(g("active")), i))
+        elif t == "locations":
+            others = con.execute("select count(*) from location where active=1 and location_id<>?", (i,)).fetchone()[0]
+            if int(g("active")) == 0 and others == 0:
+                raise ValueError("At least one location must stay active.")
+            con.execute("update location set name=?, active=? where location_id=?", (need_text(g("name"), "Location name"), int(g("active")), i))
         elif t in ("scopes", "internal"):
             con.execute("update scope set description=?, status=?, approver_user_id=? where scope_id=?",
                         (need_text(g("description"), "Description"), g("status"), int(g("approver_user_id")), i))
@@ -1584,7 +1664,7 @@ class Handler(BaseHTTPRequestHandler):
                     w = monday(datetime.date.today())
                 adds = parse_adds(q.get("add", []))
                 if "add_phase" in q and "add_role" in q:
-                    adds += parse_adds(["%s:%s" % (q["add_phase"][0], q["add_role"][0])])
+                    adds += parse_adds(["%s:%s:%s:%s" % (q["add_phase"][0], q["add_role"][0], q.get("add_loc", ["1"])[0], "1" if "add_ot" in q else "0")])
                 self.send_html(view_timesheet(con, u, w, adds=adds))
             elif url.path == "/approvals":
                 self.send_html(view_approvals(con, u))

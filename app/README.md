@@ -7,7 +7,7 @@ SQLite mock of the v1 data model for the in-house timesheet system (CMAP replace
 ```
 db/
   schema.sql      tables, triggers (business rules), views
-  seed.sql        demo data (2 clients plus the Internal client with 3 internal codes, 32 job titles in job families (3 with no rate card), 30 users, 4 projects, 9 scopes, 10 phases, 52 entries over 2 weeks)
+  seed.sql        demo data (2 locations, 2 clients plus the Internal client with 3 internal codes, 32 job titles in job families (3 with no rate card), 30 users, 4 projects, 9 scopes, 10 phases, 52 entries over 2 weeks)
 app/
   app.py          front end (plain HTML and one inline stylesheet, standard library only, no framework)
   static/         the TASA Orbiter font file, the only static file the app serves
@@ -54,16 +54,25 @@ Each person has one permission level: `user`, `controller` (cost controller) or 
 | Missing timesheets (who has not submitted, by week) | No | Their own people: those with an approved PAAF for a client they approve, plus anyone who booked to their internal codes | Everyone active that week | No |
 | Reports | Own hours only, no values | Own hours plus everyone's hours on their scopes, no values | Everything, with £ values and sales rates | No |
 | £ values and sales rates | No | No | Yes | No |
-| Admin tabs | None | None | Weekly periods, clients, rate cards, PAAFs, projects / scopes / phases, internal codes | Weekly periods, users, job roles |
+| Admin tabs | None | None | Weekly periods, clients, rate cards, PAAFs, projects / scopes / phases, internal codes | Weekly periods, users, job roles, locations |
 | Audit trail | No | No | Yes | Yes |
 
 In the demo data, Alisdair Woodhead approves for Apache and Kenneth Nicolson for Spirit (both standard users). The cost controllers are the two cost engineers, Emma Noble and Abbi Murray, and Stephanie Apedaile (commercial lead), who is not a cost engineer: cost permission is set per person on the Users tab, never taken from a job title, so anyone can be given it when the system goes live. NMC Admin is the IT account. Sales rates and £ values are never put in the page for anyone but a cost controller; the reports, their filters and the CTR page only show other people what they may see. Still to come from the roles matrix: reopening a timesheet, transaction controls, and more. Who owns weekly periods and the audit trail is still to be confirmed with the cost team, so for now both controllers and admins can use them.
 
-Admin tabs: weekly periods (close a week, or open a missed one), users, roles / skill codes, clients, client rate cards, PAAFs (raise, mark sent, approve with the signed form reference, reject), projects, scopes (each needs an approver) and phases, and internal codes. Users, roles, scopes and internal codes can be edited; rates are never edited, you add a new one with a later effective date.
+Admin tabs: weekly periods (close a week, or open a missed one), users, roles / skill codes, clients, client rate cards, PAAFs (raise, mark sent, approve with the signed form reference, reject), projects, scopes (each needs an approver) and phases, internal codes, and locations (the hour types). Users, roles, scopes, internal codes and locations can be edited; rates are never edited, you add a new one with a later effective date.
 
 Weekly periods open themselves: the first request in a new week creates that week's period, so nobody has to open it by hand. A week an admin has closed stays closed. The admin tab can still open a week that was missed, for example after the app was not used for a while.
 
-On the timesheet, the row, day and week totals update as hours are typed, before saving.
+On the timesheet, the row, day and week totals update as hours are typed, before saving. Under the grid there are three lines: Normal time, Overtime and Total.
+
+## Hour types: location and overtime
+
+Every timesheet row has a **location** (On site or Offshore) and a **type** (Normal or Overtime), so one person can book the same code on the same day as normal time, as overtime, on site and offshore, each on its own row. "Add row" has a Location dropdown and an Overtime tick box. Every entry stores both (`location_id` and `overtime`); changing either on approved hours is a controlled edit (needs a reason, goes back for approval) and the audit trail keeps the old values.
+
+- The list of locations is managed by the IT admin on the Locations tab (add, rename, switch off). A location that is switched off stops new bookings; hours already booked keep it. At least one must stay active.
+- **Overtime has no separate rate yet**, so overtime hours are valued at the normal rate in the CTR and weekly report totals. When the cost team has overtime rates they will need a place on the rate card (a second rate or a multiplier).
+- Approvers see the location and type on the Approvals page, the CTR page lists them for each entry, and Reports has an "Hours by location and overtime" section (hours only, limited to what the person may see).
+- Cell names on the timesheet form are `h_<phase>_<skill code>_<location>_<overtime>_<date>`.
 
 ## Internal hours
 

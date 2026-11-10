@@ -2,8 +2,9 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 3;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+PRAGMA user_version = 4;  -- 2: a cost controller approves the hours a scope approver books to their own scope
                           -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
+                          -- 4: every entry has a location (On site / Offshore) and an overtime flag
 
 -- Controlled list of job titles, grouped into job families. Editable by admin/superuser.
 CREATE TABLE role (
@@ -138,6 +139,13 @@ CREATE TABLE period (
     closed_at   TEXT
 );
 
+-- Where hours are worked (an hour type). Managed by the IT admin; location 1 (On site) is the default for new entries.
+CREATE TABLE location (
+    location_id INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    active      INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1))
+);
+
 -- Lifecycle: Draft -> Submitted -> Approved. Reject sends Submitted back to Draft (reason stored).
 -- Editing an Approved entry makes it Edited (reason required) and it needs re-approval.
 CREATE TABLE time_entry (
@@ -150,6 +158,8 @@ CREATE TABLE time_entry (
     rate_id     INTEGER REFERENCES rate(rate_id),            -- client sales rate for worked role, snapshot at booking; NULL for internal hours
     work_date   TEXT NOT NULL,
     hours       NUMERIC NOT NULL CHECK (hours > 0 AND hours <= 24),
+    location_id INTEGER NOT NULL DEFAULT 1 REFERENCES location(location_id),  -- where the hours were worked
+    overtime    INTEGER NOT NULL DEFAULT 0 CHECK (overtime IN (0,1)),         -- 1 = an overtime line (no separate rate yet)
     status      TEXT NOT NULL DEFAULT 'Submitted' CHECK (status IN ('Draft','Submitted','Approved','Edited')),
     approved_by INTEGER REFERENCES app_user(user_id),
     approved_at TEXT,
@@ -172,7 +182,8 @@ CREATE TABLE time_entry_audit (
     reason      TEXT,
     old_status  TEXT, new_status TEXT,
     old_hours   NUMERIC, new_hours NUMERIC,
-    old_scope_id INTEGER, old_phase_id INTEGER, old_worked_role_id INTEGER, old_rate_id INTEGER, old_work_date TEXT
+    old_scope_id INTEGER, old_phase_id INTEGER, old_worked_role_id INTEGER, old_rate_id INTEGER, old_work_date TEXT,
+    old_location_id INTEGER, old_overtime INTEGER
 );
 
 -- Booking guard: Open scope, Approved PAAF for the scope's client, matching rate, Open weekly period.
@@ -235,6 +246,7 @@ BEGIN
     WHERE OLD.status IN ('Approved','Edited') AND NEW.status <> 'Edited'
       AND (NEW.hours IS NOT OLD.hours OR NEW.scope_id IS NOT OLD.scope_id OR NEW.phase_id IS NOT OLD.phase_id OR NEW.work_date IS NOT OLD.work_date
            OR NEW.worked_role_id IS NOT OLD.worked_role_id OR NEW.rate_id IS NOT OLD.rate_id
+           OR NEW.location_id IS NOT OLD.location_id OR NEW.overtime IS NOT OLD.overtime
            OR NEW.user_id IS NOT OLD.user_id)
       AND NOT (OLD.status = 'Edited' AND NEW.status = 'Approved');
 
@@ -274,14 +286,15 @@ CREATE TRIGGER trg_time_entry_audit_update
 AFTER UPDATE ON time_entry
 BEGIN
     INSERT INTO time_entry_audit(entry_id, action, changed_by, changed_at, reason,
-        old_status, new_status, old_hours, new_hours, old_scope_id, old_phase_id, old_worked_role_id, old_rate_id, old_work_date)
+        old_status, new_status, old_hours, new_hours, old_scope_id, old_phase_id, old_worked_role_id, old_rate_id, old_work_date,
+        old_location_id, old_overtime)
     VALUES (OLD.entry_id,
         CASE WHEN OLD.status <> NEW.status THEN 'STATUS' ELSE 'UPDATE' END,
         NEW.last_edited_by, NEW.last_edited_at,
         CASE WHEN NEW.status = 'Draft' AND OLD.status = 'Submitted' THEN NEW.reject_reason
              WHEN NEW.status = 'Edited' THEN NEW.last_change_reason END,
         OLD.status, NEW.status, OLD.hours, NEW.hours,
-        OLD.scope_id, OLD.phase_id, OLD.worked_role_id, OLD.rate_id, OLD.work_date);
+        OLD.scope_id, OLD.phase_id, OLD.worked_role_id, OLD.rate_id, OLD.work_date, OLD.location_id, OLD.overtime);
 END;
 
 -- Only Draft entries can be deleted ("clear draft"), and the deleter must be named first
@@ -299,9 +312,9 @@ CREATE TRIGGER trg_time_entry_audit_delete
 AFTER DELETE ON time_entry
 BEGIN
     INSERT INTO time_entry_audit(entry_id, action, changed_by, changed_at, reason,
-        old_status, old_hours, old_scope_id, old_phase_id, old_worked_role_id, old_rate_id, old_work_date)
+        old_status, old_hours, old_scope_id, old_phase_id, old_worked_role_id, old_rate_id, old_work_date, old_location_id, old_overtime)
     VALUES (OLD.entry_id, 'DELETE', OLD.last_edited_by, OLD.last_edited_at, 'Draft cleared',
-        OLD.status, OLD.hours, OLD.scope_id, OLD.phase_id, OLD.worked_role_id, OLD.rate_id, OLD.work_date);
+        OLD.status, OLD.hours, OLD.scope_id, OLD.phase_id, OLD.worked_role_id, OLD.rate_id, OLD.work_date, OLD.location_id, OLD.overtime);
 END;
 
 -- CTR (Cost Time Resource): per phase, one line per role: hours x sales rate = total.

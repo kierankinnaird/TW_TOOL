@@ -206,6 +206,9 @@ INSERT INTO phase (phase_id, scope_id, name) VALUES
  (1,1,'Define'),(2,1,'Execute'),(3,2,'Define'),(4,3,'Define'),(5,4,'Define'),(6,5,'Define'),(7,6,'Define'),
  (8,7,'General'),(9,8,'General'),(10,9,'General');
 
+-- Hour types: where hours are worked. Entries default to location 1 (On site) and normal time; overtime is a flag on the entry.
+INSERT INTO location (location_id, name) VALUES (1,'On site'),(2,'Offshore');
+
 -- Weekly periods: week of 26 Oct (to be closed later) and week of 2 Nov.
 INSERT INTO period (week_start) VALUES ('2026-10-26'),('2026-11-02');
 
@@ -261,10 +264,8 @@ INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, ra
  (20,2,3,20,22,28,'2026-10-27',8,20),
  (19,2,3,19,23,29,'2026-11-03',8,19),
  (18,1,1,18,21,27,'2026-10-28',8,18),
- (21,1,2,21,11,17,'2026-11-02',8,21),
  (22,1,2,22,13,19,'2026-11-03',8,22),
  (23,1,1,23,10,16,'2026-10-27',8,23),
- (24,1,1,24,24,30,'2026-10-28',4,24),
  (12,5,6,29,15,44,'2026-10-28',8,12),
  (13,5,6,30,16,45,'2026-11-02',8,13),
  (25,5,6,34,9,38,'2026-10-29',8,25),
@@ -273,6 +274,11 @@ INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, ra
  (20,6,7,33,22,51,'2026-11-03',8,20),
  (19,6,7,32,23,52,'2026-11-04',8,19),
  (11,6,7,28,7,36,'2026-11-04',4,11);
+
+-- Examples of the other hour types: an overtime day on site, and a day offshore.
+INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) VALUES
+ (21,1,2,21,11,17,'2026-11-02',8,21, 1,1),
+ (24,1,1,24,24,30,'2026-10-28',4,24, 2,0);
 
 -- Approvals are edits, so they name who did it (and are written to time_entry_audit).
 -- Week of 26 Oct: approved by each scope's approver.
