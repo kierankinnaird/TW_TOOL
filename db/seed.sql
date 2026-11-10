@@ -320,3 +320,6 @@ UPDATE time_entry SET hours=7, status='Edited', edit_count=edit_count+1,
 UPDATE time_entry SET status='Draft', reject_reason='Project Controls Manager cover not agreed with client, please confirm',
        last_edited_by=8, last_edited_at='2026-11-06 10:00'
  WHERE user_id=10 AND work_date='2026-11-04';
+
+-- Allowances people can claim per day (one of each per person per day).
+INSERT INTO allowance_type (allowance_id, name) VALUES (1,'Overnight allowance'),(2,'Per Diem'),(3,'Mob fee');

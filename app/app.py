@@ -10,12 +10,12 @@ import os
 import sqlite3
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
 # Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
-REQUIRED_SCHEMA = 5
+REQUIRED_SCHEMA = 10
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
 ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "TASAOrbiterVF.woff2"), "font/woff2")}
 
@@ -59,9 +59,9 @@ def ensure_current_period(con):
     con.commit()
 
 
-def table(headers, rows, raw_cols=()):
+def table(headers, rows, raw_cols=(), raw_heads=False):
     out = ['<table border="1" cellpadding="3" cellspacing="0"><tr>']
-    out += ["<th>%s</th>" % esc(h) for h in headers]
+    out += ["<th>%s</th>" % (h if raw_heads else esc(h)) for h in headers]
     out.append("</tr>")
     for r in rows:
         out.append("<tr>")
@@ -83,9 +83,14 @@ def permission_of(con, u):
     return me["permission"] if me else None
 
 
+# Who approves an entry (t) on a scope (s): the booking code's own approver if it has one, otherwise the scope's approver.
+T_APPROVER = "coalesce((select pa.approver_user_id from phase pa where pa.phase_id=t.phase_id), s.approver_user_id)"
+
+
 def is_approver(con, u):
-    """Approver is not a permission: it means being named as approver on at least one scope."""
-    return con.execute("select 1 from scope where approver_user_id=? limit 1", (u,)).fetchone() is not None
+    """Approver is not a permission: it means being named as approver on at least one scope or booking code."""
+    return con.execute("select 1 from scope where approver_user_id=? union all select 1 from phase where approver_user_id=? limit 1",
+                       (u, u)).fetchone() is not None
 
 
 def approval_queue(con, u):
@@ -93,16 +98,16 @@ def approval_queue(con, u):
     A named approver approves hours booked to their scopes, but never their own. Hours booked by a scope's approver have nobody else
     who may approve them, so a cost controller approves those."""
     if permission_of(con, u) == "controller":
-        return " and t.user_id = s.approver_user_id", ()
+        return " and t.user_id = " + T_APPROVER, ()
     if is_approver(con, u):
-        return " and s.approver_user_id=? and t.user_id<>?", (u, u)
+        return " and " + T_APPROVER + "=? and t.user_id<>?", (u, u)
     return None
 
 
 def may_action(con, u, eid):
     """Can this person approve or reject this entry? The scope's approver can (the database refuses their own hours);
     a cost controller can, but only for hours booked by the scope's approver."""
-    row = con.execute("select s.approver_user_id, t.user_id from time_entry t join scope s on s.scope_id=t.scope_id where t.entry_id=?", (eid,)).fetchone()
+    row = con.execute("select " + T_APPROVER + ", t.user_id from time_entry t join scope s on s.scope_id=t.scope_id where t.entry_id=?", (eid,)).fetchone()
     if not row:
         return False
     if permission_of(con, u) == "controller":
@@ -114,8 +119,12 @@ def pending_for(con, u):
     queue = approval_queue(con, u)
     if queue is None:
         return 0
-    return con.execute("select count(*) from time_entry t join scope s on s.scope_id=t.scope_id "
-                       "where t.status in ('Submitted','Edited')" + queue[0], queue[1]).fetchone()[0]
+    n = con.execute("select count(*) from time_entry t join scope s on s.scope_id=t.scope_id "
+                    "where t.status in ('Submitted','Edited')" + queue[0], queue[1]).fetchone()[0]
+    aq = allowance_queue(con, u)
+    if aq:
+        n += con.execute("select count(*) from allowance_entry a join scope s on s.scope_id=a.scope_id where a.status='Submitted'" + aq[0], aq[1]).fetchone()[0]
+    return n
 
 
 STYLE = """
@@ -240,6 +249,40 @@ def locations(con, active_only=True):
     return [tuple(r) for r in con.execute("select location_id, name from location %s order by location_id" % ("where active=1" if active_only else ""))]
 
 
+def parse_pairs(vals):
+    """Allowance rows added but not saved yet, as (phase, allowance) pairs from 'phase:allowance' values."""
+    out = []
+    for v in vals:
+        try:
+            p, a = [int(x) for x in v.split(":")]
+        except ValueError:
+            continue
+        out.append((p, a))
+    return list(dict.fromkeys(out))
+
+
+# Who approves an allowance (a) on a scope (s): the booking code's own approver if it has one, otherwise the scope's approver.
+A_APPROVER = "coalesce((select pa.approver_user_id from phase pa where pa.phase_id=a.phase_id), s.approver_user_id)"
+
+
+def allowance_queue(con, u):
+    """The allowances (a, on scopes s) this person approves, as SQL and arguments, or None. Same rules as approval_queue for hours."""
+    if permission_of(con, u) == "controller":
+        return " and a.user_id = " + A_APPROVER, ()
+    if is_approver(con, u):
+        return " and " + A_APPROVER + "=? and a.user_id<>?", (u, u)
+    return None
+
+
+def may_action_allowance(con, u, aid):
+    row = con.execute("select " + A_APPROVER + ", a.user_id from allowance_entry a join scope s on s.scope_id=a.scope_id where a.allowance_entry_id=?", (aid,)).fetchone()
+    if not row:
+        return False
+    if permission_of(con, u) == "controller":
+        return row[1] == row[0]
+    return row[0] == u
+
+
 def parse_adds(vals):
     """Rows added to the grid but not saved yet, as (phase, skill code, location, overtime). 'phase:role' alone means On site, normal time."""
     out = []
@@ -282,8 +325,9 @@ document.addEventListener('input',function(e){if(e.target.name&&e.target.name.in
 </script>"""
 
 
-def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
+def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     adds = adds or []
+    aadds = aadds or []
     me = me_row(con, u)
     if not me:
         return layout(con, u, "My Timesheet", "<p>Unknown user.</p>")
@@ -438,8 +482,52 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
     b.append("<p><b>Hours this week (all statuses): %s</b> &nbsp; Approved %s, Edited %s, Submitted %s, Draft %s</p>" % (
         fmt(sum(by_status.values())), fmt(by_status["Approved"]), fmt(by_status["Edited"]), fmt(by_status["Submitted"]), fmt(by_status["Draft"])))
     b.append("<p><small>To clear a draft entry, empty its box and click Save draft.</small></p>")
-    if any(e["status"] != "Draft" for e in entries):
-        b.append("<p><small>Submitted and approved hours are locked. If one needs changing, ask a cost controller to reopen the timesheet.</small></p>")
+    # allowances: a row per booking code and allowance, a tick box per day
+    arows = {}
+    for a in con.execute(
+            "select a.*, at.name as allowance, s.scope_code, s.description, c.name as client, pr.name as project, ph.name as phase "
+            "from allowance_entry a join allowance_type at on at.allowance_id=a.allowance_id join phase ph on ph.phase_id=a.phase_id "
+            "join scope s on s.scope_id=a.scope_id join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
+            "where a.user_id=? and a.work_date between ? and ? order by c.name, pr.name, s.scope_code, ph.name, a.allowance_id", (u, d0, d6)):
+        arows.setdefault((a["phase_id"], a["allowance_id"]), {"client": a["client"], "project": a["project"], "scope": "%s %s" % (a["scope_code"], a["description"]),
+                                                              "phase": a["phase"], "allowance": a["allowance"], "cells": {}})["cells"][a["work_date"]] = a
+    for (pid, aid) in aadds:
+        if (pid, aid) in arows:
+            continue
+        i = con.execute("select s.scope_code, s.description, c.name as client, pr.name as project, ph.name as phase, at.name as allowance "
+                        "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
+                        "join client c on c.client_id=s.client_id, allowance_type at where ph.phase_id=? and at.allowance_id=? and at.active=1", (pid, aid)).fetchone()
+        if i:
+            arows[(pid, aid)] = {"client": i["client"], "project": i["project"], "scope": "%s %s" % (i["scope_code"], i["description"]),
+                                 "phase": i["phase"], "allowance": i["allowance"], "cells": {}}
+    atypes = con.execute("select allowance_id, name from allowance_type where active=1 order by allowance_id").fetchall()
+    if arows or atypes:
+        b.append("<p><b>Allowances</b> <small>Tick the days you are claiming. One of each allowance per day. They are submitted and approved with your hours.</small></p>")
+    if arows:
+        ahead = ["Client", "Project", "Scope", "Phase", "Allowance"] + [d.strftime("%a %d/%m") for d in days] + ["Days"]
+        atrs = []
+        for (pid, aid), r in arows.items():
+            tds = ['<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td style="white-space:nowrap">%s</td>' % (
+                esc(r["client"]), esc(r["project"]), esc(r["scope"]), esc(r["phase"]), esc(r["allowance"]))]
+            n_days = 0
+            for d in days:
+                iso = d.isoformat()
+                a = r["cells"].get(iso)
+                if a is not None:
+                    n_days += 1
+                if a is not None and a["status"] != "Draft":
+                    cell = '<span title="%s">&#10003;</span>' % esc(a["status"])
+                elif open_week and active(iso):
+                    cell = ('<input type="checkbox" name="a_%d_%d_%s" value="1"%s><input type="hidden" name="ashown" value="%d:%d:%s">' % (
+                        pid, aid, iso, " checked" if a is not None else "", pid, aid, iso))
+                else:
+                    cell = "&#10003;" if a is not None else "&ndash;"
+                tds.append('<td align="center">%s</td>' % cell)
+            tds.append('<td align="right">%d<input type="hidden" name="arow" value="%d:%d"></td>' % (n_days, pid, aid))
+            atrs.append("<tr>%s</tr>" % "".join(tds))
+        b.append('<table border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s</table>' % ("".join("<th>%s</th>" % esc(h) for h in ahead), "".join(atrs)))
+    if any(e["status"] != "Draft" for e in entries) or any(a["status"] != "Draft" for r in arows.values() for a in r["cells"].values()):
+        b.append("<p><small>Submitted and approved hours are locked, and so are submitted and approved allowances. If one needs changing, ask a cost controller to reopen the timesheet.</small></p>")
     b.append('<p><input type="submit" name="action" value="Save draft"> '
              '<input type="submit" name="action" value="Submit week"></p></form>')
 
@@ -451,7 +539,9 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
         "and p.status='Approved' and (p.expiry_date is null or p.expiry_date >= ?) "
         "where s.status='Open' and ph.status='Open' and pr.status='Open' "
         "and (c.is_internal=1 or p.paaf_id is not null) "  # client work needs an approved PAAF, internal codes are open to everyone
-        "order by c.is_internal, c.name, pr.name, s.scope_code, ph.name", (u, d0)).fetchall()
+        "and (ph.restricted=0 or exists (select 1 from phase_person pp where pp.phase_id=ph.phase_id and pp.user_id=?)) "  # transaction controls:
+        "and (ph.book_to is null or ph.book_to >= ?) and (ph.book_from is null or ph.book_from <= ?) "  # people, and booking dates
+        "order by c.is_internal, c.name, pr.name, s.scope_code, ph.name", (u, d0, u, d0, d6)).fetchall()
     roles = con.execute("select role_id, skill_code, name from role where active=1 order by skill_code").fetchall()
     if week_inactive:
         pass  # the note above says why nothing can be added
@@ -463,6 +553,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
         so = "".join('<option value="%d">%s</option>' % (s["phase_id"], label(s)) for s in scopes)
         ro = "".join('<option value="%d"%s>%s %s</option>' % (r["role_id"], " selected" if r["role_id"] == me["role_id"] else "", esc(r["skill_code"]), esc(r["name"])) for r in roles)
         keep = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"])
+        akeep = "".join('<input type="hidden" name="aadd" value="%d:%d">' % k for k in arows if not arows[k]["cells"])
         lo = "".join('<option value="%d">%s</option>' % (lid, esc(name)) for lid, name in locations(con))
         b.append('<form method="get" action="/timesheet"><input type="hidden" name="u" value="%d">'
                  '<input type="hidden" name="w" value="%s">%s<b>Add row:</b> Phase <select name="add_phase">%s</select> '
@@ -470,7 +561,13 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
                  '<label><input type="checkbox" name="add_ot" value="1"> Overtime</label> <input type="submit" value="Add row"></form>'
                  "<p><small>Your own skill code is pre-selected. Choose a different one if you are covering another role. "
                  "Hours NMC pays for itself (not billed to a client) go to an Internal code, for example Internal - Business Services. "
-                 "Tick Overtime for overtime hours: they go on their own line and have no separate rate yet.</small></p>" % (u, d0, keep, so, ro, lo))
+                 "Tick Overtime for overtime hours: they go on their own line and have no separate rate yet.</small></p>" % (u, d0, keep + akeep, so, ro, lo))
+        if atypes:
+            ao = "".join('<option value="%d">%s</option>' % (t["allowance_id"], esc(t["name"])) for t in atypes)
+            b.append('<form method="get" action="/timesheet"><input type="hidden" name="u" value="%d"><input type="hidden" name="w" value="%s">%s%s'
+                     '<b>Add allowance:</b> Booking code <select name="aadd_phase">%s</select> Allowance <select name="aadd_type">%s</select> '
+                     '<input type="submit" value="Add allowance row"></form>'
+                     "<p><small>An allowance is claimed against a booking code, so the code's approver approves it.</small></p>" % (u, d0, keep, akeep, so, ao))
     else:
         b.append("<p>You have no approved PAAF for any client with open scopes, so there is nothing to book to.</p>")
     return layout(con, u, "My Timesheet", "".join(b))
@@ -489,14 +586,18 @@ def book_entry(con, u, pid, rid, lid, ot, date, hours):
     if info["is_internal"]:  # NMC pays for these hours: no PAAF, no sales rate
         paaf_id = rate_id = None
     else:
-        rate = con.execute("select rate_id from rate where client_id=? and role_id=? and effective_from<=? "
-                           "order by effective_from desc limit 1", (info["client_id"], rid, date)).fetchone()
-        paaf = con.execute("select paaf_id from paaf where user_id=? and client_id=?", (u, info["client_id"])).fetchone()
-        if not rate:
-            return "no rate for that skill code on this client."
+        paaf = con.execute("select p.paaf_id, r.role_id as position from paaf p join rate r on r.rate_id=p.rate_id "
+                           "where p.user_id=? and p.client_id=?", (u, info["client_id"])).fetchone()
         if not paaf:
             return "you have no PAAF for this client."
-        paaf_id, rate_id = paaf[0], rate[0]
+        # Booking as their own role uses the position assigned on their PAAF; covering another role uses that role's line of the rate card.
+        # Either way the rate is the one in force on the work date (rates are never edited, a new one is added with a start date).
+        own = con.execute("select 1 from app_user where user_id=? and role_id=?", (u, rid)).fetchone()
+        rate = con.execute("select rate_id from rate where client_id=? and role_id=? and effective_from<=? "
+                           "order by effective_from desc limit 1", (info["client_id"], paaf["position"] if own else rid, date)).fetchone()
+        if not rate:
+            return "no rate for that skill code on this client."
+        rate_id, paaf_id = rate[0], paaf["paaf_id"]
     con.execute("insert into time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, "
                 "status, created_by, location_id, overtime) values (?,?,?,?,?,?,?,?, 'Draft', ?, ?, ?)",
                 (u, info["scope_id"], pid, paaf_id, rid, rate_id, date, hours, u, lid, ot))
@@ -559,21 +660,61 @@ def save_timesheet(con, form):
             saved += 1
         except sqlite3.DatabaseError as e:
             msgs.append("%s: %s" % (label, e))
+    # allowances: only the tick boxes that were on the page ('ashown') are looked at, so locked days are never touched
+    aadds = parse_pairs(form.get("arow", []))
+    a_saved = a_cleared = 0
+    for shown in form.get("ashown", []):
+        try:
+            pid, aid, date = shown.split(":")
+            pid, aid = int(pid), int(aid)
+            datetime.date.fromisoformat(date)
+        except ValueError:
+            continue
+        if not d0 <= date <= d6:
+            continue
+        checked = "a_%d_%d_%s" % (pid, aid, date) in form
+        info = con.execute("select s.scope_id, s.scope_code, ph.name as phase, at.name as allowance from phase ph join scope s on s.scope_id=ph.scope_id, "
+                           "allowance_type at where ph.phase_id=? and at.allowance_id=?", (pid, aid)).fetchone()
+        if not info:
+            continue
+        label = "%s on %s (%s %s)" % (info["allowance"], date, info["scope_code"], info["phase"])
+        existing = con.execute("select * from allowance_entry where user_id=? and allowance_id=? and work_date=?", (u, aid, date)).fetchone()
+        try:
+            if checked and not existing:
+                con.execute("insert into allowance_entry (user_id, scope_id, phase_id, allowance_id, work_date, created_by, last_edited_by, last_edited_at) "
+                            "values (?,?,?,?,?,?,?,?)", (u, info["scope_id"], pid, aid, date, u, u, stamp()))
+                a_saved += 1
+            elif checked and existing and existing["phase_id"] != pid:
+                msgs.append("%s: already claimed against another booking code that day." % label)
+            elif not checked and existing and existing["phase_id"] == pid and existing["status"] == "Draft":
+                con.execute("update allowance_entry set last_edited_by=?, last_edited_at=? where allowance_entry_id=?", (u, stamp(), existing["allowance_entry_id"]))
+                con.execute("delete from allowance_entry where allowance_entry_id=?", (existing["allowance_entry_id"],))
+                a_cleared += 1
+        except sqlite3.DatabaseError as e:
+            msgs.append("%s: %s" % (label, e))
     ok_msgs = []
     if saved:
         ok_msgs.append("%d entr%s saved." % (saved, "y" if saved == 1 else "ies"))
     if cleared:
         ok_msgs.append("%d draft entr%s cleared." % (cleared, "y" if cleared == 1 else "ies"))
+    if a_saved:
+        ok_msgs.append("%d allowance day%s saved." % (a_saved, "" if a_saved == 1 else "s"))
+    if a_cleared:
+        ok_msgs.append("%d allowance day%s cleared." % (a_cleared, "" if a_cleared == 1 else "s"))
     if action == "Submit week":
         try:
             n = con.execute("update time_entry set status='Submitted', last_edited_by=?, last_edited_at=? "
                             "where user_id=? and status='Draft' and work_date between ? and ?", (u, stamp(), u, d0, d6)).rowcount
             ok_msgs.append("%d entr%s submitted for approval." % (n, "y" if n == 1 else "ies"))
+            na = con.execute("update allowance_entry set status='Submitted', last_edited_by=?, last_edited_at=? "
+                             "where user_id=? and status='Draft' and work_date between ? and ?", (u, stamp(), u, d0, d6)).rowcount
+            if na:
+                ok_msgs.append("%d allowance day%s submitted for approval." % (na, "" if na == 1 else "s"))
         except sqlite3.DatabaseError as e:
             msgs.append("Submit failed: %s" % e)
     con.commit()
     body_msgs = ok_msgs if not msgs else msgs + ok_msgs
-    return view_timesheet(con, u, w, body_msgs, adds, ok=not msgs)
+    return view_timesheet(con, u, w, body_msgs, adds, ok=not msgs, aadds=aadds)
 
 
 def copy_week(con, form):
@@ -619,57 +760,156 @@ def copy_week(con, form):
 
 
 # ---------- Approvals ----------
-def view_approvals(con, u, msgs=None, ok=False):
+APPROVALS_JS = """<script>
+// Detail rows start hidden (they stay visible without scripting); a link per person opens them, and a person's tick box ticks their entries.
+(function(){
+  var d=document.querySelectorAll('tr.drow'), t=document.querySelectorAll('.js'), i;
+  for(i=0;i<d.length;i++){d[i].style.display='none';}
+  for(i=0;i<t.length;i++){t[i].style.display='';}
+})();
+function openRow(a){var r=document.getElementById(a.getAttribute('data-r')); r.style.display=(r.style.display==='none')?'':'none'; return false;}
+function openAll(show){var d=document.querySelectorAll('tr.drow'), i; for(i=0;i<d.length;i++){d[i].style.display=show?'':'none';} return false;}
+function tickPerson(c){var e=document.querySelectorAll('input[data-p="'+c.getAttribute('data-p')+'"]'), i; for(i=0;i<e.length;i++){e[i].checked=c.checked;}}
+function tickAll(c){var e=document.getElementsByName('entry_id'), g=document.getElementsByName('allowance_entry_id'), p=document.querySelectorAll('input.pp'), i;
+  for(i=0;i<e.length;i++){e[i].checked=c.checked;} for(i=0;i<g.length;i++){g[i].checked=c.checked;} for(i=0;i<p.length;i++){p[i].checked=c.checked;}}
+</script>"""
+
+
+def view_approvals(con, u, msgs=None, ok=False, q=None):
+    """The approver's week: one line per person with each weekday, a way to open a line to see everything booked against them, and
+    previous and next weeks (approved hours stay visible). Cost controllers see the hours booked by approvers to the scopes they approve."""
     queue = approval_queue(con, u)
     if queue is None:
         return layout(con, u, "Approvals", msgs_html(msgs, ok) + "<p>Hours are approved by the approver named on each booking code. "
                       "You are not named as an approver on any code, so there is nothing for you to approve.</p>")
     where, wargs = queue
-    rows = con.execute(
-        "select t.entry_id, bu.name as booked_by, c.name as client, pr.name as project, s.scope_code, ph.name as phase, ro.skill_code, lo.name as location, t.overtime, t.work_date, t.hours, "
-        "t.status, t.last_change_reason, (select old_hours from time_entry_audit a where a.entry_id=t.entry_id "
-        "and a.new_status='Edited' order by a.audit_id desc limit 1) as was "
+    q = q or {}
+    aq = allowance_queue(con, u)
+    waiting = con.execute(
+        "select wk, sum(n) as n from (select date(t.work_date,'weekday 0','-6 days') as wk, count(*) as n from time_entry t join scope s on s.scope_id=t.scope_id "
+        "where t.status in ('Submitted','Edited')" + where + " group by wk "
+        "union all select date(a.work_date,'weekday 0','-6 days') as wk, count(*) as n from allowance_entry a join scope s on s.scope_id=a.scope_id "
+        "where a.status='Submitted'" + aq[0] + " group by wk) group by wk order by wk", list(wargs) + list(aq[1])).fetchall()
+    try:
+        w = monday(datetime.date.fromisoformat(q["w"][0]))
+    except (KeyError, ValueError, IndexError):
+        w = monday(datetime.date.fromisoformat(waiting[0]["wk"])) if waiting else monday(datetime.date.today())  # the oldest week still waiting
+    d0 = w.isoformat()
+    days = [w + datetime.timedelta(days=i) for i in range(7)]
+    entries = con.execute(
+        "select t.entry_id, t.user_id, bu.name as booked_by, c.name as client, pr.name as project, s.scope_code, ph.name as phase, ro.skill_code, "
+        "lo.name as location, t.overtime, t.work_date, t.hours, t.status, t.last_change_reason, "
+        "(select old_hours from time_entry_audit a where a.entry_id=t.entry_id and a.new_status='Edited' order by a.audit_id desc limit 1) as was "
         "from time_entry t join scope s on s.scope_id=t.scope_id join phase ph on ph.phase_id=t.phase_id "
         "join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
         "join app_user bu on bu.user_id=t.user_id join role ro on ro.role_id=t.worked_role_id join location lo on lo.location_id=t.location_id "
-        "where t.status in ('Submitted','Edited')" + where + " order by bu.name, t.work_date", wargs).fetchall()
+        "where t.status<>'Draft' and t.work_date between ? and ?" + where + " order by bu.name, t.work_date, s.scope_code, ph.name, ro.skill_code",
+        [d0, days[-1].isoformat()] + list(wargs)).fetchall()
+    people = {}
+    for e in entries:
+        people.setdefault(e["user_id"], []).append(e)
+    allowances = con.execute(
+        "select a.allowance_entry_id, a.user_id, bu.name as booked_by, at.name as allowance, a.work_date, a.status, c.name as client, s.scope_code, ph.name as phase "
+        "from allowance_entry a join scope s on s.scope_id=a.scope_id join phase ph on ph.phase_id=a.phase_id join client c on c.client_id=s.client_id "
+        "join allowance_type at on at.allowance_id=a.allowance_id join app_user bu on bu.user_id=a.user_id "
+        "where a.status<>'Draft' and a.work_date between ? and ?" + aq[0] + " order by bu.name, a.work_date, a.allowance_id",
+        [d0, days[-1].isoformat()] + list(aq[1])).fetchall()
+
+    def link(wk, label):
+        return '<a href="/approvals?u=%d&amp;w=%s">%s</a>' % (u, wk.isoformat(), label)
+
     body = msgs_html(msgs, ok)
     if permission_of(con, u) == "controller":
         body += ("<p><small>These are hours booked by approvers to the scopes they approve. Nobody else may approve them "
                  "(not even the approver, who never approves their own hours), so a cost controller does.</small></p>")
-    if not rows:
-        return layout(con, u, "Approvals", body + "<p>Nothing waiting for your approval.</p>")
+    n_wait = sum(r["n"] for r in waiting)
+    body += '<p>%s &nbsp; <b>Week commencing %s</b> &nbsp; %s &nbsp; %s</p>' % (
+        link(w - datetime.timedelta(days=7), "&lt;&lt; Previous week"), w.strftime("%d/%m/%Y"),
+        link(w + datetime.timedelta(days=7), "Next week &gt;&gt;"), link(monday(datetime.date.today()), "This week"))
+    body += '<form method="get" action="/approvals">%s<p>Week containing %s <input type="submit" value="Show"></p></form>' % (hidden(u=u), date_input("w", d0))
+    if n_wait:
+        body += "<p><b>%d entr%s waiting for your approval</b>: %s.</p>" % (n_wait, "y" if n_wait == 1 else "ies", ", ".join(
+            link(datetime.date.fromisoformat(r["wk"]), "%s (%d)" % (datetime.date.fromisoformat(r["wk"]).strftime("%d/%m/%Y"), r["n"])) for r in waiting))
+    else:
+        body += "<p>Nothing waiting for your approval.</p>"
+    if not people and not allowances:
+        return layout(con, u, "Approvals", body + "<p>No submitted or approved hours in this week from the people you approve.</p>")
+
+    head = ('<tr><th><input type="checkbox" title="Select all" onclick="tickAll(this)"></th><th>Person</th>%s<th>Total</th><th>Waiting</th><th>Approved</th></tr>' %
+            "".join("<th>%s</th>" % d.strftime("%a %d/%m") for d in days))
+    ncol = 2 + 7 + 3
+    day_tot = {d.isoformat(): 0.0 for d in days}
     trs = []
-    for r in rows:
-        trs.append("<tr><td align=\"center\"><input type=\"checkbox\" name=\"entry_id\" value=\"%d\"></td><td>%s</td><td>%s</td><td>%s</td>"
-                   "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td align=\"right\">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                       r["entry_id"], esc(r["booked_by"]), esc(r["client"]), esc(r["project"]), esc(r["scope_code"]), esc(r["phase"]), esc(r["skill_code"]),
-                       esc(r["location"]), "<b>Overtime</b>" if r["overtime"] else "Normal", esc(r["work_date"]),
-                       fmt(r["hours"]), esc(r["status"]), esc(fmt(r["was"]) if r["was"] is not None else ""), esc(r["last_change_reason"] or "")))
-    head = ("<tr><th><input type=\"checkbox\" title=\"Select all\" onclick=\"var c=document.getElementsByName('entry_id');"
-            "for(var i=0;i<c.length;i++){c[i].checked=this.checked;}\"></th><th>Booked by</th><th>Client</th><th>Project</th><th>Scope</th>"
-            "<th>Phase</th><th>Skill code</th><th>Location</th><th>Type</th><th>Date</th><th>Hours</th><th>Status</th><th>Was</th><th>Edit reason</th></tr>")
-    body += ('<form method="post" action="/approvals/act">%s<p><small>Tick the entries to action, or tick the box in the header to select all '
-             'and then untick any you have an issue with. Entries left unticked stay in your queue.</small></p>'
-             '<table border="1" cellpadding="3" cellspacing="0">%s%s</table>'
+    for uid, es in people.items():
+        per_day = {d.isoformat(): 0.0 for d in days}
+        wait_h = appr_h = 0.0
+        n_pending = 0
+        for e in es:
+            per_day[e["work_date"]] += e["hours"]
+            day_tot[e["work_date"]] += e["hours"]
+            if e["status"] in ("Submitted", "Edited"):
+                wait_h += e["hours"]
+                n_pending += 1
+            else:
+                appr_h += e["hours"]
+        drow = "d%d" % uid
+        trs.append('<tr><td align="center">%s</td><td><b>%s</b> <a href="#" class="js" style="display:none" data-r="%s" onclick="return openRow(this)">detail</a></td>%s'
+                   '<td align="right"><b>%s</b></td><td align="right">%s</td><td align="right">%s</td></tr>' % (
+                       '<input type="checkbox" class="pp js" style="display:none" data-p="%d" onclick="tickPerson(this)">' % uid if n_pending else "",
+                       esc(es[0]["booked_by"]), drow,
+                       "".join('<td align="center">%s</td>' % (fmt(per_day[d.isoformat()]) if per_day[d.isoformat()] else "&ndash;") for d in days),
+                       fmt(wait_h + appr_h), fmt(wait_h) if wait_h else "", fmt(appr_h) if appr_h else ""))
+        lines = []
+        for e in es:
+            pend = e["status"] in ("Submitted", "Edited")
+            lines.append("<tr><td align=\"center\">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
+                         "<td align=\"right\">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                             '<input type="checkbox" name="entry_id" value="%d" data-p="%d">' % (e["entry_id"], uid) if pend else "",
+                             esc(e["client"]), esc(e["project"]), esc(e["scope_code"]), esc(e["phase"]), esc(e["skill_code"]),
+                             esc(e["location"]), "<b>Overtime</b>" if e["overtime"] else "Normal", esc(e["work_date"]),
+                             fmt(e["hours"]), esc(e["status"]), esc(fmt(e["was"]) if e["was"] is not None else ""), esc(e["last_change_reason"] or "")))
+        trs.append('<tr class="drow" id="%s"><td></td><td colspan="%d"><table border="1" cellpadding="3" cellspacing="0">'
+                   "<tr><th></th><th>Client</th><th>Project</th><th>Scope</th><th>Phase</th><th>Skill code</th><th>Location</th><th>Type</th>"
+                   "<th>Date</th><th>Hours</th><th>Status</th><th>Was</th><th>Edit reason</th></tr>%s</table></td></tr>" % (drow, ncol - 2, "".join(lines)))
+    foot = ('<tr><td></td><td align="right"><b>All people</b></td>%s<td align="right"><b>%s</b></td><td></td><td></td></tr>' % (
+        "".join('<td align="center"><b>%s</b></td>' % (fmt(day_tot[d.isoformat()]) if day_tot[d.isoformat()] else "&ndash;") for d in days), fmt(sum(day_tot.values()))))
+    allow_html = ""
+    if allowances:
+        allow_html = ('<p><b>Allowances</b> <small>Claims for Overnight allowance, Per Diem and Mob fee, approved or sent back in the same way as hours.</small></p>'
+                      '<table border="1" cellpadding="3" cellspacing="0"><tr><th></th><th>Person</th><th>Allowance</th><th>Date</th><th>Client</th><th>Scope</th><th>Phase</th><th>Status</th></tr>%s</table>' % "".join(
+                          '<tr><td align="center">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
+                              '<input type="checkbox" name="allowance_entry_id" value="%d">' % a["allowance_entry_id"] if a["status"] == "Submitted" else "",
+                              esc(a["booked_by"]), esc(a["allowance"]), esc(a["work_date"]), esc(a["client"]), esc(a["scope_code"]), esc(a["phase"]), esc(a["status"]))
+                          for a in allowances))
+    body += ('<form method="post" action="/approvals/act">%s<p><small>One line per person, with the submitted and approved hours for each day. '
+             '<a href="#" class="js" style="display:none" onclick="return openAll(true)">Show all detail</a>'
+             '<span class="js" style="display:none"> | </span>'
+             '<a href="#" class="js" style="display:none" onclick="return openAll(false)">Hide all detail</a>. '
+             'Open a line to see everything booked against that person. Tick the boxes (a person, or single entries in their detail) to action them, '
+             'or tick the box in the header to select all and then untick any you have an issue with. Entries left unticked stay in your queue. '
+             'Use Previous week to see earlier approved hours.</small></p>'
+             '%s%s%s'
              '<p><input type="submit" name="action" value="Approve selected"></p>'
              '<p>Reason (needed to reject) %s <input type="submit" name="action" value="Reject selected"> '
              '<small>Rejected entries go back to the person as drafts. Edited entries can only be approved.</small></p></form>'
-             % (hidden(u=u), head, "".join(trs), txt("reason", "", 40)))
+             % (hidden(u=u, w=d0), ('<table border="1" cellpadding="3" cellspacing="0">%s%s%s</table>' % (head, "".join(trs), foot)) if people else "",
+                allow_html, APPROVALS_JS, txt("reason", "", 40)))
     return layout(con, u, "Approvals", body)
 
 
 def act_approval(con, form):
     u = int(form["u"][0])
     ids = [int(x) for x in form.get("entry_id", [])]
+    aids = [int(x) for x in form.get("allowance_entry_id", [])]
     action, reason = form["action"][0], form.get("reason", [""])[0].strip()
     approve = action.startswith("Approve")
+    q = {"w": form["w"]} if form.get("w") else {}
     if approval_queue(con, u) is None:
-        return view_approvals(con, u)
-    if not ids:
-        return view_approvals(con, u, ["Tick at least one entry first."])
+        return view_approvals(con, u, q=q)
+    if not ids and not aids:
+        return view_approvals(con, u, ["Tick at least one entry first."], q=q)
     if not approve and not reason:
-        return view_approvals(con, u, ["Give a reason to reject."])
+        return view_approvals(con, u, ["Give a reason to reject."], q=q)
     done, msgs = 0, []
     for eid in ids:
         if not may_action(con, u, eid):
@@ -690,10 +930,34 @@ def act_approval(con, form):
             done += 1
         except sqlite3.DatabaseError as e:
             msgs.append("Entry %d: %s" % (eid, e))
+    a_done = 0
+    for aid in aids:
+        if not may_action_allowance(con, u, aid):
+            msgs.append("Allowance %d: only the approver named on its booking code can approve or reject it "
+                        "(a cost controller can, for allowances the approver booked themselves)." % aid)
+            continue
+        cur = con.execute("select status from allowance_entry where allowance_entry_id=?", (aid,)).fetchone()
+        if not cur or cur[0] != "Submitted":
+            msgs.append("Allowance %d: only submitted allowances can be approved or rejected." % aid)
+            continue
+        try:
+            if approve:
+                con.execute("update allowance_entry set status='Approved', approved_by=?, approved_at=?, last_edited_by=?, last_edited_at=? "
+                            "where allowance_entry_id=?", (u, stamp(), u, stamp(), aid))
+            else:
+                con.execute("update allowance_entry set status='Draft', reason=?, last_edited_by=?, last_edited_at=? where allowance_entry_id=?",
+                            (reason, u, stamp(), aid))
+            a_done += 1
+        except sqlite3.DatabaseError as e:
+            msgs.append("Allowance %d: %s" % (aid, e))
     con.commit()
     verb = "approved" if approve else "sent back to draft"
-    ok_msg = "%d entr%s %s." % (done, "y" if done == 1 else "ies", verb)
-    return view_approvals(con, u, ([ok_msg] if done else []) + msgs, ok=not msgs)
+    ok_msgs = []
+    if done:
+        ok_msgs.append("%d entr%s %s." % (done, "y" if done == 1 else "ies", verb))
+    if a_done:
+        ok_msgs.append("%d allowance day%s %s." % (a_done, "" if a_done == 1 else "s", verb))
+    return view_approvals(con, u, ok_msgs + msgs, ok=not msgs, q=q)
 
 
 # ---------- Missing timesheets ----------
@@ -728,10 +992,11 @@ def view_missing(con, u, q):
     scope_sql, scope_args = "", []
     if perm != "controller":
         scope_sql = (" and p.user_id<>? and (p.user_id in (select user_id from paaf where status='Approved' and client_id in "
-                     "(select client_id from scope where approver_user_id=?)) or p.user_id in "
+                     "(select client_id from scope where approver_user_id=? union select s2.client_id from phase ph2 join scope s2 on s2.scope_id=ph2.scope_id "
+                     "where ph2.approver_user_id=?)) or p.user_id in "
                      "(select t.user_id from time_entry t join scope s on s.scope_id=t.scope_id join client c on c.client_id=s.client_id "
-                     "where c.is_internal=1 and s.approver_user_id=?))")
-        scope_args = [u, u, u]
+                     "where c.is_internal=1 and " + T_APPROVER + "=?))")
+        scope_args = [u, u, u, u]
     # everyone who is active at some point in the week (start and end dates)
     people = con.execute(
         "select p.user_id, p.nmc_id, p.name, p.employment_type, r.name as title from app_user p join role r on r.role_id=p.role_id "
@@ -861,9 +1126,17 @@ def reopen_week(con, form):
     d0, d6 = w.isoformat(), (w + datetime.timedelta(days=6)).isoformat()
     ids = [r[0] for r in con.execute("select entry_id from time_entry where user_id=? and status<>'Draft' and work_date between ? and ? "
                                      "order by entry_id", (person, d0, d6))]
-    if not ids:
+    aids = [r[0] for r in con.execute("select allowance_entry_id from allowance_entry where user_id=? and status<>'Draft' and work_date between ? and ? "
+                                      "order by allowance_entry_id", (person, d0, d6))]
+    if not ids and not aids:
         return view_reopen(con, u, q, ["Nothing to reopen: there are no submitted or approved hours in that week."])
     msgs, n = [], 0
+    for aid in aids:  # allowances go back to Draft with the hours
+        try:
+            con.execute("update allowance_entry set status='Draft', approved_by=NULL, approved_at=NULL, reason=?, last_edited_by=?, last_edited_at=? "
+                        "where allowance_entry_id=?", (reason, u, stamp(), aid))
+        except sqlite3.DatabaseError as e:
+            msgs.append("Allowance %d: %s" % (aid, e))
     for eid in ids:
         try:
             con.execute("update time_entry set status='Draft', approved_by=NULL, approved_at=NULL, reject_reason=NULL, reopen_reason=?, "
@@ -872,9 +1145,10 @@ def reopen_week(con, form):
         except sqlite3.DatabaseError as e:
             msgs.append("Entry %d: %s" % (eid, e))
     ok_msgs = []
-    if n:
+    if n or aids:
         who = con.execute("select name from app_user where user_id=?", (person,)).fetchone()[0]
-        ok_msgs.append("%d entr%s reopened. They are drafts again, with your reason, for %s to correct and submit." % (n, "y" if n == 1 else "ies", who))
+        ok_msgs.append("%d entr%s reopened%s. They are drafts again, with your reason, for %s to correct and submit." % (
+            n, "y" if n == 1 else "ies", (" with %d allowance day%s" % (len(aids), "" if len(aids) == 1 else "s")) if aids else "", who))
         if "reopen_period" in form:
             con.execute("insert or ignore into period (week_start) values (?)", (d0,))
             con.execute("update period set status='Open', closed_by=NULL, closed_at=NULL where week_start=?", (d0,))
@@ -921,14 +1195,15 @@ def report_view(con, u):
 
 ALL_REPORTS = {"money": True, "all": True}
 # scopes a person can see hours for: the ones they approve and the ones they have booked to (arguments: user, user)
-VISIBLE_SCOPES = "(select scope_id from scope where approver_user_id=? union select scope_id from time_entry where user_id=?)"
+VISIBLE_SCOPES = ("(select scope_id from scope where approver_user_id=? union select scope_id from phase where approver_user_id=? "
+                  "union select scope_id from time_entry where user_id=?)")
 
 
 def visible_to(rv, u):
     """SQL limiting time entries (t) on scopes (s) to what this person may see, and its arguments."""
     if rv["all"]:
         return "", ()
-    return " and (t.user_id=? or s.approver_user_id=?)", (u, u)
+    return " and (t.user_id=? or " + T_APPROVER + "=?)", (u, u)
 
 
 def ctr_tree_rows(con, u=None, rv=ALL_REPORTS):
@@ -949,7 +1224,7 @@ def ctr_tree_rows(con, u=None, rv=ALL_REPORTS):
         "select c.name as client, pr.name as project, s.scope_code, s.description, ph.phase_id, ph.name as phase "
         "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
         "join client c on c.client_id=s.client_id where s.status='Open' and c.is_internal=0 and ph.phase_id not in "
-        "(select phase_id from time_entry where status<>'Draft')" + ("" if rv["all"] else " and s.approver_user_id=?"),
+        "(select phase_id from time_entry where status<>'Draft')" + ("" if rv["all"] else " and coalesce(ph.approver_user_id, s.approver_user_id)=?"),
         () if rv["all"] else (u,)).fetchall()
 
     def mk(label, kind):
@@ -1041,7 +1316,7 @@ def period_filters(con, q, u=None, rv=ALL_REPORTS):
         return v if v in [o[0] for o in options] else None
 
     allowed = rv["all"]
-    vargs = () if allowed else (u, u)
+    vargs = () if allowed else (u, u, u)
     in_scopes = "" if allowed else " and s.scope_id in " + VISIBLE_SCOPES
     # Client work only: internal hours have no sales value, so they are not part of the period report (see the Internal hours section).
     clients = [tuple(r) for r in con.execute(
@@ -1069,14 +1344,13 @@ def period_filters(con, q, u=None, rv=ALL_REPORTS):
     return (client, project, scope, phase), (clients, projects, scopes, phases)
 
 
-def view_reports(con, u, q):
-    if permission_of(con, u) == "admin":  # Admin (IT) has no reports
-        return no_access(con, u, "Reports")
-    rv = report_view(con, u)
+def period_data(con, u, q, rv):
+    """The weekly period report: (rows, from, to, chosen filters, filter option lists)."""
     money = rv["money"]
     d_from = q.get("from", [""])[0] or "2026-10-01"
     d_to = q.get("to", [""])[0] or "2026-12-31"
-    (client, project, scope, phase), (clients, projects, scopes, phases) = period_filters(con, q, u, rv)
+    filters = period_filters(con, q, u, rv)
+    (client, project, scope, phase) = filters[0]
     chosen = (client, client, project, project, scope, scope, phase, phase)
     if money:
         per = con.execute("select week_start, client, project, scope_code, phase, skill_code, role, hours, total from v_period_report "
@@ -1095,10 +1369,19 @@ def view_reports(con, u, q):
             "join project p on p.project_id=s.project_id join client c on c.client_id=s.client_id "
             "join rate rt on rt.rate_id=t.rate_id join role r on r.role_id=rt.role_id "
             "where t.status='Approved' and date(t.work_date,'weekday 0','-6 days') between ? and ? "
-            "and (t.user_id=? or s.approver_user_id=?) "
+            "and (t.user_id=? or " + T_APPROVER + "=?) "
             "and (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?) and (? is null or ph.phase_id=?) "
             "group by week_start, ph.phase_id, rt.rate_id order by week_start, client, project, s.scope_code, phase, r.skill_code",
             (d_from, d_to, u, u) + chosen).fetchall()
+    return per, d_from, d_to, filters
+
+
+def view_reports(con, u, q):
+    if permission_of(con, u) == "admin":  # Admin (IT) has no reports
+        return no_access(con, u, "Reports")
+    rv = report_view(con, u)
+    money = rv["money"]
+    per, d_from, d_to, ((client, project, scope, phase), (clients, projects, scopes, phases)) = period_data(con, u, q, rv)
     auto = ' onchange="this.form.submit()"'
     filtered = any(x is not None for x in (client, project, scope, phase))
     tree_rows, g_h, g_t, g_p = ctr_tree_rows(con, u, rv)
@@ -1141,7 +1424,10 @@ def view_reports(con, u, q):
                        "so it is smaller than the all-weeks figure.")
         filtered_note = "Filtered to the client, project, scope or phase chosen above, so the total for range is only part of your hours."
 
-    b = ["<h4>CTR (Cost Time Resource) - by client, project, scope and phase</h4>",
+    period_q = urlencode([("u", u), ("from", d_from), ("to", d_to)] + [(k, v) for k, v in (("client", client), ("project", project), ("scope", scope), ("phase", phase)) if v is not None])
+    b = ['<p><a href="/reports/grid?u=%d">Timesheet grid: hours by person, code and day</a> (ready-made layouts you can tailor) &nbsp; '
+         '<a href="/reports/period.xlsx?%s">Download the period report as Excel</a></p>' % (u, esc(period_q)),
+         "<h4>CTR (Cost Time Resource) - by client, project, scope and phase</h4>",
          "<p><small>%s</small></p>" % tree_note,
          '<p><input type="button" value="Expand all" onclick="openTo(9)"> <input type="button" value="Collapse all" onclick="openTo(0)"> '
          '<input type="button" value="Show to phase" onclick="openTo(3)"> <input type="button" value="Show to skill code" onclick="openTo(4)"> '
@@ -1184,6 +1470,23 @@ def view_reports(con, u, q):
     else:
         b.append("<p>No internal hours in this date range.</p>")
 
+    # Allowances claimed in the date range: days per person and allowance, approved and waiting
+    avis, aargs = ("", ()) if rv["all"] else (" and (a.user_id=? or " + A_APPROVER + "=?)", (u, u))
+    allow_rows = con.execute(
+        "select bu.name as person, at.name as allowance, sum(a.status='Approved') as approved, sum(a.status='Submitted') as waiting "
+        "from allowance_entry a join scope s on s.scope_id=a.scope_id join app_user bu on bu.user_id=a.user_id join allowance_type at on at.allowance_id=a.allowance_id "
+        "where a.status<>'Draft' and date(a.work_date,'weekday 0','-6 days') between ? and ?" + avis +
+        " group by a.user_id, a.allowance_id order by bu.name, a.allowance_id", (d_from, d_to) + aargs).fetchall()
+    b.append("<h4>Allowances (Overnight allowance, Per Diem, Mob fee)</h4>")
+    b.append("<p><small>Days claimed in the date range above, by person and allowance. Approved days are signed off; waiting days are submitted and not yet approved. "
+             "No amounts are held yet.</small></p>")
+    if allow_rows:
+        b.append('<table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>Allowance</th><th>Approved days</th><th>Waiting days</th></tr>%s%s</table>' % (
+            "".join('<tr><td>%s</td><td>%s</td><td align="right">%d</td><td align="right">%d</td></tr>' % (esc(r["person"]), esc(r["allowance"]), r["approved"], r["waiting"]) for r in allow_rows),
+            sub_row(["Total", "", str(sum(r["approved"] for r in allow_rows)), str(sum(r["waiting"] for r in allow_rows))], right_from=2)))
+    else:
+        b.append("<p>No allowances in this date range.</p>")
+
     # Hours by where they were worked and whether they were overtime (hours only). Client and internal hours, approved, same date range.
     lvis, largs = visible_to(rv, u)
     by_loc = con.execute(
@@ -1208,6 +1511,260 @@ def view_reports(con, u, q):
     return layout(con, u, "Reports", "".join(b))
 
 
+# ---------- Timesheet grid report, layouts and Excel downloads (R27, R29, R30) ----------
+GRID_COLS = [("person", "Person", "u.name"), ("client", "Client", "c.name"), ("project", "Project", "pr.name"),
+             ("scope", "Scope", "s.scope_code || ' ' || s.description"), ("phase", "Phase", "ph.name"),
+             ("skill", "Skill code", "ro.skill_code"), ("loc", "Location", "lo.name"),
+             ("type", "Type", "case when t.overtime=1 then 'Overtime' else 'Normal' end")]
+# ready-made layouts: name, the columns that group the hours, and how the time is split across the page (day, week or one total)
+GRID_LAYOUTS = [("pcd", "Person by code by day", ["person", "client", "project", "scope", "phase", "skill", "loc", "type"], "day"),
+                ("pd", "Person by day", ["person"], "day"),
+                ("pw", "Person by week", ["person"], "week"),
+                ("cpt", "Code by person (total)", ["client", "project", "scope", "phase", "person"], "none"),
+                ("cw", "Code by week", ["client", "project", "scope", "phase"], "week"),
+                ("ltw", "Location and type by week", ["loc", "type"], "week")]
+GRID_BY = [("day", "each day"), ("week", "each week"), ("none", "one total")]
+GRID_MAX_DAYS = 42
+
+
+def grid_data(con, u, q, rv):
+    """The timesheet grid: hours grouped by the chosen columns (a ready-made layout, or ticked columns) with days, weeks or a
+    single total across the page. Returns a dict with the effective settings, the header, the rows and the total row.
+    Only what this person may see is included, and values only for cost controllers."""
+    money = rv["money"]
+    vis, vargs = visible_to(rv, u)
+    layouts = {k: (name, cols, by) for k, name, cols, by in GRID_LAYOUTS}
+    layout = q.get("layout", ["pcd"])[0]
+    if layout not in layouts:
+        layout = "pcd"
+    tailored = q.get("tailor", [""])[0] == "1" and q.get("lay_prev", [""])[0] == layout  # a changed layout starts again from its preset
+    keys = [c[0] for c in GRID_COLS]
+    cols = [k for k in keys if k in q.get("col", [])] if tailored else list(layouts[layout][1])
+    by = q.get("by", [""])[0] if tailored and q.get("by", [""])[0] in dict(GRID_BY) else layouts[layout][2]
+    status = "all" if q.get("st", [""])[0] == "all" else "approved"
+
+    def pick_date(name, default):
+        try:
+            return datetime.date.fromisoformat(q.get(name, [""])[0])
+        except ValueError:
+            return default
+
+    latest = con.execute("select max(t.work_date) from time_entry t join scope s on s.scope_id=t.scope_id where t.status<>'Draft'" + vis, vargs).fetchone()[0]
+    first = monday(datetime.date.fromisoformat(latest)) if latest else monday(datetime.date.today())
+    d_from, d_to = pick_date("from", first), pick_date("to", first + datetime.timedelta(days=6))
+    if d_to < d_from:
+        d_from, d_to = d_to, d_from
+    notes = []
+    if by == "day" and (d_to - d_from).days + 1 > GRID_MAX_DAYS:
+        by = "week"
+        notes.append("That is more than %d days, so the hours are shown for each week instead of each day." % GRID_MAX_DAYS)
+
+    base = ("from time_entry t join scope s on s.scope_id=t.scope_id join phase ph on ph.phase_id=t.phase_id "
+            "join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
+            "join app_user u on u.user_id=t.user_id join role ro on ro.role_id=t.worked_role_id "
+            "join location lo on lo.location_id=t.location_id left join rate rt on rt.rate_id=t.rate_id where t.status<>'Draft'" + vis)
+    options = {
+        "client": [tuple(r) for r in con.execute("select distinct c.client_id, c.name " + base + " order by c.name", vargs)],
+        "scope": [(r[0], "%s %s" % (r[1], r[2])) for r in con.execute("select distinct s.scope_id, s.scope_code, s.description " + base + " order by s.scope_code", vargs)],
+        "person": [tuple(r) for r in con.execute("select distinct u.user_id, u.name " + base + " order by u.name", vargs)]}
+    chosen = {}
+    for k, col in (("client", "c.client_id"), ("scope", "s.scope_id"), ("person", "u.user_id")):
+        try:
+            v = int(q.get(k, [""])[0])
+        except ValueError:
+            v = None
+        chosen[k] = v if v in [o[0] for o in options[k]] else None
+    extra, eargs = "", []
+    for k, col in (("client", "c.client_id"), ("scope", "s.scope_id"), ("person", "u.user_id")):
+        if chosen[k] is not None:
+            extra += " and %s=?" % col
+            eargs.append(chosen[k])
+    sql_cols = "".join(", %s as k_%s" % (e, k) for k, _, e in GRID_COLS if k in cols)
+    statuses = "('Approved')" if status == "approved" else "('Approved','Submitted','Edited')"
+    ents = con.execute("select t.work_date, t.hours, coalesce(rt.sales_rate, 0) as rate%s %s and t.status in %s and t.work_date between ? and ?%s "
+                       "order by t.work_date" % (sql_cols, base, statuses, extra),
+                       list(vargs) + [d_from.isoformat(), d_to.isoformat()] + eargs).fetchall()
+
+    if by == "day":
+        buckets = [d_from + datetime.timedelta(days=i) for i in range((d_to - d_from).days + 1)]
+        labels = [d.strftime("%a %d/%m") for d in buckets]
+        key_of = lambda iso: iso
+        bucket_keys = [d.isoformat() for d in buckets]
+    elif by == "week":
+        w = monday(d_from)
+        bucket_keys = []
+        while w <= d_to:
+            bucket_keys.append(w.isoformat())
+            w += datetime.timedelta(days=7)
+        labels = ["w/c %s" % datetime.date.fromisoformat(k).strftime("%d/%m") for k in bucket_keys]
+        key_of = lambda iso: monday(datetime.date.fromisoformat(iso)).isoformat()
+    else:
+        bucket_keys, labels, key_of = [], [], (lambda iso: "")
+    groups = {}
+    for e in ents:
+        g = groups.setdefault(tuple(e["k_" + k] for k in cols) or ("All hours",), {"b": {}, "h": 0.0, "v": 0.0})
+        g["b"][key_of(e["work_date"])] = g["b"].get(key_of(e["work_date"]), 0.0) + e["hours"]
+        g["h"] += e["hours"]
+        g["v"] += e["hours"] * e["rate"]
+    names = {k: l for k, l, _ in GRID_COLS}
+    nc = max(len(cols), 1)
+    header = [names[k] for k in cols] or ["Hours"]
+    header += labels + ["Total hours"] + (["Value"] if money else [])
+    rows = [list(key) + [groups[key]["b"].get(k) or None for k in bucket_keys] + [groups[key]["h"]] + ([round(groups[key]["v"], 2)] if money else [])
+            for key in sorted(groups)]
+    total_row = (["Total"] + [None] * (nc - 1) + [sum(g["b"].get(k, 0.0) for g in groups.values()) or None for k in bucket_keys]
+                 + [sum(g["h"] for g in groups.values())] + ([round(sum(g["v"] for g in groups.values()), 2)] if money else []))
+    return {"layout": layout, "cols": cols, "by": by, "status": status, "from": d_from, "to": d_to, "chosen": chosen, "options": options,
+            "header": header, "rows": rows, "total": total_row, "notes": notes, "money": money, "ncols": nc}
+
+
+def grid_query(g, u):
+    """The settings of a grid as a query string, so the Excel link gives exactly what is on screen."""
+    pairs = [("u", u), ("layout", g["layout"]), ("lay_prev", g["layout"]), ("tailor", "1"), ("by", g["by"]), ("st", g["status"]),
+             ("from", g["from"].isoformat()), ("to", g["to"].isoformat())]
+    pairs += [("col", c) for c in g["cols"]]
+    pairs += [(k, v) for k, v in g["chosen"].items() if v is not None]
+    return urlencode(pairs)
+
+
+def view_grid(con, u, q):
+    """Hours by person, code and day (or week, or total) with ready-made layouts that can be tailored, and an Excel download."""
+    if permission_of(con, u) == "admin":  # Admin (IT) has no reports
+        return no_access(con, u, "Reports")
+    g = grid_data(con, u, q, report_view(con, u))
+    auto = ' onchange="this.form.submit()"'
+    form = ('<form method="get" action="/reports/grid">%s<input type="hidden" name="lay_prev" value="%s"><input type="hidden" name="tailor" value="1">'
+            "<p>Layout %s &nbsp; Time across the page %s &nbsp; Show %s</p>"
+            "<p>Columns %s</p>"
+            "<p>From %s To %s &nbsp; Client %s Scope %s Person %s</p>"
+            '<p><input type="submit" value="Show"> <input type="button" value="Reset" onclick="location.href=\'/reports/grid?u=%d\'"> '
+            '<a href="/reports/grid.xlsx?%s">Download as Excel</a></p></form>' % (
+                hidden(u=u), g["layout"],
+                sel("layout", [(k, n) for k, n, _, _ in GRID_LAYOUTS], g["layout"], False, "-", auto),
+                sel("by", GRID_BY, g["by"]),
+                sel("st", [("approved", "approved hours only"), ("all", "approved and waiting for approval")], g["status"]),
+                " ".join('<label><input type="checkbox" name="col" value="%s"%s> %s</label>' % (k, " checked" if k in g["cols"] else "", l)
+                         for k, l, _ in GRID_COLS),
+                date_input("from", g["from"].isoformat()), date_input("to", g["to"].isoformat()),
+                sel("client", g["options"]["client"], g["chosen"]["client"], True, "All clients"),
+                sel("scope", g["options"]["scope"], g["chosen"]["scope"], True, "All scopes"),
+                sel("person", g["options"]["person"], g["chosen"]["person"], True, "Everyone"), u, esc(grid_query(g, u))))
+    head = "".join("<th>%s</th>" % esc(h) for h in g["header"])
+    nc = g["ncols"]
+
+    def line(r, bold=False):
+        out = []
+        for i, v in enumerate(r):
+            if i < nc:
+                text, attr = esc(v if v is not None else ""), ' style="white-space:nowrap"'
+            else:
+                text = "" if v is None else ("%.2f" % v if g["money"] and i == len(r) - 1 else fmt(v))
+                attr = ' align="right"'
+            out.append("<td%s>%s</td>" % (attr, "<b>%s</b>" % text if bold else text))
+        return "<tr>%s</tr>" % "".join(out)
+
+    body_rows = [line(r) for r in g["rows"]]
+    total_html = line(g["total"], True)
+    b = ['<p><a href="/reports?u=%d">&lt;&lt; Back to Reports</a></p>' % u, "<h4>Timesheet grid: hours by person, code and day</h4>",
+         "<p><small>Pick a ready-made layout, then tailor it: tick the columns that group the hours, choose whether time runs across the page by day, "
+         "week or as one total, narrow it by client, scope or person, and download exactly what you see as an Excel file. "
+         "Changing the layout resets the ticked columns to that layout. %s</small></p>" % (
+             "Value is hours x the client sales rate (internal hours have no rate)." if g["money"] else "You see your own hours and, for scopes you approve, everyone's on them.")]
+    b += ["<p><small>%s</small></p>" % esc(n) for n in g["notes"]]
+    b.append(form)
+    if g["rows"]:
+        b.append('<table border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s%s</table>' % (head, "".join(body_rows), total_html))
+    else:
+        b.append("<p>No hours match these choices.</p>")
+    return layout(con, u, "Reports - timesheet grid", "".join(b))
+
+
+def grid_sheet(g):
+    """The grid as rows for a spreadsheet: header, lines, total."""
+    return [g["header"]] + g["rows"] + ([g["total"]] if g["rows"] else [])
+
+
+def col_letter(i):
+    out, i = "", i + 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def xlsx_bytes(sheet_name, rows, bold_rows=(1,)):
+    """A one-sheet Excel file (.xlsx) from rows of text and numbers, built with the standard library only. Rows in bold_rows (counting from 1)
+    are bold. Text is stored as text, so nothing typed into the system can be read as a formula."""
+    import io
+    import zipfile
+    from xml.sax.saxutils import escape
+
+    def clean(v):
+        return escape("".join(ch for ch in str(v) if ch in "\t\n\r" or ord(ch) >= 32))
+
+    lines, widths = [], []
+    for ri, row in enumerate(rows, 1):
+        cells = []
+        for ci, v in enumerate(row):
+            if v is None or v == "":
+                continue
+            ref, style = "%s%d" % (col_letter(ci), ri), ' s="1"' if ri in bold_rows else ""
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                cells.append('<c r="%s"%s><v>%s</v></c>' % (ref, style, repr(round(float(v), 6))))
+                text = fmt(v)
+            else:
+                cells.append('<c r="%s"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (ref, style, clean(v)))
+                text = str(v)
+            while len(widths) <= ci:
+                widths.append(8)
+            widths[ci] = max(widths[ci], min(len(text) + 2, 50))
+        lines.append('<row r="%d">%s</row>' % (ri, "".join(cells)))
+    name = "".join(ch for ch in sheet_name if ch not in "[]:*?/\\")[:31] or "Report"
+    sheet = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+             '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+             '<cols>%s</cols><sheetData>%s</sheetData></worksheet>' % (
+                 "".join('<col min="%d" max="%d" width="%d" customWidth="1"/>' % (i + 1, i + 1, w) for i, w in enumerate(widths)), "".join(lines)))
+    parts = {
+        "[Content_Types].xml": '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>',
+        "_rels/.rels": '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+        "xl/workbook.xml": '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="%s" sheetId="1" r:id="rId1"/></sheets></workbook>' % clean(name),
+        "xl/_rels/workbook.xml.rels": '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>',
+        "xl/styles.xml": '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+        '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>',
+        "xl/worksheets/sheet1.xml": sheet}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for part, text in parts.items():
+            z.writestr(part, text.encode("utf-8"))
+    return buf.getvalue()
+
+
+def period_sheet(con, u, q, rv):
+    per, d_from, d_to, _ = period_data(con, u, q, rv)
+    money = rv["money"]
+    rows = [["Week commencing", "Client", "Project", "Scope", "Phase", "Skill code", "Role", "Hours"] + (["Total"] if money else [])]
+    for r in per:
+        rows.append([r["week_start"], r["client"], r["project"], r["scope_code"], r["phase"], r["skill_code"], r["role"], r["hours"]]
+                    + ([round(r["total"], 2)] if money else []))
+    if per:
+        rows.append(["Total for range"] + [None] * 6 + [sum(r["hours"] for r in per)] + ([round(sum(r["total"] for r in per), 2)] if money else []))
+    return rows, ("Period %s to %s" % (d_from, d_to))
+
+
 def view_ctr(con, u, q):
     """One CTR (a phase): a Summary tab plus one tab per job family, like the tabs in the CTR workbook.
     Sales rates and values are only shown to cost controllers; everyone else sees hours, limited to what they may see."""
@@ -1220,10 +1777,10 @@ def view_ctr(con, u, q):
         pid = int(q.get("phase", ["0"])[0])
     except ValueError:
         pid = 0
-    ph = con.execute("select ph.phase_id, ph.name as phase, ph.status as phase_status, s.scope_code, s.description, s.status as scope_status, "
+    ph = con.execute("select ph.phase_id, ph.name as phase, ph.status as phase_status, ph.description as phase_desc, ph.wbs, ph.cbs, ph.abs_code, s.scope_code, s.description, s.status as scope_status, "
                      "pr.project_code, pr.name as project, c.name as client, a.name as approver "
                      "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
-                     "join client c on c.client_id=s.client_id join app_user a on a.user_id=s.approver_user_id "
+                     "join client c on c.client_id=s.client_id join app_user a on a.user_id=coalesce(ph.approver_user_id, s.approver_user_id) "
                      "where ph.phase_id=?", (pid,)).fetchone()
     if not ph:
         return layout(con, u, "CTR", "<p>CTR not found. Open one from the <a href=\"/reports?u=%d\">Reports</a> page.</p>" % u)
@@ -1258,9 +1815,12 @@ def view_ctr(con, u, q):
     head = ('<p><a href="/reports?u=%d">&lt;&lt; Back to Reports</a></p>'
             "<table border=\"0\" cellpadding=\"2\"><tr><td>Client</td><td><b>%s</b></td></tr><tr><td>Project</td><td><b>%s %s</b></td></tr>"
             "<tr><td>Scope</td><td><b>%s %s</b> (%s)</td></tr><tr><td>Phase</td><td><b>%s</b> (%s)</td></tr>"
-            "<tr><td>Approver</td><td>%s</td></tr></table>" % (
+            "<tr><td>Approver</td><td>%s</td></tr>%s</table>" % (
                 u, esc(ph["client"]), esc(ph["project_code"]), esc(ph["project"]), esc(ph["scope_code"]), esc(ph["description"]),
-                esc(ph["scope_status"]), esc(ph["phase"]), esc(ph["phase_status"]), esc(ph["approver"])))
+                esc(ph["scope_status"]), esc(ph["phase"]), esc(ph["phase_status"]), esc(ph["approver"]),
+                ("<tr><td>Description</td><td>%s</td></tr>" % esc(ph["phase_desc"]) if ph["phase_desc"] else "")
+                + ("<tr><td>WBS / CBS / ABS</td><td>%s</td></tr>" % esc(" / ".join(x or "-" for x in (ph["wbs"], ph["cbs"], ph["abs_code"])))
+                   if (ph["wbs"] or ph["cbs"] or ph["abs_code"]) else "")))
     b = [head, "<p>CTR tabs: %s</p>" % " | ".join(tabs)]
     if not ents:
         b.append("<p>No hours have been submitted to this phase yet.</p>")
@@ -1392,6 +1952,14 @@ def opts_users(con):
     return [tuple(r) for r in con.execute("select user_id, name from app_user order by name")]
 
 
+def rate_options(con, client_id=None):
+    """Rates on the client rate cards, for choosing the rate on a PAAF: (rate_id, 'Client - PM-04 Planner - 85 (from 2026-01-01)')."""
+    return [(r["rate_id"], "%s - %s %s - %g (from %s)" % (r["client"], r["skill_code"], r["role"], r["sales_rate"], r["effective_from"]))
+            for r in con.execute("select rt.rate_id, c.name as client, ro.skill_code, ro.name as role, rt.sales_rate, rt.effective_from from rate rt "
+                                 "join client c on c.client_id=rt.client_id join role ro on ro.role_id=rt.role_id "
+                                 "where (? is null or rt.client_id=?) order by c.name, ro.skill_code, rt.effective_from desc", (client_id, client_id))]
+
+
 def opts_approvers(con):
     """Only standard users can be named as an approver (cost controllers and admins never approve)."""
     return [tuple(r) for r in con.execute("select user_id, name from app_user where permission='user' order by name")]
@@ -1421,7 +1989,38 @@ def edit_link(u, t, i):
     return '<a href="/admin/edit?u=%d&amp;t=%s&amp;id=%d">Edit</a>' % (u, t, i)
 
 
-def admin_body(con, u, t):
+PAAF_STATUSES = ["Draft", "Sent", "Approved", "Rejected"]
+PAAF_SORTS = {"id": ("p.paaf_id", "p.paaf_id desc"),
+              "name": ("u.name, p.paaf_id", "u.name desc, p.paaf_id desc"),
+              "client": ("c.name, u.name, p.paaf_id", "c.name desc, u.name desc, p.paaf_id desc"),
+              "status": ("p.status, p.paaf_id", "p.status desc, p.paaf_id desc"),
+              "expiry": ("p.expiry_date is null, p.expiry_date, p.paaf_id", "p.expiry_date is not null, p.expiry_date desc, p.paaf_id desc")}
+
+
+def paaf_filters(q):
+    """The PAAF list's filters and order, from a query or a posted form (values are lists): person, client, status, sort (a leading - is descending)."""
+    def one(k):
+        return (q.get(k) or [""])[0].strip()
+
+    def num(k):
+        try:
+            return int(one(k))
+        except ValueError:
+            return None
+    sort = one("f_sort") or "id"
+    desc = sort.startswith("-")
+    if sort.lstrip("-") not in PAAF_SORTS:
+        sort, desc = "id", False
+    status = one("f_status")
+    return {"person": num("f_person"), "client": num("f_client"), "status": status if status in PAAF_STATUSES else "", "sort": sort.lstrip("-"), "desc": desc}
+
+
+def paaf_hidden(f):
+    """The list's filters and order carried through a form, so an action leaves you looking at the same list."""
+    return hidden(f_person=f["person"] or "", f_client=f["client"] or "", f_status=f["status"], f_sort=("-" if f["desc"] else "") + f["sort"])
+
+
+def admin_body(con, u, t, q=None):
     b = []
     if t == "periods":
         rows = [list(r) for r in con.execute("select week_start, status, closed_by, closed_at from period order by week_start")]
@@ -1477,11 +2076,38 @@ def admin_body(con, u, t):
                  % (hidden(u=u, t="rates"), sel("client_id", opts_clients(con, True)), sel("role_id", opts_roles(con)),
                     txt("sales_rate", "", 8), date_input("effective_from", datetime.date.today().isoformat())))
     elif t == "paafs":
+        flt = paaf_filters(q or {})
+        where, wargs = "", []
+        for key, col in (("person", "p.user_id"), ("client", "p.client_id"), ("status", "p.status")):
+            if flt[key]:
+                where += " and %s=?" % col
+                wargs.append(flt[key])
+        total = con.execute("select count(*) from paaf").fetchone()[0]
+        order = PAAF_SORTS[flt["sort"]][1 if flt["desc"] else 0]
         rows = []
-        for r in con.execute("select p.*, u.name as uname, c.name as client, ro.skill_code, rt.sales_rate "
-                             "from paaf p join app_user u on u.user_id=p.user_id join client c on c.client_id=p.client_id "
-                             "join rate rt on rt.rate_id=p.rate_id join role ro on ro.role_id=rt.role_id order by c.name, u.name"):
-            f = '<form method="post" action="/admin/paaf" style="display:inline">%s' % hidden(u=u, paaf_id=r["paaf_id"])
+        found = con.execute("select p.*, u.name as uname, c.name as client, ro.skill_code, rt.sales_rate "
+                            "from paaf p join app_user u on u.user_id=p.user_id join client c on c.client_id=p.client_id "
+                            "join rate rt on rt.rate_id=p.rate_id join role ro on ro.role_id=rt.role_id where 1=1" + where + " order by " + order, wargs).fetchall()
+        # filters (a GET form that stays on this tab)
+        b.append('<form method="get" action="/admin">%s<p>Person %s Client %s Status %s <input type="submit" value="Filter"> '
+                 '<input type="button" value="Clear filters" onclick="location.href=\'/admin?u=%d&amp;t=paafs\'"> '
+                 '<small>Showing %d of %d PAAFs, in order of the # column. Click a column heading to sort by it, and again to reverse it.</small></p></form>' % (
+                     hidden(u=u, t="paafs", f_sort=("-" if flt["desc"] else "") + flt["sort"]),
+                     sel("f_person", [(r["user_id"], r["name"]) for r in con.execute(
+                         "select distinct a.user_id, a.name from app_user a join paaf p on p.user_id=a.user_id order by a.name")], flt["person"], True, "Everyone"),
+                     sel("f_client", [tuple(r) for r in con.execute(
+                         "select distinct c.client_id, c.name from client c join paaf p on p.client_id=c.client_id order by c.name")], flt["client"], True, "All clients"),
+                     sel("f_status", [(x, x) for x in PAAF_STATUSES], flt["status"], True, "Any status"), u, len(found), total))
+
+        def head(label, key):
+            flip = "-" + key if (flt["sort"] == key and not flt["desc"]) else key
+            arrow = (" &#9650;" if not flt["desc"] else " &#9660;") if flt["sort"] == key else ""
+            return '<a href="/admin?u=%d&amp;t=paafs&amp;f_person=%s&amp;f_client=%s&amp;f_status=%s&amp;f_sort=%s" style="color:inherit">%s%s</a>' % (
+                u, flt["person"] or "", flt["client"] or "", quote(flt["status"]), quote(flip), label, arrow)
+        for r in found:
+            f = '<form method="post" action="/admin/paaf" style="display:inline">%s%s' % (hidden(u=u, paaf_id=r["paaf_id"]), paaf_hidden(flt))
+            if r["status"] in ("Draft", "Sent", "Rejected"):  # the assigned rate can still be changed
+                f += ('%s <input type="submit" name="action" value="Change rate"> <br>' % sel("rate_id", rate_options(con, r["client_id"]), r["rate_id"]))
             if r["status"] == "Draft":
                 f += ('<input type="submit" name="action" value="Authorise internally"> '
                       '<input type="submit" name="action" value="Mark sent"> <small>(sent = formal client approval)</small>')
@@ -1493,12 +2119,19 @@ def admin_body(con, u, t):
             f += "</form>"
             rows.append([r["paaf_id"], r["uname"], r["client"], r["skill_code"], "%g" % r["sales_rate"], r["status"], r["sent_date"],
                          r["decided_date"], r["document_ref"], r["expiry_date"], f])
-        b.append(table(["#", "Name", "Client", "Skill code", "Sales rate", "Status", "Sent", "Decided", "Signed form", "Expiry", "Action"],
-                       rows, raw_cols=(10,)))
-        b.append('<h4>Raise a PAAF</h4><p><small>One PAAF per person per client. The rate is taken from the person\'s role on that '
-                 "client's rate card. Mark it sent when it goes to the client, then approve it once the signed form comes back.</small></p>"
-                 '<form method="post" action="/admin/add">%s Person %s Client %s <input type="submit" value="Raise PAAF"></form>'
-                 % (hidden(u=u, t="paafs"), sel("user_id", opts_users(con)), sel("client_id", opts_clients(con, True))))
+        heads = [head("#", "id"), head("Name", "name"), head("Client", "client"), "Skill code", "Sales rate", head("Status", "status"),
+                 "Sent", "Decided", "Signed form", head("Expiry", "expiry"), "Action"]  # raw: the headings hold sort links
+        if rows:
+            b.append(table(heads, rows, raw_cols=(10,), raw_heads=True))
+        else:
+            b.append("<p>No PAAFs match these filters.</p>")
+        b.append('<h4>Raise a PAAF</h4><p><small>One PAAF per person per client. Pick the rate to assign from the client\'s rate card, or leave it '
+                 "on the default, the rate for the person's own role. The rate card line you pick is the person's position on that client: it sets the rate for their hours "
+                 "when they book as their own role, at the rate in force on the work date (covering another role uses the card line for that role). Mark the PAAF sent when it goes to the client, then approve "
+                 "it once the signed form comes back. The rate can be changed until the PAAF is approved.</small></p>"
+                 '<form method="post" action="/admin/add">%s Person %s Client %s Rate %s <input type="submit" value="Raise PAAF"></form>'
+                 % (hidden(u=u, t="paafs"), sel("user_id", opts_users(con)), sel("client_id", opts_clients(con, True)),
+                    sel("rate_id", rate_options(con), None, True, "Default: the person's own role")))
     elif t == "locations":
         b.append("<p><small>Where hours are worked. People pick one on each timesheet row (and tick Overtime for overtime). "
                  "Rename a location or switch it off to stop new bookings to it; hours already booked keep it. At least one must stay active.</small></p>")
@@ -1544,22 +2177,31 @@ def admin_body(con, u, t):
                     sel("status", [("Open", "Open"), ("Pipeline", "Pipeline"), ("Closed", "Closed")]),
                     sel("approver_user_id", opts_approvers(con))))
         b.append("<h4>Phases</h4>")
-        rows = [[r["client"], r["scope_code"], r["description"], r["name"], r["status"], edit_link(u, "phases", r["phase_id"])]
-                for r in con.execute("select ph.*, s.scope_code, s.description, c.name as client from phase ph join scope s on s.scope_id=ph.scope_id "
-                                     "join client c on c.client_id=s.client_id order by c.name, s.scope_code, ph.name")]
-        b.append(table(["Client", "Scope", "Description", "Phase", "Status", ""], rows, raw_cols=(5,)))
+        rows = []
+        for r in con.execute("select ph.*, s.scope_code, s.description as scope_desc, c.name as client, a.name as own_approver, "
+                             "(select count(*) from phase_person pp where pp.phase_id=ph.phase_id) as n_people "
+                             "from phase ph join scope s on s.scope_id=ph.scope_id join client c on c.client_id=s.client_id "
+                             "left join app_user a on a.user_id=ph.approver_user_id order by c.name, s.scope_code, ph.name"):
+            controls = []
+            if r["restricted"]:
+                controls.append("%d named %s only" % (r["n_people"], "person" if r["n_people"] == 1 else "people"))
+            if r["book_from"] or r["book_to"]:
+                controls.append("%s to %s" % (r["book_from"] or "any date", r["book_to"] or "any date"))
+            rows.append([r["client"], r["scope_code"], r["scope_desc"], r["name"], r["description"] or "", r["status"],
+                         r["own_approver"] or "scope's approver", "; ".join(controls) or "open to all", edit_link(u, "phases", r["phase_id"])])
+        b.append(table(["Client", "Scope", "Description", "Phase (booking code)", "Phase description", "Status", "Approver", "Who and when can book", ""], rows, raw_cols=(8,)))
         b.append('<form method="post" action="/admin/add">%s Scope %s Phase name %s <input type="submit" value="Add phase"></form>'
                  % (hidden(u=u, t="phases"), sel("scope_id", opts_scopes(con)), txt("name", "", 20)))
     return "".join(b)
 
 
-def view_admin(con, u, t, msgs=None, ok=False):
+def view_admin(con, u, t, msgs=None, ok=False, q=None):
     tabs = allowed_tabs(con, u)
     if not tabs or (t in dict(ADMIN_TABS) and not can_use_tab(con, u, t)):
         return no_access(con, u, "Admin")
     t = t if t in dict(tabs) else tabs[0][0]
     links = "".join('<a href="/admin?u=%d&amp;t=%s"%s>%s</a>' % (u, k, ' class="cur"' if k == t else "", esc(v)) for k, v in tabs)
-    body = '%s<p class="tabs">%s</p><h4>%s</h4>%s' % (msgs_html(msgs, ok), links, esc(dict(tabs)[t]), admin_body(con, u, t))
+    body = '%s<p class="tabs">%s</p><h4>%s</h4>%s' % (msgs_html(msgs, ok), links, esc(dict(tabs)[t]), admin_body(con, u, t, q))
     return layout(con, u, "Admin", body)
 
 
@@ -1610,12 +2252,29 @@ def view_admin_edit(con, u, t, i, msgs=None):
                 % (esc(r["client"]), esc(r["project_code"]), txt("name", r["name"], 30), sel("status", [("Open", "Open"), ("Closed", "Closed")], r["status"])))
         note = "<p><small>Closing a project stops new bookings to all of its scopes.</small></p>"
     elif t == "phases":
-        r = con.execute("select ph.*, s.scope_code from phase ph join scope s on s.scope_id=ph.scope_id where phase_id=?", (i,)).fetchone()
+        r = con.execute("select ph.*, s.scope_code, a.name as scope_approver from phase ph join scope s on s.scope_id=ph.scope_id "
+                        "join app_user a on a.user_id=s.approver_user_id where phase_id=?", (i,)).fetchone()
         if not r:
             return layout(con, u, "Admin", "<p>Not found.</p>")
+        allowed = {x[0] for x in con.execute("select user_id from phase_person where phase_id=?", (i,))}
+        people = " ".join('<label><input type="checkbox" name="person" value="%d"%s> %s</label>' % (
+            p["user_id"], " checked" if p["user_id"] in allowed else "", esc(p["name"]))
+            for p in con.execute("select user_id, name from app_user order by name"))
         form = ("<tr><td>Scope</td><td>%s</td></tr><tr><td>Phase name</td><td>%s</td></tr><tr><td>Status</td><td>%s</td></tr>"
-                % (esc(r["scope_code"]), txt("name", r["name"], 20), sel("status", [("Open", "Open"), ("Closed", "Closed")], r["status"])))
-        note = "<p><small>Closing a phase stops new bookings to it. Existing hours are not affected.</small></p>"
+                "<tr><td>Description</td><td>%s</td></tr><tr><td>WBS</td><td>%s</td></tr><tr><td>CBS</td><td>%s</td></tr><tr><td>ABS</td><td>%s</td></tr>"
+                "<tr><td>Approver</td><td>%s</td></tr>"
+                "<tr><td>Who can book</td><td>%s</td></tr><tr><td>People allowed</td><td>%s</td></tr>"
+                "<tr><td>Bookable from</td><td>%s</td></tr><tr><td>Bookable until</td><td>%s</td></tr>"
+                % (esc(r["scope_code"]), txt("name", r["name"], 20), sel("status", [("Open", "Open"), ("Closed", "Closed")], r["status"]),
+                   txt("description", r["description"] or "", 50), txt("wbs", r["wbs"] or "", 20), txt("cbs", r["cbs"] or "", 20), txt("abs_code", r["abs_code"] or "", 20),
+                   sel("approver_user_id", opts_approvers(con), r["approver_user_id"], True, "Scope's approver (%s)" % r["scope_approver"]),
+                   sel("restricted", [("0", "Anyone with an approved PAAF (or an internal code)"), ("1", "Only the people ticked below")], str(r["restricted"])),
+                   people, date_input("book_from", r["book_from"] or ""), date_input("book_to", r["book_to"] or "")))
+        note = ("<p><small>Closing a phase stops new bookings to it. Existing hours are not affected. The approver is the person who approves hours booked to this "
+                "code; leave it on the scope's approver unless this code needs someone else. Transaction controls: by default anyone who may book to the client "
+                "can book to this code. Choose \"Only the people ticked\" to limit it to a list (nobody can book if the list is empty), and set dates to limit "
+                "which work dates can be booked. These controls stop new bookings only; hours already booked are not affected. WBS, CBS and ABS are "
+                "optional reference fields.</small></p>")
     else:
         return layout(con, u, "Admin", "<p>Not found.</p>")
     body = '%s%s<form method="post" action="/admin/save">%s<table border="0" cellpadding="2">%s</table>%s<input type="submit" value="Save changes"></form>' % (
@@ -1683,11 +2342,16 @@ def admin_add(con, form):
             msg = "Internal code %s added." % code
         elif t == "paafs":
             user_id, client_id = int(g("user_id")), int(g("client_id"))
-            rate = con.execute("select rt.rate_id from rate rt join app_user u on u.role_id=rt.role_id where u.user_id=? and rt.client_id=? "
-                               "and rt.effective_from<=? order by rt.effective_from desc limit 1",
-                               (user_id, client_id, datetime.date.today().isoformat())).fetchone()
+            if g("rate_id"):  # a rate picked from the dropdown must be on this client's rate card
+                rate = con.execute("select rate_id from rate where rate_id=? and client_id=?", (int(g("rate_id")), client_id)).fetchone()
+                if not rate:
+                    raise ValueError("That rate is not on this client's rate card. Choose one of the client's rates.")
+            else:
+                rate = con.execute("select rt.rate_id from rate rt join app_user u on u.role_id=rt.role_id where u.user_id=? and rt.client_id=? "
+                                   "and rt.effective_from<=? order by rt.effective_from desc limit 1",
+                                   (user_id, client_id, datetime.date.today().isoformat())).fetchone()
             if not rate:
-                raise ValueError("That client's rate card has no rate for this person's role. Add the rate first.")
+                raise ValueError("That client's rate card has no rate for this person's role. Add the rate first, or pick a rate.")
             con.execute("insert into paaf (user_id, client_id, rate_id, status) values (?,?,?,'Draft')", (user_id, client_id, rate[0]))
             msg = "PAAF raised as a draft."
         else:
@@ -1731,7 +2395,17 @@ def admin_save(con, form):
         elif t == "projects":
             con.execute("update project set name=?, status=? where project_id=?", (need_text(g("name"), "Project name"), g("status"), i))
         elif t == "phases":
-            con.execute("update phase set name=?, status=? where phase_id=?", (need_text(g("name"), "Phase name"), g("status"), i))
+            b_from, b_to = need_date(g("book_from"), "Bookable from", False), need_date(g("book_to"), "Bookable until", False)
+            if b_from and b_to and b_to < b_from:
+                raise ValueError("Bookable until cannot be before bookable from.")
+            con.execute("update phase set name=?, status=?, description=?, wbs=?, cbs=?, abs_code=?, approver_user_id=?, restricted=?, "
+                        "book_from=?, book_to=? where phase_id=?",
+                        (need_text(g("name"), "Phase name"), g("status"), g("description") or None, g("wbs") or None, g("cbs") or None,
+                         g("abs_code") or None, int(g("approver_user_id")) if g("approver_user_id") else None,
+                         1 if g("restricted") == "1" else 0, b_from, b_to, i))
+            con.execute("delete from phase_person where phase_id=?", (i,))
+            for person in form.get("person", []):
+                con.execute("insert or ignore into phase_person (phase_id, user_id) values (?,?)", (i, int(person)))
         else:
             raise ValueError("Unknown form.")
         con.commit()
@@ -1747,6 +2421,7 @@ def act_paaf(con, form):
     u, pid, action = int(form["u"][0]), int(form["paaf_id"][0]), form["action"][0]
     if not can_use_tab(con, u, "paafs"):
         return view_admin(con, u, "paafs")
+    q = form  # the list's filters and order come back with the form
     today = datetime.date.today().isoformat()
     g = lambda k: form.get(k, [""])[0].strip()
     try:
@@ -1756,6 +2431,12 @@ def act_paaf(con, form):
         if action == "Mark sent" and p["status"] == "Draft":
             con.execute("update paaf set status='Sent', sent_date=? where paaf_id=?", (today, pid))
             msg = "PAAF %d marked as sent." % pid
+        elif action == "Change rate" and p["status"] in ("Draft", "Sent", "Rejected"):
+            rate = con.execute("select rate_id from rate where rate_id=? and client_id=?", (int(g("rate_id") or 0), p["client_id"])).fetchone()
+            if not rate:
+                raise ValueError("Choose one of this client's rates.")
+            con.execute("update paaf set rate_id=? where paaf_id=?", (rate[0], pid))
+            msg = "PAAF %d now uses the chosen rate." % pid
         elif action == "Authorise internally" and p["status"] in ("Draft", "Sent"):
             con.execute("update paaf set status='Approved', decided_date=? where paaf_id=?", (today, pid))
             msg = "PAAF %d authorised internally. The person can now book to that client." % pid
@@ -1773,11 +2454,11 @@ def act_paaf(con, form):
         else:
             raise ValueError("That action is not available for a PAAF with status %s." % p["status"])
         con.commit()
-        return view_admin(con, u, "paafs", [msg], ok=True)
+        return view_admin(con, u, "paafs", [msg], ok=True, q=q)
     except ValueError as e:
-        return view_admin(con, u, "paafs", [str(e)])
+        return view_admin(con, u, "paafs", [str(e)], q=q)
     except sqlite3.DatabaseError as e:
-        return view_admin(con, u, "paafs", [str(e)])
+        return view_admin(con, u, "paafs", [str(e)], q=q)
 
 
 def act_period(con, form):
@@ -1812,8 +2493,14 @@ def view_audit(con, u):
         "left join app_user ch on ch.user_id=a.changed_by join scope s on s.scope_id=t.scope_id "
         "order by a.audit_id desc limit 200").fetchall()
     heads = ["#", "When", "Changed by", "Action", "Booked by", "Scope", "Date", "Old status", "New status", "Old hours", "New hours", "Reason"]
-    return layout(con, u, "Audit trail (latest 200)", table(heads, [[fmt(v) if i in (9, 10) else fmt_time(v) if i == 1 else v
-                                                                    for i, v in enumerate(r)] for r in rows]))
+    arows = con.execute(
+        "select a.audit_id, a.changed_at, ch.name as changed_by, a.action, bu.name as person, at.name as allowance, a.work_date, a.old_status, a.new_status, a.reason "
+        "from allowance_audit a left join app_user ch on ch.user_id=a.changed_by join app_user bu on bu.user_id=a.user_id "
+        "join allowance_type at on at.allowance_id=a.allowance_id order by a.audit_id desc limit 200").fetchall()
+    body = table(heads, [[fmt(v) if i in (9, 10) else fmt_time(v) if i == 1 else v for i, v in enumerate(r)] for r in rows])
+    body += "<h4>Allowances</h4>" + table(["#", "When", "Changed by", "Action", "Booked by", "Allowance", "Date", "Old status", "New status", "Reason"],
+                                           [[fmt_time(v) if i == 1 else v for i, v in enumerate(r)] for r in arows])
+    return layout(con, u, "Audit trail (latest 200)", body)
 
 
 # ---------- server ----------
@@ -1821,11 +2508,31 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def security_headers(self):
+        """Browser protections on every page: no content sniffing, no framing (clickjacking), no referrer leaks, and a policy that only
+        lets the page load its own resources (the page's own inline style and script are the only inline code it has)."""
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                         "img-src 'self' data:; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+        self.send_header("Cache-Control", "no-store")
+
     def send_html(self, text, code=200):
         data = text.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self.security_headers()
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_download(self, data, filename):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.send_header("Content-Disposition", 'attachment; filename="%s"' % filename)
+        self.send_header("Content-Length", str(len(data)))
+        self.security_headers()
         self.end_headers()
         self.wfile.write(data)
 
@@ -1867,19 +2574,36 @@ class Handler(BaseHTTPRequestHandler):
                 adds = parse_adds(q.get("add", []))
                 if "add_phase" in q and "add_role" in q:
                     adds += parse_adds(["%s:%s:%s:%s" % (q["add_phase"][0], q["add_role"][0], q.get("add_loc", ["1"])[0], "1" if "add_ot" in q else "0")])
-                self.send_html(view_timesheet(con, u, w, adds=adds))
+                aadds = parse_pairs(q.get("aadd", []))
+                if "aadd_phase" in q and "aadd_type" in q:
+                    aadds += parse_pairs(["%s:%s" % (q["aadd_phase"][0], q["aadd_type"][0])])
+                self.send_html(view_timesheet(con, u, w, adds=adds, aadds=list(dict.fromkeys(aadds))))
             elif url.path == "/approvals":
-                self.send_html(view_approvals(con, u))
+                self.send_html(view_approvals(con, u, q=q))
             elif url.path == "/missing":
                 self.send_html(view_missing(con, u, q))
             elif url.path == "/reopen":
                 self.send_html(view_reopen(con, u, q))
             elif url.path == "/reports":
                 self.send_html(view_reports(con, u, q))
+            elif url.path == "/reports/grid":
+                self.send_html(view_grid(con, u, q))
+            elif url.path in ("/reports/grid.xlsx", "/reports/period.xlsx"):
+                if permission_of(con, u) == "admin":
+                    self.send_html(no_access(con, u, "Reports"), 403)
+                else:
+                    rv = report_view(con, u)
+                    if url.path == "/reports/grid.xlsx":
+                        rows, sheet = grid_sheet(grid_data(con, u, q, rv)), "Timesheet grid"
+                        n_bold = (1, len(rows)) if len(rows) > 1 else (1,)
+                    else:
+                        rows, sheet = period_sheet(con, u, q, rv)
+                        n_bold = (1, len(rows)) if len(rows) > 1 else (1,)
+                    self.send_download(xlsx_bytes(sheet, rows, n_bold), "timewriting-%s.xlsx" % ("grid" if "grid" in url.path else "period"))
             elif url.path == "/ctr":
                 self.send_html(view_ctr(con, u, q))
             elif url.path == "/admin":
-                self.send_html(view_admin(con, u, q.get("t", [""])[0]))
+                self.send_html(view_admin(con, u, q.get("t", [""])[0], q=q))
             elif url.path == "/admin/edit":
                 self.send_html(view_admin_edit(con, u, q.get("t", [""])[0], int(q.get("id", ["0"])[0])))
             elif url.path == "/audit":

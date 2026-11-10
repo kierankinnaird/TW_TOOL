@@ -201,10 +201,10 @@ class TestLifecycle(Base):
     def test_only_the_named_scope_approver_can_approve(self):
         eid = self.first("status='Submitted' and scope_id=1")  # scope 1 (Apache) approver = Alisdair Woodhead (7)
         sql = "UPDATE time_entry SET status='Approved', approved_by=?, last_edited_by=?, last_edited_at='t1' WHERE entry_id=?"
-        self.blocked(sql, (5, 5, eid), "Only the scope approver")   # Ewan Shaw: not an approver
-        self.blocked(sql, (8, 8, eid), "Only the scope approver")   # Kenneth Nicolson approves the Spirit scopes, not this one
-        self.blocked(sql, (29, 29, eid), "Only the scope approver")  # the cost controller never approves
-        self.blocked(sql, (30, 30, eid), "Only the scope approver")  # nor does the IT admin
+        self.blocked(sql, (5, 5, eid), "Only the approver of the booking code")   # Ewan Shaw: not an approver
+        self.blocked(sql, (8, 8, eid), "Only the approver of the booking code")   # Kenneth Nicolson approves the Spirit scopes, not this one
+        self.blocked(sql, (29, 29, eid), "Only the approver of the booking code")  # the cost controller never approves
+        self.blocked(sql, (30, 30, eid), "Only the approver of the booking code")  # nor does the IT admin
         self.con.execute(sql, (7, 7, eid))                          # Alisdair: the named approver
 
     def test_nobody_approves_their_own_entry(self):
@@ -312,13 +312,13 @@ class TestPermissionLevels(Base):
         eid = self.con.execute(NEW_ENTRY, (8, 5, 6, 36, 30, 60, "2026-11-04", 4, 8)).lastrowid
         sql = "UPDATE time_entry SET status='Approved', approved_by=?, last_edited_by=?, last_edited_at='t1' WHERE entry_id=?"
         self.blocked(sql, (8, 8, eid), "not their own entry")        # never their own
-        self.blocked(sql, (7, 7, eid), "Only the scope approver")    # another approver
-        self.blocked(sql, (30, 30, eid), "Only the scope approver")  # the admin never approves
+        self.blocked(sql, (7, 7, eid), "Only the approver of the booking code")    # another approver
+        self.blocked(sql, (30, 30, eid), "Only the approver of the booking code")  # the admin never approves
         self.con.execute(sql, (29, 29, eid))                         # a cost controller does
         self.assertEqual(self.scalar("select approved_by from time_entry where entry_id=?", eid), 29)
         # ...but a controller still cannot approve anyone else's hours (Ewan Shaw's on scope 1)
         other = self.scalar("select entry_id from time_entry where status='Submitted' and scope_id=1 limit 1")
-        self.blocked(sql, (29, 29, other), "Only the scope approver")
+        self.blocked(sql, (29, 29, other), "Only the approver of the booking code")
 
     def test_an_approver_cannot_be_made_a_controller_or_admin_while_still_named(self):
         self.blocked("UPDATE app_user SET permission='controller' WHERE user_id=8", msg="Remove this person as scope approver")
@@ -369,6 +369,241 @@ class TestActiveDatesAndPaafExpiry(Base):
         self.assertEqual(bad, 0)
         bad = self.scalar("select count(*) from time_entry t join paaf p on p.paaf_id=t.paaf_id where p.expiry_date is not null and t.work_date > p.expiry_date")
         self.assertEqual(bad, 0)
+
+
+class TestAllowances(Base):
+    """Overnight allowance, Per Diem and Mob fee: claimed per day against a booking code, submitted and approved with the hours."""
+    INS = "INSERT INTO allowance_entry (user_id, scope_id, phase_id, allowance_id, work_date, created_by) VALUES (?,?,?,?,?,?)"
+    SET = "UPDATE allowance_entry SET status=?, reason=?, approved_by=?, approved_at=?, last_edited_by=?, last_edited_at='t%s' WHERE allowance_entry_id=?"
+    n = 0
+
+    def claim(self, user=5, allowance=1, date="2026-11-06", scope=1, phase=1):
+        self.con.execute(self.INS, (user, scope, phase, allowance, date, user))
+        return self.scalar("select max(allowance_entry_id) from allowance_entry")
+
+    def update(self, eid, status, by, reason=None, approved_by=None):
+        TestAllowances.n += 1
+        return (self.SET % TestAllowances.n, (status, reason, approved_by, "t" if approved_by else None, by, eid))
+
+    def blocked_update(self, eid, status, by, msg, reason=None, approved_by=None):
+        sql, args = self.update(eid, status, by, reason, approved_by)
+        self.blocked(sql, args, msg)
+
+    def do_update(self, eid, status, by, reason=None, approved_by=None):
+        sql, args = self.update(eid, status, by, reason, approved_by)
+        self.con.execute(sql, args)
+
+    def test_the_three_allowances_are_seeded(self):
+        self.assertEqual([r[0] for r in self.con.execute("select name from allowance_type order by allowance_id")], ["Overnight allowance", "Per Diem", "Mob fee"])
+
+    def test_a_person_claims_one_of_each_allowance_per_day(self):
+        self.claim(allowance=1)
+        self.claim(allowance=2)                                   # a different allowance on the same day is fine
+        self.blocked(self.INS, (5, 1, 1, 1, "2026-11-06", 5), "UNIQUE")      # the same one twice is not
+        self.blocked(self.INS, (5, 1, 2, 1, "2026-11-06", 5), "UNIQUE")      # not even against another booking code
+
+    def test_the_booking_rules_apply_to_allowances(self):
+        self.blocked(self.INS, (4, 1, 1, 2, "2026-11-06", 4), "No approved PAAF")        # David Hart's PAAF is only Sent
+        self.blocked(self.INS, (5, 1, 1, 2, "2026-10-30", 5), "period is not open")
+        self.blocked(self.INS, (5, 1, 1, 2, "2026-02-27", 5), "not active on that date")
+        self.blocked(self.INS, (1, 4, 5, 2, "2026-11-06", 1), "Scope is not Open")
+        self.con.execute("UPDATE phase SET restricted=1 WHERE phase_id=1")
+        self.blocked(self.INS, (5, 1, 1, 2, "2026-11-06", 5), "restricted")
+        self.con.execute("UPDATE phase SET restricted=0, book_to='2026-11-04' WHERE phase_id=1")
+        self.blocked(self.INS, (5, 1, 1, 2, "2026-11-06", 5), "booking dates")
+        self.con.execute("UPDATE allowance_type SET active=0 WHERE allowance_id=3")
+        self.blocked(self.INS, (5, 1, 2, 3, "2026-11-06", 5), "not available")
+
+    def test_internal_codes_need_no_paaf_for_allowances(self):
+        self.con.execute(self.INS, (5, 7, 8, 2, "2026-11-06", 5))
+
+    def test_submit_approve_and_the_audit_trail(self):
+        eid = self.claim()
+        self.blocked_update(eid, "Submitted", 7, "Only the person can submit")
+        self.do_update(eid, "Submitted", 5)
+        self.blocked_update(eid, "Approved", 5, "Only the approver of the booking code", approved_by=5)      # not their own
+        self.blocked_update(eid, "Approved", 30, "Only the approver of the booking code", approved_by=30)    # the admin never approves
+        self.blocked_update(eid, "Approved", 8, "Only the approver of the booking code", approved_by=8)      # another scope's approver
+        self.do_update(eid, "Approved", 7, approved_by=7)                                                    # the code's approver
+        self.assertEqual(self.scalar("select status from allowance_entry where allowance_entry_id=?", eid), "Approved")
+        trail = [tuple(r) for r in self.con.execute("select action, old_status, new_status, changed_by from allowance_audit where allowance_entry_id=? order by audit_id", (eid,))]
+        self.assertEqual(trail, [("CREATE", None, "Draft", 5), ("STATUS", "Draft", "Submitted", 5), ("STATUS", "Submitted", "Approved", 7)])
+
+    def test_an_approver_cannot_skip_the_submit_and_a_cost_controller_approves_the_approvers_own(self):
+        eid = self.claim()
+        self.blocked_update(eid, "Approved", 7, "Only the person can submit", approved_by=7)                                # Draft straight to Approved
+        self.con.execute("UPDATE phase SET approver_user_id=6 WHERE phase_id=1")                             # Jamie Ireland approves this code
+        self.con.execute("INSERT INTO paaf (user_id, client_id, rate_id, status) VALUES (6, 1, 1, 'Approved')")
+        own = self.claim(user=6)
+        self.do_update(own, "Submitted", 6)
+        self.blocked_update(own, "Approved", 6, "Only the approver of the booking code", approved_by=6)
+        self.do_update(own, "Approved", 29, approved_by=29)                                                  # a cost controller does
+
+    def test_sending_back_needs_a_reason_and_reopening_is_for_cost_controllers(self):
+        eid = self.claim()
+        self.do_update(eid, "Submitted", 5)
+        self.blocked_update(eid, "Draft", 7, "needs a reason")
+        self.blocked_update(eid, "Draft", 5, "needs a reason", reason="oops")                                # the owner cannot withdraw it
+        self.do_update(eid, "Draft", 7, reason="Wrong day")
+        self.assertEqual(self.scalar("select reason from allowance_entry where allowance_entry_id=?", eid), "Wrong day")
+        self.do_update(eid, "Submitted", 5)
+        self.do_update(eid, "Approved", 7, approved_by=7)
+        self.blocked_update(eid, "Draft", 7, "Only a cost controller can reopen", reason="Reopen")
+        self.blocked_update(eid, "Draft", 29, "Only a cost controller can reopen")                           # needs a reason
+        self.do_update(eid, "Draft", 29, reason="Reopened for correction")
+        self.assertEqual(self.scalar("select status from allowance_entry where allowance_entry_id=?", eid), "Draft")
+
+    def test_only_drafts_can_be_deleted_and_nothing_else_can_be_changed(self):
+        eid = self.claim()
+        self.blocked("UPDATE allowance_entry SET work_date='2026-11-05', last_edited_by=5, last_edited_at='x' WHERE allowance_entry_id=?", (eid,), "Only the status")
+        self.blocked("UPDATE allowance_entry SET user_id=9 WHERE allowance_entry_id=?", (eid,), "last_edited_by")
+        self.do_update(eid, "Submitted", 5)
+        self.blocked("DELETE FROM allowance_entry WHERE allowance_entry_id=?", (eid,), "Only Draft")
+        other = self.claim(allowance=2)
+        self.con.execute("DELETE FROM allowance_entry WHERE allowance_entry_id=?", (other,))
+        self.assertEqual(self.scalar("select count(*) from allowance_audit where allowance_entry_id=? and action='DELETE'", other), 1)
+
+    def test_the_allowance_audit_trail_cannot_be_changed(self):
+        self.claim()
+        self.blocked("UPDATE allowance_audit SET reason='tidied'", msg="cannot be changed")
+        self.blocked("DELETE FROM allowance_audit", msg="cannot be deleted")
+
+
+class TestRatesAreAppendOnly(Base):
+    """FR-12: a rate is never edited; a new row with a later effective date takes over."""
+    def test_a_rate_cannot_be_edited_or_deleted(self):
+        self.blocked("UPDATE rate SET sales_rate=1 WHERE rate_id=4", msg="never edited")
+        self.blocked("UPDATE rate SET effective_from='2020-01-01' WHERE rate_id=4", msg="never edited")
+        self.blocked("DELETE FROM rate WHERE rate_id=4", msg="never deleted")
+        self.assertGreater(self.scalar("select sales_rate from rate where rate_id=4"), 1)
+
+    def test_a_new_row_with_a_later_date_takes_over_and_old_hours_keep_their_price(self):
+        old_rate = self.scalar("select sales_rate from rate where rate_id=4")
+        entry = self.scalar("select entry_id from time_entry where rate_id=4 limit 1")
+        self.con.execute("INSERT INTO rate (client_id, role_id, sales_rate, effective_from) "
+                         "SELECT client_id, role_id, sales_rate + 10, '2027-01-01' FROM rate WHERE rate_id=4")
+        self.assertEqual(self.scalar("select rate_id from time_entry where entry_id=?", entry), 4)
+        self.assertEqual(self.scalar("select sales_rate from rate where rate_id=4"), old_rate)
+
+
+class TestAuditTrailIsAppendOnly(Base):
+    """NFR-05: every change to hours is recorded and the record cannot be altered or removed."""
+    def test_audit_rows_cannot_be_changed(self):
+        self.assertGreater(self.scalar("select count(*) from time_entry_audit"), 0)
+        self.blocked("UPDATE time_entry_audit SET reason='tidied up'", msg="cannot be changed")
+        self.blocked("UPDATE time_entry_audit SET new_hours=0 WHERE audit_id=1", msg="cannot be changed")
+
+    def test_audit_rows_cannot_be_deleted(self):
+        before = self.scalar("select count(*) from time_entry_audit")
+        self.blocked("DELETE FROM time_entry_audit WHERE audit_id=1", msg="cannot be deleted")
+        self.blocked("DELETE FROM time_entry_audit", msg="cannot be deleted")
+        self.assertEqual(self.scalar("select count(*) from time_entry_audit"), before)
+
+    def test_normal_work_still_adds_audit_rows(self):
+        before = self.scalar("select count(*) from time_entry_audit")
+        self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 2, 5))
+        self.assertGreater(self.scalar("select count(*) from time_entry_audit"), before)
+
+
+class TestPaafPosition(Base):
+    """R09: the person is assigned a position (a line of the client's rate card) on their PAAF, and it sets the rate for their own-role hours."""
+    def apache_rate(self, role):
+        return self.scalar("select rate_id from rate where client_id=1 and role_id=? order by effective_from desc limit 1", role)
+
+    def test_a_person_booking_as_their_own_role_may_use_the_position_on_their_paaf(self):
+        # Ewan Shaw is a Planner (role 4) but his PAAF assigns him the Project Engineer position (role 3)
+        self.con.execute("UPDATE paaf SET rate_id=? WHERE paaf_id=1", (self.apache_rate(3),))
+        self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 4, self.apache_rate(3), "2026-11-06", 8, 5))
+        self.assertEqual(self.scalar("select rate_id from time_entry where user_id=5 and work_date='2026-11-06'"), self.apache_rate(3))
+
+    def test_the_position_does_not_cover_other_roles_or_other_clients(self):
+        self.con.execute("UPDATE paaf SET rate_id=? WHERE paaf_id=1", (self.apache_rate(3),))
+        # covering another role (5) with the assigned position's rate is not allowed, and neither is a rate of another client
+        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 5, self.apache_rate(3), "2026-11-06", 8, 5), "Rate does not match")
+        other = self.scalar("select rate_id from rate where client_id=2 and role_id=3 limit 1")
+        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, other, "2026-11-06", 8, 5), "Rate does not match")
+
+
+class TestBookingCodeControls(Base):
+    """R06 transaction controls (a list of people, a booking window), R19 an approver per booking code, R04a/R04f description and references."""
+    # BB0001 is scope 1 (approver Alisdair Woodhead, 7), phases 1 Define and 2 Execute. Ewan Shaw (5) and Daniel Evans (9) hold Apache PAAFs.
+    def book(self, user, date, phase=1, role=4, rate=4, paaf=None):
+        paaf = paaf or self.scalar("select paaf_id from paaf where user_id=? and client_id=1", user)
+        return self.con.execute(NEW_ENTRY, (user, 1, phase, paaf, role, rate, date, 2, user))
+
+    def test_a_code_is_open_to_anyone_by_default(self):
+        self.assertEqual(self.scalar("select restricted from phase where phase_id=1"), 0)
+        self.book(5, "2026-11-06")
+
+    def test_a_restricted_code_can_only_be_booked_by_the_people_on_its_list(self):
+        self.con.execute("UPDATE phase SET restricted=1 WHERE phase_id=1")
+        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 2, 5), msg="restricted")          # nobody listed yet
+        self.con.execute("INSERT INTO phase_person (phase_id, user_id) VALUES (1, 5)")
+        self.book(5, "2026-11-06")                                                                  # Ewan is on the list
+        self.con.execute("INSERT INTO period (week_start) VALUES ('2026-11-02') ON CONFLICT DO NOTHING")
+        self.blocked(NEW_ENTRY, (9, 1, 1, self.scalar("select paaf_id from paaf where user_id=9 and client_id=1"), 3, 3, "2026-11-06", 2, 9),
+                     msg="not on its list")                                                         # Daniel is not
+        self.book(9, "2026-11-06", phase=2, role=3, rate=3)                                         # another code of the scope is unaffected
+
+    def test_a_booking_window_limits_the_work_dates(self):
+        self.con.execute("UPDATE phase SET book_from='2026-11-03', book_to='2026-11-05' WHERE phase_id=1")
+        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-02", 2, 5), msg="outside its booking dates")
+        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 2, 5), msg="outside its booking dates")
+        self.book(5, "2026-11-03")
+        self.book(5, "2026-11-05")                                                                  # both ends are inside the window
+
+    def test_a_window_can_be_open_ended(self):
+        self.con.execute("UPDATE phase SET book_from='2026-11-05' WHERE phase_id=1")
+        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-04", 2, 5), msg="outside its booking dates")
+        self.book(5, "2026-11-06")
+
+    def test_controls_do_not_change_hours_already_booked(self):
+        before = self.scalar("select count(*) from time_entry where phase_id=1")
+        self.con.execute("UPDATE phase SET restricted=1, book_from='2030-01-01' WHERE phase_id=1")
+        self.assertEqual(self.scalar("select count(*) from time_entry where phase_id=1"), before)
+
+    def test_a_code_can_have_its_own_approver_and_only_they_approve_it(self):
+        self.con.execute("UPDATE phase SET approver_user_id=6 WHERE phase_id=1")   # Jamie Ireland, project manager, approves BB0001 Define
+        eid = self.scalar("select entry_id from time_entry where phase_id=1 and status='Submitted' and user_id<>6 limit 1")
+        sql = "UPDATE time_entry SET status='Approved', approved_by=?, approved_at='t', last_edited_by=?, last_edited_at='t' WHERE entry_id=?"
+        self.blocked(sql, (7, 7, eid), "Only the approver of the booking code")          # the scope's approver no longer approves this code
+        self.con.execute(sql, (6, 6, eid))                                                 # the code's own approver does
+        self.assertEqual(self.scalar("select status from time_entry where entry_id=?", eid), "Approved")
+        # a code with no approver of its own still follows its scope's approver
+        other = self.scalar("select entry_id from time_entry where phase_id=3 and status='Submitted' limit 1")
+        self.blocked(sql, (6, 6, other), "Only the approver of the booking code")
+        self.con.execute(sql, (7, 7, other))
+
+    def test_only_a_standard_user_can_approve_a_code_and_they_cannot_be_demoted_while_they_do(self):
+        self.blocked("UPDATE phase SET approver_user_id=29 WHERE phase_id=1", msg="standard user")
+        self.blocked("INSERT INTO phase (scope_id, name, approver_user_id) VALUES (1, 'Closeout', 30)", msg="standard user")
+        self.con.execute("UPDATE phase SET approver_user_id=6 WHERE phase_id=1")
+        self.blocked("UPDATE app_user SET permission='controller' WHERE user_id=6", msg="Remove this person as scope approver")
+
+    def test_the_approver_queue_view_uses_the_codes_approver(self):
+        self.con.execute("UPDATE phase SET approver_user_id=6 WHERE phase_id=1")
+        rows = self.con.execute("select approver_user_id from v_approver_queue where entry_id in (select entry_id from time_entry where phase_id=1)").fetchall()
+        self.assertTrue(rows)
+        self.assertEqual({r[0] for r in rows}, {6})
+
+    def test_a_cost_controller_approves_hours_booked_by_the_codes_approver(self):
+        self.con.execute("UPDATE phase SET approver_user_id=6 WHERE phase_id=1")
+        self.con.execute("INSERT INTO paaf (user_id, client_id, rate_id, status) VALUES (6, 1, 1, 'Approved')")
+        paaf = self.scalar("select paaf_id from paaf where user_id=6 and client_id=1")
+        role = self.scalar("select role_id from rate where rate_id=1")
+        self.con.execute(NEW_ENTRY, (6, 1, 1, paaf, role, 1, "2026-11-06", 2, 6))
+        eid = self.scalar("select entry_id from time_entry where user_id=6 and work_date='2026-11-06'")
+        self.con.execute("UPDATE time_entry SET status='Submitted', last_edited_by=6, last_edited_at='t' WHERE entry_id=?", (eid,))
+        sql = "UPDATE time_entry SET status='Approved', approved_by=?, approved_at='t', last_edited_by=?, last_edited_at='t' WHERE entry_id=?"
+        self.blocked(sql, (6, 6, eid))                    # not their own hours
+        self.blocked(sql, (7, 7, eid))                    # the scope approver is not this code's approver
+        self.con.execute(sql, (29, 29, eid))              # a cost controller approves it
+
+    def test_a_code_can_carry_a_description_and_wbs_cbs_abs_references(self):
+        self.con.execute("UPDATE phase SET description='Clear the wellbay', wbs='1.2.3', cbs='C-40', abs_code='A-7' WHERE phase_id=1")
+        self.assertEqual(tuple(self.con.execute("select description, wbs, cbs, abs_code from phase where phase_id=1").fetchone()),
+                         ("Clear the wellbay", "1.2.3", "C-40", "A-7"))
+        self.assertIsNone(self.scalar("select wbs from phase where phase_id=2"))            # all of them are optional
 
 
 class TestReopen(Base):

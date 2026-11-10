@@ -2,10 +2,16 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 5;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+PRAGMA user_version = 10;  -- 2: a cost controller approves the hours a scope approver books to their own scope
                           -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
                           -- 4: every entry has a location (On site / Offshore / Standard) and an overtime flag
                           -- 5: a cost controller can reopen submitted or approved hours (reopen_reason)
+                          -- 6: booking codes (phases) can have their own approver, a description, WBS / CBS / ABS references,
+                          --    and transaction controls (a list of people and a booking window)
+                          -- 7: the position (rate card line) assigned on a person's PAAF sets the rate for their own-role hours
+                          -- 8: the audit trail can only be added to, never changed or deleted
+                          -- 9: rate rows can only be added: a rate is never edited or deleted, a new row with a later date takes over
+                          -- 10: allowances (Overnight allowance, Per Diem, Mob fee) claimed per day, submitted and approved with the hours
 
 -- Controlled list of job titles, grouped into job families. Editable by admin/superuser.
 CREATE TABLE role (
@@ -86,8 +92,38 @@ CREATE TABLE phase (
     scope_id   INTEGER NOT NULL REFERENCES scope(scope_id),
     name       TEXT NOT NULL,
     status     TEXT NOT NULL DEFAULT 'Open' CHECK (status IN ('Open','Closed')),
+    description TEXT,                                   -- free-text description of the booking code
+    wbs        TEXT,                                    -- optional WBS / CBS / ABS references
+    cbs        TEXT,
+    abs_code   TEXT,
+    -- Approver for this booking code. Empty means the scope's approver (so one scope can have codes with different approvers).
+    approver_user_id INTEGER REFERENCES app_user(user_id),
+    -- Transaction controls. restricted = 0: anyone can book to the code. restricted = 1: only the people listed in phase_person.
+    -- book_from / book_to (both optional) limit the work dates that can be booked.
+    restricted INTEGER NOT NULL DEFAULT 0 CHECK (restricted IN (0,1)),
+    book_from  TEXT,
+    book_to    TEXT,
     UNIQUE (scope_id, name)
 );
+
+-- People allowed to book to a restricted booking code.
+CREATE TABLE phase_person (
+    phase_id INTEGER NOT NULL REFERENCES phase(phase_id),
+    user_id  INTEGER NOT NULL REFERENCES app_user(user_id),
+    PRIMARY KEY (phase_id, user_id)
+);
+
+-- A booking code's own approver must be a standard user too.
+CREATE TRIGGER trg_phase_approver_insert BEFORE INSERT ON phase
+BEGIN
+    SELECT RAISE(ABORT, 'Only a standard user can be named as a booking code approver')
+    WHERE NEW.approver_user_id IS NOT NULL AND (SELECT permission FROM app_user WHERE user_id = NEW.approver_user_id) <> 'user';
+END;
+CREATE TRIGGER trg_phase_approver_update BEFORE UPDATE OF approver_user_id ON phase
+BEGIN
+    SELECT RAISE(ABORT, 'Only a standard user can be named as a booking code approver')
+    WHERE NEW.approver_user_id IS NOT NULL AND (SELECT permission FROM app_user WHERE user_id = NEW.approver_user_id) <> 'user';
+END;
 
 -- Approver is not a permission: it means being named as approver on a scope. Only standard users can be named.
 -- Cost controllers and admins never approve, so they cannot be approvers.
@@ -104,7 +140,8 @@ END;
 CREATE TRIGGER trg_user_permission_update BEFORE UPDATE OF permission ON app_user
 BEGIN
     SELECT RAISE(ABORT, 'Remove this person as scope approver before making them a controller or admin')
-    WHERE NEW.permission <> 'user' AND EXISTS (SELECT 1 FROM scope WHERE approver_user_id = NEW.user_id);
+    WHERE NEW.permission <> 'user' AND (EXISTS (SELECT 1 FROM scope WHERE approver_user_id = NEW.user_id)
+                                        OR EXISTS (SELECT 1 FROM phase WHERE approver_user_id = NEW.user_id));
 END;
 
 -- A scope sits under a project of the same client.
@@ -120,6 +157,16 @@ BEGIN
 END;
 
 -- The internal client has no rate card and needs no PAAFs.
+-- Rates are append-only so past billing stays reproducible: a change is a new row with a later effective date.
+CREATE TRIGGER trg_rate_no_update BEFORE UPDATE ON rate
+BEGIN
+    SELECT RAISE(ABORT, 'Rates are never edited: add a new row with a later effective date');
+END;
+CREATE TRIGGER trg_rate_no_delete BEFORE DELETE ON rate
+BEGIN
+    SELECT RAISE(ABORT, 'Rates are never deleted: add a new row with a later effective date');
+END;
+
 CREATE TRIGGER trg_rate_not_internal BEFORE INSERT ON rate
 BEGIN
     SELECT RAISE(ABORT, 'Internal codes have no rate card')
@@ -206,6 +253,13 @@ BEGIN
     WHERE (SELECT pr.status FROM scope sc JOIN project pr ON pr.project_id = sc.project_id WHERE sc.scope_id = NEW.scope_id) <> 'Open';
     SELECT RAISE(ABORT, 'Phase is not Open')
     WHERE (SELECT status FROM phase WHERE phase_id = NEW.phase_id) <> 'Open';
+    -- Transaction controls on the booking code: a list of people, and a window of dates (both optional).
+    SELECT RAISE(ABORT, 'This booking code is restricted and this person is not on its list of people')
+    WHERE (SELECT restricted FROM phase WHERE phase_id = NEW.phase_id) = 1
+      AND NOT EXISTS (SELECT 1 FROM phase_person WHERE phase_id = NEW.phase_id AND user_id = NEW.user_id);
+    SELECT RAISE(ABORT, 'This booking code cannot be booked on that date (outside its booking dates)')
+    WHERE EXISTS (SELECT 1 FROM phase WHERE phase_id = NEW.phase_id
+                  AND ((book_from IS NOT NULL AND NEW.work_date < book_from) OR (book_to IS NOT NULL AND NEW.work_date > book_to)));
     -- Client work: needs an approved PAAF and a matching rate. Internal hours: neither.
     SELECT RAISE(ABORT, 'No approved PAAF for this user and client')
     WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 0
@@ -221,7 +275,10 @@ BEGIN
       AND NOT EXISTS (
         SELECT 1 FROM rate r JOIN scope s ON s.client_id = r.client_id
         WHERE r.rate_id = NEW.rate_id AND s.scope_id = NEW.scope_id
-          AND r.role_id = NEW.worked_role_id);
+          AND (r.role_id = NEW.worked_role_id
+               -- or, booking as their own role, the position they are assigned on their PAAF
+               OR (NEW.worked_role_id = (SELECT role_id FROM app_user WHERE user_id = NEW.user_id)
+                   AND r.role_id = (SELECT pr.role_id FROM paaf p JOIN rate pr ON pr.rate_id = p.rate_id WHERE p.paaf_id = NEW.paaf_id))));
     SELECT RAISE(ABORT, 'Internal hours have no PAAF and no rate')
     WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 1
       AND (NEW.paaf_id IS NOT NULL OR NEW.rate_id IS NOT NULL);
@@ -280,16 +337,26 @@ BEGIN
 
     -- approval: the person named as the scope's approver, never the entry owner. One exception: hours booked BY the scope's
     -- approver have nobody else who may approve them, so a cost controller approves those. Admins never approve.
-    SELECT RAISE(ABORT, 'Only the scope approver can approve (and not their own entry); a cost controller approves hours booked by the scope approver')
+    SELECT RAISE(ABORT, 'Only the approver of the booking code can approve (and not their own entry); a cost controller approves hours booked by the code approver')
     WHERE NEW.status = 'Approved' AND OLD.status <> 'Approved'
       AND (NEW.approved_by IS NULL
            OR NEW.approved_by = NEW.user_id
            OR NOT (
-                (NEW.approved_by = (SELECT approver_user_id FROM scope WHERE scope_id = NEW.scope_id)
+                (NEW.approved_by = COALESCE((SELECT approver_user_id FROM phase WHERE phase_id = NEW.phase_id), (SELECT approver_user_id FROM scope WHERE scope_id = NEW.scope_id))
                  AND (SELECT permission FROM app_user WHERE user_id = NEW.approved_by) = 'user')
                 OR
                 ((SELECT permission FROM app_user WHERE user_id = NEW.approved_by) = 'controller'
-                 AND NEW.user_id = (SELECT approver_user_id FROM scope WHERE scope_id = NEW.scope_id))));
+                 AND NEW.user_id = COALESCE((SELECT approver_user_id FROM phase WHERE phase_id = NEW.phase_id), (SELECT approver_user_id FROM scope WHERE scope_id = NEW.scope_id)))));
+END;
+
+-- The audit trail is append-only: rows can be added (by the triggers below) but never changed or removed.
+CREATE TRIGGER trg_audit_no_update BEFORE UPDATE ON time_entry_audit
+BEGIN
+    SELECT RAISE(ABORT, 'The audit trail cannot be changed');
+END;
+CREATE TRIGGER trg_audit_no_delete BEFORE DELETE ON time_entry_audit
+BEGIN
+    SELECT RAISE(ABORT, 'The audit trail cannot be deleted');
 END;
 
 CREATE TRIGGER trg_time_entry_audit_insert
@@ -370,8 +437,143 @@ JOIN role r   ON r.role_id = rt.role_id
 WHERE t.status = 'Approved'
 GROUP BY week_start, ph.phase_id, rt.rate_id;
 
--- Entries waiting on each scope approver.
+-- Entries waiting on each approver (the booking code's own approver, else the scope's).
 CREATE VIEW v_approver_queue AS
-SELECT s.approver_user_id, s.scope_code, u.name AS booked_by, t.work_date, t.hours, t.status, t.entry_id
-FROM time_entry t JOIN scope s ON s.scope_id = t.scope_id JOIN app_user u ON u.user_id = t.user_id
+SELECT COALESCE(ph.approver_user_id, s.approver_user_id) AS approver_user_id, s.scope_code, u.name AS booked_by, t.work_date, t.hours, t.status, t.entry_id
+FROM time_entry t JOIN scope s ON s.scope_id = t.scope_id JOIN phase ph ON ph.phase_id = t.phase_id JOIN app_user u ON u.user_id = t.user_id
 WHERE t.status IN ('Submitted','Edited');
+
+-- ---------------------------------------------------------------------------------------------------------------------------
+-- Allowances: Overnight allowance, Per Diem, Mob fee. A person claims one of each per day, against a booking code (so it is
+-- approved by that code's approver and follows the same rules as hours). Flat claims: no amount is stored yet.
+-- ---------------------------------------------------------------------------------------------------------------------------
+CREATE TABLE allowance_type (
+    allowance_id INTEGER PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    active       INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1))
+);
+
+CREATE TABLE allowance_entry (
+    allowance_entry_id INTEGER PRIMARY KEY,
+    user_id        INTEGER NOT NULL REFERENCES app_user(user_id),
+    scope_id       INTEGER NOT NULL REFERENCES scope(scope_id),
+    phase_id       INTEGER NOT NULL REFERENCES phase(phase_id),
+    allowance_id   INTEGER NOT NULL REFERENCES allowance_type(allowance_id),
+    work_date      TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'Draft' CHECK (status IN ('Draft','Submitted','Approved')),
+    reason         TEXT,                                  -- why it was sent back or reopened
+    approved_by    INTEGER REFERENCES app_user(user_id),
+    approved_at    TEXT,
+    created_by     INTEGER NOT NULL REFERENCES app_user(user_id),
+    last_edited_by INTEGER REFERENCES app_user(user_id),
+    last_edited_at TEXT,
+    UNIQUE (user_id, allowance_id, work_date)             -- one of each allowance per person per day
+);
+
+CREATE TRIGGER trg_allowance_valid
+BEFORE INSERT ON allowance_entry
+BEGIN
+    SELECT RAISE(ABORT, 'New allowances must be Draft') WHERE NEW.status <> 'Draft';
+    SELECT RAISE(ABORT, 'That allowance is not available') WHERE NOT EXISTS (SELECT 1 FROM allowance_type WHERE allowance_id = NEW.allowance_id AND active = 1);
+    SELECT RAISE(ABORT, 'This person is not active on that date (check their start and end dates)')
+    WHERE EXISTS (SELECT 1 FROM app_user WHERE user_id = NEW.user_id AND (NEW.work_date < start_date OR (end_date IS NOT NULL AND NEW.work_date > end_date)));
+    SELECT RAISE(ABORT, 'Scope is not Open') WHERE (SELECT status FROM scope WHERE scope_id = NEW.scope_id) <> 'Open';
+    SELECT RAISE(ABORT, 'Phase does not belong to this scope') WHERE NOT EXISTS (SELECT 1 FROM phase WHERE phase_id = NEW.phase_id AND scope_id = NEW.scope_id);
+    SELECT RAISE(ABORT, 'Project is not Open')
+    WHERE (SELECT pr.status FROM scope sc JOIN project pr ON pr.project_id = sc.project_id WHERE sc.scope_id = NEW.scope_id) <> 'Open';
+    SELECT RAISE(ABORT, 'Phase is not Open') WHERE (SELECT status FROM phase WHERE phase_id = NEW.phase_id) <> 'Open';
+    SELECT RAISE(ABORT, 'This booking code is restricted and this person is not on its list of people')
+    WHERE (SELECT restricted FROM phase WHERE phase_id = NEW.phase_id) = 1
+      AND NOT EXISTS (SELECT 1 FROM phase_person WHERE phase_id = NEW.phase_id AND user_id = NEW.user_id);
+    SELECT RAISE(ABORT, 'This booking code cannot be booked on that date (outside its booking dates)')
+    WHERE EXISTS (SELECT 1 FROM phase WHERE phase_id = NEW.phase_id
+                  AND ((book_from IS NOT NULL AND NEW.work_date < book_from) OR (book_to IS NOT NULL AND NEW.work_date > book_to)));
+    SELECT RAISE(ABORT, 'No approved PAAF for this user and client')
+    WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 0
+      AND NOT EXISTS (SELECT 1 FROM paaf p JOIN scope s ON s.client_id = p.client_id
+                      WHERE p.user_id = NEW.user_id AND s.scope_id = NEW.scope_id AND p.status = 'Approved'
+                        AND (p.expiry_date IS NULL OR NEW.work_date <= p.expiry_date));
+    SELECT RAISE(ABORT, 'Weekly period is not open')
+    WHERE NOT EXISTS (SELECT 1 FROM period WHERE week_start = date(NEW.work_date, 'weekday 0', '-6 days') AND status = 'Open');
+END;
+
+CREATE TRIGGER trg_allowance_edit_rules
+BEFORE UPDATE ON allowance_entry
+BEGIN
+    SELECT RAISE(ABORT, 'Edits must set last_edited_by and last_edited_at')
+    WHERE NEW.last_edited_by IS NULL OR NEW.last_edited_at IS NULL
+       OR (NEW.last_edited_by IS OLD.last_edited_by AND NEW.last_edited_at IS OLD.last_edited_at);
+    SELECT RAISE(ABORT, 'Only the status of an allowance can change')
+    WHERE NEW.user_id <> OLD.user_id OR NEW.scope_id <> OLD.scope_id OR NEW.phase_id <> OLD.phase_id
+       OR NEW.allowance_id <> OLD.allowance_id OR NEW.work_date <> OLD.work_date;
+    -- the person submits their own drafts
+    SELECT RAISE(ABORT, 'Only the person can submit their own allowances')
+    WHERE OLD.status = 'Draft' AND NEW.status <> 'Draft' AND (NEW.status <> 'Submitted' OR NEW.last_edited_by <> NEW.user_id);
+    -- approval: the booking code's approver (never the owner); hours and allowances booked BY the code's approver are approved by a cost controller
+    SELECT RAISE(ABORT, 'Only the approver of the booking code can approve (and not their own entry); a cost controller approves allowances booked by the code approver')
+    WHERE OLD.status = 'Submitted' AND NEW.status = 'Approved'
+      AND (NEW.approved_by IS NULL OR NEW.approved_by = NEW.user_id OR NOT (
+            (NEW.approved_by = COALESCE((SELECT approver_user_id FROM phase WHERE phase_id = NEW.phase_id), (SELECT approver_user_id FROM scope WHERE scope_id = NEW.scope_id))
+             AND (SELECT permission FROM app_user WHERE user_id = NEW.approved_by) = 'user')
+            OR ((SELECT permission FROM app_user WHERE user_id = NEW.approved_by) = 'controller'
+                AND NEW.user_id = COALESCE((SELECT approver_user_id FROM phase WHERE phase_id = NEW.phase_id), (SELECT approver_user_id FROM scope WHERE scope_id = NEW.scope_id)))));
+    -- sending back (Submitted -> Draft) needs a reason, from the code's approver or a cost controller, never the owner
+    SELECT RAISE(ABORT, 'Sending an allowance back needs a reason, from its approver or a cost controller')
+    WHERE OLD.status = 'Submitted' AND NEW.status = 'Draft'
+      AND (NEW.reason IS NULL OR NEW.reason = '' OR NEW.reason IS OLD.reason OR NEW.last_edited_by = NEW.user_id
+           OR NOT (NEW.last_edited_by = COALESCE((SELECT approver_user_id FROM phase WHERE phase_id = NEW.phase_id), (SELECT approver_user_id FROM scope WHERE scope_id = NEW.scope_id))
+                   OR (SELECT permission FROM app_user WHERE user_id = NEW.last_edited_by) = 'controller'));
+    -- reopening (Approved -> Draft): only a cost controller, with a reason, never their own
+    SELECT RAISE(ABORT, 'Only a cost controller can reopen an approved allowance, with a reason, and not their own')
+    WHERE OLD.status = 'Approved' AND NEW.status = 'Draft'
+      AND (NEW.reason IS NULL OR NEW.reason = '' OR NEW.reason IS OLD.reason OR NEW.last_edited_by = NEW.user_id
+           OR (SELECT permission FROM app_user WHERE user_id = NEW.last_edited_by) <> 'controller');
+    SELECT RAISE(ABORT, 'That change of status is not allowed')
+    WHERE (OLD.status = 'Draft' AND NEW.status = 'Approved') OR (OLD.status = 'Approved' AND NEW.status = 'Submitted');
+END;
+
+CREATE TRIGGER trg_allowance_delete_draft_only
+BEFORE DELETE ON allowance_entry
+BEGIN
+    SELECT RAISE(ABORT, 'Only Draft allowances can be deleted') WHERE OLD.status <> 'Draft';
+END;
+
+-- Audit trail for allowances: append-only, like the one for hours.
+CREATE TABLE allowance_audit (
+    audit_id           INTEGER PRIMARY KEY,
+    allowance_entry_id INTEGER NOT NULL,
+    action             TEXT NOT NULL CHECK (action IN ('CREATE','STATUS','DELETE')),
+    changed_by         INTEGER REFERENCES app_user(user_id),
+    changed_at         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    old_status         TEXT,
+    new_status         TEXT,
+    reason             TEXT,
+    user_id            INTEGER NOT NULL,
+    allowance_id       INTEGER NOT NULL,
+    work_date          TEXT NOT NULL
+);
+CREATE TRIGGER trg_allowance_audit_insert AFTER INSERT ON allowance_entry
+BEGIN
+    INSERT INTO allowance_audit (allowance_entry_id, action, changed_by, new_status, user_id, allowance_id, work_date)
+    VALUES (NEW.allowance_entry_id, 'CREATE', NEW.created_by, NEW.status, NEW.user_id, NEW.allowance_id, NEW.work_date);
+END;
+CREATE TRIGGER trg_allowance_audit_update AFTER UPDATE ON allowance_entry
+WHEN NEW.status <> OLD.status
+BEGIN
+    INSERT INTO allowance_audit (allowance_entry_id, action, changed_by, old_status, new_status, reason, user_id, allowance_id, work_date)
+    VALUES (NEW.allowance_entry_id, 'STATUS', NEW.last_edited_by, OLD.status, NEW.status,
+            CASE WHEN NEW.status = 'Draft' THEN NEW.reason END, NEW.user_id, NEW.allowance_id, NEW.work_date);
+END;
+CREATE TRIGGER trg_allowance_audit_delete BEFORE DELETE ON allowance_entry
+BEGIN
+    INSERT INTO allowance_audit (allowance_entry_id, action, changed_by, old_status, user_id, allowance_id, work_date)
+    VALUES (OLD.allowance_entry_id, 'DELETE', COALESCE(OLD.last_edited_by, OLD.user_id), OLD.status, OLD.user_id, OLD.allowance_id, OLD.work_date);
+END;
+CREATE TRIGGER trg_allowance_audit_no_update BEFORE UPDATE ON allowance_audit
+BEGIN
+    SELECT RAISE(ABORT, 'The audit trail cannot be changed');
+END;
+CREATE TRIGGER trg_allowance_audit_no_delete BEFORE DELETE ON allowance_audit
+BEGIN
+    SELECT RAISE(ABORT, 'The audit trail cannot be deleted');
+END;
