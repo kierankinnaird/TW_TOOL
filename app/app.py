@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, quote, urlparse
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
 # Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
-REQUIRED_SCHEMA = 2
+REQUIRED_SCHEMA = 3
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
 ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "TASAOrbiterVF.woff2"), "font/woff2")}
 
@@ -183,7 +183,7 @@ input[type=checkbox]{accent-color:var(--orange);width:1rem;height:1rem}
 @media (max-width:820px){.shell{flex-direction:column}.side{position:static;flex:none;width:100%}.top{flex-wrap:wrap}}
 """
 
-NAV_KEY = {"My": "timesheet", "Approvals": "approvals", "Reports": "reports", "CTR": "reports",
+NAV_KEY = {"My": "timesheet", "Approvals": "approvals", "Missing": "missing", "Reports": "reports", "CTR": "reports",
            "Admin": "admin", "Edit": "admin", "Audit": "audit"}
 
 
@@ -198,6 +198,8 @@ def layout(con, u, title, body):
     items = [("timesheet", "My Timesheet", "/timesheet?u=%d" % u)]
     if approval_queue(con, u) is not None:
         items.append(("approvals", "Approvals (%d)" % pending_for(con, u), "/approvals?u=%d" % u))
+    if perm == "controller" or is_approver(con, u):  # who has not completed a timesheet: everyone for cost controllers, their own people for approvers
+        items.append(("missing", "Missing timesheets", "/missing?u=%d" % u))
     if perm != "admin":  # Admin (IT) manages users and job roles only: no reports
         items.append(("reports", "Reports", "/reports?u=%d" % u))
     if perm in ("controller", "admin"):
@@ -271,6 +273,15 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
     d0, d6 = days[0].isoformat(), days[6].isoformat()
     period = con.execute("select * from period where week_start=?", (d0,)).fetchone()
     open_week = bool(period and period["status"] == "Open")
+    start, end = me["start_date"], me["end_date"]  # hours can only be booked on dates from the start date to the end date
+
+    def active(iso):
+        return iso >= start and (end is None or iso <= end)
+
+    def dmy(iso):
+        return datetime.date.fromisoformat(iso).strftime("%d/%m/%Y")
+
+    week_inactive = start > d6 or (end is not None and end < d0)
     entries = con.execute(
         "select t.*, s.scope_code, s.description, c.name as client, pr.name as project, ph.name as phase, ro.skill_code "
         "from time_entry t join phase ph on ph.phase_id=t.phase_id join scope s on s.scope_id=ph.scope_id "
@@ -305,6 +316,13 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
     elif not open_week:
         b.append("<p><b>This week is closed.</b> New hours cannot be added. Approved hours can only be changed "
                  "with a reason (controlled edit).</p>")
+    if week_inactive:
+        b.append("<p><b>This week is outside your start and end dates</b> (%s), so no hours can be booked to it.</p>" % (
+            "you start on %s" % dmy(start) if start > d6 else "you finished on %s" % dmy(end)))
+    elif start > d0 or (end is not None and end < d6):
+        b.append("<p><small>Hours can only be booked between your start and end dates (%s): days outside them show a dash.</small></p>" % (
+            "from %s" % dmy(start) if start > d0 and (end is None or end >= d6) else
+            "until %s" % dmy(end) if (start <= d0) else "from %s until %s" % (dmy(start), dmy(end))))
 
     adds_hidden = "".join('<input type="hidden" name="add" value="%d:%d">' % k for k in rows if not rows[k]["cells"])
     b.append('<form method="post" action="/timesheet/save">'
@@ -322,7 +340,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
             name = "h_%d_%d_%s" % (pid, rid, iso)
             fixed = ""  # hours the person cannot type over (shown as text), so the live totals can still count them
             if e is None:
-                cell = '<input type="text" size="4" name="%s" value="">' % name if open_week else "&nbsp;"
+                cell = '<input type="text" size="4" name="%s" value="">' % name if open_week and active(iso) else ("&ndash;" if open_week else "&nbsp;")
             else:
                 rt += e["hours"]
                 day_tot[iso] += e["hours"]
@@ -358,11 +376,14 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
         "select ph.phase_id, ph.name as phase, s.scope_code, s.description, pr.name as project, c.name as client, c.is_internal "
         "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
         "join client c on c.client_id=s.client_id left join paaf p on p.client_id=s.client_id and p.user_id=? "
-        "and p.status='Approved' where s.status='Open' and ph.status='Open' and pr.status='Open' "
+        "and p.status='Approved' and (p.expiry_date is null or p.expiry_date >= ?) "
+        "where s.status='Open' and ph.status='Open' and pr.status='Open' "
         "and (c.is_internal=1 or p.paaf_id is not null) "  # client work needs an approved PAAF, internal codes are open to everyone
-        "order by c.is_internal, c.name, pr.name, s.scope_code, ph.name", (u,)).fetchall()
+        "order by c.is_internal, c.name, pr.name, s.scope_code, ph.name", (u, d0)).fetchall()
     roles = con.execute("select role_id, skill_code, name from role where active=1 order by skill_code").fetchall()
-    if scopes:
+    if week_inactive:
+        pass  # the note above says why nothing can be added
+    elif scopes:
         def label(s):
             if s["is_internal"]:  # e.g. "Internal - Business Services"
                 return "%s - %s%s" % (esc(s["client"]), esc(s["description"]), "" if s["phase"] == "General" else " &gt; %s" % esc(s["phase"]))
@@ -546,6 +567,94 @@ def act_approval(con, form):
     verb = "approved" if approve else "sent back to draft"
     ok_msg = "%d entr%s %s." % (done, "y" if done == 1 else "ies", verb)
     return view_approvals(con, u, ([ok_msg] if done else []) + msgs, ok=not msgs)
+
+
+# ---------- Missing timesheets ----------
+MISSING_FILTERS = [("missing", "Not submitted"), ("Not started", "Not started"), ("Draft only", "Draft only"),
+                   ("Partly submitted", "Partly submitted"), ("Submitted", "Submitted"), ("all", "Everyone")]
+
+
+def week_status(n_submitted, n_draft):
+    """Where one person's week stands. Submitted covers submitted, approved and edited entries; drafts include entries sent back."""
+    if n_submitted == 0 and n_draft == 0:
+        return "Not started"
+    if n_submitted == 0:
+        return "Draft only"
+    return "Partly submitted" if n_draft else "Submitted"
+
+
+def view_missing(con, u, q):
+    """Who has not completed their timesheet for a week. Cost controllers see everyone who is active that week. An approver sees
+    their own people: those with an approved PAAF for a client they approve, and anyone who has booked to their internal codes."""
+    perm = permission_of(con, u)
+    if perm != "controller" and not is_approver(con, u):
+        return no_access(con, u, "Missing timesheets")
+    try:
+        w = monday(datetime.date.fromisoformat(q["w"][0]))
+    except (KeyError, ValueError):
+        w = monday(datetime.date.today()) - datetime.timedelta(days=7)  # the last completed week
+    d0, d6 = w.isoformat(), (w + datetime.timedelta(days=6)).isoformat()
+    show = q.get("s", ["missing"])[0]
+    if show not in dict(MISSING_FILTERS):
+        show = "missing"
+
+    scope_sql, scope_args = "", []
+    if perm != "controller":
+        scope_sql = (" and p.user_id<>? and (p.user_id in (select user_id from paaf where status='Approved' and client_id in "
+                     "(select client_id from scope where approver_user_id=?)) or p.user_id in "
+                     "(select t.user_id from time_entry t join scope s on s.scope_id=t.scope_id join client c on c.client_id=s.client_id "
+                     "where c.is_internal=1 and s.approver_user_id=?))")
+        scope_args = [u, u, u]
+    # everyone who is active at some point in the week (start and end dates)
+    people = con.execute(
+        "select p.user_id, p.nmc_id, p.name, p.employment_type, r.name as title from app_user p join role r on r.role_id=p.role_id "
+        "where p.start_date<=? and (p.end_date is null or p.end_date>=?)" + scope_sql + " order by p.name", [d6, d0] + scope_args).fetchall()
+    week = {r["user_id"]: r for r in con.execute(
+        "select user_id, sum(status<>'Draft') as n_sub, sum(status='Draft') as n_draft, "
+        "sum(case when status<>'Draft' then hours else 0 end) as h_sub, sum(case when status='Draft' then hours else 0 end) as h_draft, "
+        "sum(status='Draft' and reject_reason is not null) as n_back from time_entry where work_date between ? and ? group by user_id", (d0, d6))}
+
+    order = ["Submitted", "Partly submitted", "Draft only", "Not started"]
+    counts = dict.fromkeys(order, 0)
+    rows = []
+    for p in people:
+        a = week.get(p["user_id"])
+        status = week_status(a["n_sub"] if a else 0, a["n_draft"] if a else 0)
+        counts[status] += 1
+        if show == "all" or show == status or (show == "missing" and status != "Submitted"):
+            rows.append('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td align="right">%s</td><td align="right">%s</td><td align="right">%s</td></tr>' % (
+                esc(p["name"]), esc(p["nmc_id"]), esc(p["title"]), esc(p["employment_type"]),
+                status if status == "Submitted" else "<b>%s</b>" % status,
+                fmt(a["h_sub"]) if a and a["h_sub"] else "", fmt(a["h_draft"]) if a and a["h_draft"] else "",
+                a["n_back"] if a and a["n_back"] else ""))
+
+    def link(w_, s_, label):
+        return '<a href="/missing?u=%d&amp;w=%s&amp;s=%s">%s</a>' % (u, w_.isoformat(), quote(s_), label)
+
+    this_week = monday(datetime.date.today())
+    b = ['<p>%s &nbsp; <b>Week commencing %s</b> &nbsp; %s &nbsp; %s</p>' % (
+        link(w - datetime.timedelta(days=7), show, "&lt;&lt; Previous week"), w.strftime("%d/%m/%Y"),
+        link(w + datetime.timedelta(days=7), show, "Next week &gt;&gt;"), link(this_week, show, "This week so far")),
+        '<form method="get" action="/missing">%s<p>Week containing %s Show %s <input type="submit" value="Show"></p></form>' % (
+            hidden(u=u), date_input("w", d0), sel("s", MISSING_FILTERS, show, False, "-", ' onchange="this.form.submit()"'))]
+    if not people:
+        b.append("<p>Nobody is expected to submit a timesheet in this week from your list.%s</p>" % (
+            "" if perm == "controller" else " Your people are those with an approved PAAF for a client you approve, "
+            "and anyone who has booked to your internal codes."))
+        return layout(con, u, "Missing timesheets", "".join(b))
+    b.append("<p><b>%d</b> expected: %s.</p>" % (len(people), ", ".join(
+        link(w, st, "%d %s" % (counts[st], st.lower())) for st in order)))
+    b.append("<p><small>%s Submitted counts submitted, approved and edited hours. Draft hours are saved but not submitted. "
+             "Sent back is the number of entries an approver rejected that have not been submitted again. "
+             "Everyone whose start and end dates cover any part of the week is expected, including the weeks still in progress.</small></p>" % (
+                 "Everyone who is active that week." if perm == "controller" else
+                 "Your people: those with an approved PAAF for a client you approve, and anyone who has booked to your internal codes."))
+    if rows:
+        b.append('<table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>NMC ID</th><th>Job title</th><th>Employment</th>'
+                 '<th>Status</th><th>Submitted hrs</th><th>Draft hrs</th><th>Sent back</th></tr>%s</table>' % "".join(rows))
+    else:
+        b.append("<p>%s</p>" % ("Everyone has submitted for this week." if show == "missing" else "Nobody matches this filter."))
+    return layout(con, u, "Missing timesheets", "".join(b))
 
 
 # ---------- Reports ----------
@@ -1479,6 +1588,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html(view_timesheet(con, u, w, adds=adds))
             elif url.path == "/approvals":
                 self.send_html(view_approvals(con, u))
+            elif url.path == "/missing":
+                self.send_html(view_missing(con, u, q))
             elif url.path == "/reports":
                 self.send_html(view_reports(con, u, q))
             elif url.path == "/ctr":

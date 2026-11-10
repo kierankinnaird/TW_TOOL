@@ -41,7 +41,7 @@ python app/app.py                            # then open http://localhost:8000
 
 The app checks the database's schema version when it starts (`PRAGMA user_version` in `db/schema.sql`, `REQUIRED_SCHEMA` in `app/app.py`; raise both together when a schema change would break older databases). If it says the database was built with an older schema, run `python scripts/build.py` to make a fresh `build/timewriting.db`. That leaves any other database file alone, so a database you pointed `TW_DB` at keeps its data; clear `TW_DB` (PowerShell: `Remove-Item Env:TW_DB`) to use the new one.
 
-Pages: My Timesheet (weekly grid), Approvals (approvers only), Reports (CTR and weekly period reports), Admin and Audit trail (cost controllers and the IT admin, each seeing their own tabs). Rebuilding the database resets the data.
+Pages: My Timesheet (weekly grid), Approvals (approvers and cost controllers), Missing timesheets (approvers and cost controllers), Reports (CTR and weekly period reports), Admin and Audit trail (cost controllers and the IT admin, each seeing their own tabs). Rebuilding the database resets the data.
 
 ## Roles
 
@@ -51,12 +51,13 @@ Each person has one permission level: `user`, `controller` (cost controller) or 
 |---|---|---|---|---|
 | Own timesheet | Yes | Yes | Yes | Yes |
 | Approvals page, approve or reject | No | Yes, for their scopes only, never their own hours | Only hours an approver booked to their own scope | No |
+| Missing timesheets (who has not submitted, by week) | No | Their own people: those with an approved PAAF for a client they approve, plus anyone who booked to their internal codes | Everyone active that week | No |
 | Reports | Own hours only, no values | Own hours plus everyone's hours on their scopes, no values | Everything, with £ values and sales rates | No |
 | £ values and sales rates | No | No | Yes | No |
 | Admin tabs | None | None | Weekly periods, clients, rate cards, PAAFs, projects / scopes / phases, internal codes | Weekly periods, users, job roles |
 | Audit trail | No | No | Yes | Yes |
 
-In the demo data, Alisdair Woodhead approves for Apache and Kenneth Nicolson for Spirit (both standard users). The cost controllers are the two cost engineers, Emma Noble and Abbi Murray, and Stephanie Apedaile (commercial lead), who is not a cost engineer: cost permission is set per person on the Users tab, never taken from a job title, so anyone can be given it when the system goes live. NMC Admin is the IT account. Sales rates and £ values are never put in the page for anyone but a cost controller; the reports, their filters and the CTR page only show other people what they may see. Still to come from the roles matrix: a missing-timesheets view, reopening a timesheet, transaction controls, and more. Who owns weekly periods and the audit trail is still to be confirmed with the cost team, so for now both controllers and admins can use them.
+In the demo data, Alisdair Woodhead approves for Apache and Kenneth Nicolson for Spirit (both standard users). The cost controllers are the two cost engineers, Emma Noble and Abbi Murray, and Stephanie Apedaile (commercial lead), who is not a cost engineer: cost permission is set per person on the Users tab, never taken from a job title, so anyone can be given it when the system goes live. NMC Admin is the IT account. Sales rates and £ values are never put in the page for anyone but a cost controller; the reports, their filters and the CTR page only show other people what they may see. Still to come from the roles matrix: reopening a timesheet, transaction controls, and more. Who owns weekly periods and the audit trail is still to be confirmed with the cost team, so for now both controllers and admins can use them.
 
 Admin tabs: weekly periods (close a week, or open a missed one), users, roles / skill codes, clients, client rate cards, PAAFs (raise, mark sent, approve with the signed form reference, reject), projects, scopes (each needs an approver) and phases, and internal codes. Users, roles, scopes and internal codes can be edited; rates are never edited, you add a new one with a later effective date.
 
@@ -84,7 +85,7 @@ SELECT * FROM v_period_report
 
 ## Rules enforced in the database
 
-- Booking is to a phase and needs an Open project, scope and phase, an Approved PAAF for the scope's client, a rate that matches the client and worked role, and an Open weekly period. Internal codes need none of the PAAF and rate, and cannot carry them.
+- Booking is to a phase and needs an Open project, scope and phase, an Approved PAAF for the scope's client, a rate that matches the client and worked role, and an Open weekly period. Internal codes need none of the PAAF and rate, and cannot carry them. The work date must also fall between the person's start and end dates (no end date means still employed; the last day counts), and, for client work, on or before the PAAF's expiry date if it has one. On the timesheet, days outside a person's dates have no box.
 - Lifecycle: Draft, Submitted, Approved, Edited. Reject returns to Draft with a reason. Editing an approved entry sets Edited, needs a reason, and needs re-approval.
 - Approval is by the person named as the scope's approver, never the entry owner. The one exception: hours booked by the scope's own approver are approved by a cost controller. Admins never approve, and neither controllers nor admins can be named as an approver.
 - Every edit names its editor; every create, edit, status change and deletion is audited. Only Draft entries can be deleted (clear draft).

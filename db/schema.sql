@@ -2,7 +2,8 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 2;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+PRAGMA user_version = 3;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+                          -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
 
 -- Controlled list of job titles, grouped into job families. Editable by admin/superuser.
 CREATE TABLE role (
@@ -180,6 +181,10 @@ BEFORE INSERT ON time_entry
 BEGIN
     SELECT RAISE(ABORT, 'New entries must be Draft or Submitted')
     WHERE NEW.status NOT IN ('Draft','Submitted');
+    -- Only people who are live can book: the work date must fall within their start and end dates (no end date = still employed).
+    SELECT RAISE(ABORT, 'This person is not active on that date (check their start and end dates)')
+    WHERE EXISTS (SELECT 1 FROM app_user
+                  WHERE user_id = NEW.user_id AND (NEW.work_date < start_date OR (end_date IS NOT NULL AND NEW.work_date > end_date)));
     SELECT RAISE(ABORT, 'Scope is not Open')
     WHERE (SELECT status FROM scope WHERE scope_id = NEW.scope_id) <> 'Open';
     SELECT RAISE(ABORT, 'Phase does not belong to this scope')
@@ -195,6 +200,9 @@ BEGIN
         SELECT 1 FROM paaf p JOIN scope s ON s.client_id = p.client_id
         WHERE p.paaf_id = NEW.paaf_id AND p.user_id = NEW.user_id
           AND s.scope_id = NEW.scope_id AND p.status = 'Approved');
+    -- A PAAF with an expiry date stops covering hours worked after that date (no expiry date = open-ended).
+    SELECT RAISE(ABORT, 'The PAAF has expired for that date')
+    WHERE EXISTS (SELECT 1 FROM paaf p WHERE p.paaf_id = NEW.paaf_id AND p.expiry_date IS NOT NULL AND NEW.work_date > p.expiry_date);
     SELECT RAISE(ABORT, 'Rate does not match the scope client and worked role')
     WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 0
       AND NOT EXISTS (

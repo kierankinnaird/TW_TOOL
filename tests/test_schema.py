@@ -326,6 +326,51 @@ class TestPermissionLevels(Base):
         self.con.execute("UPDATE app_user SET permission='controller' WHERE user_id=5")  # Ewan Shaw approves nothing, so this is fine
 
 
+class TestActiveDatesAndPaafExpiry(Base):
+    """Only live people can book (start and end dates), and a PAAF stops covering hours after its expiry date."""
+    # Ewan Shaw (5) started on 1 Mar 2026 and has no end date. His Apache PAAF is 1 (rate 4, Planner). BB0001 is scope 1, phase 1.
+    def book(self, date, user=5, scope=1, phase=1, paaf=1, role=4, rate=4):
+        return self.con.execute(NEW_ENTRY, (user, scope, phase, paaf, role, rate, date, 2, user))
+
+    def test_nobody_can_book_before_their_start_date(self):
+        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-02-27", 2, 5), msg="not active on that date")   # the Friday before 1 March
+        self.book("2026-11-06")                                                                              # long after: fine
+
+    def test_nobody_can_book_after_their_end_date_but_the_last_day_is_fine(self):
+        self.con.execute("UPDATE app_user SET end_date='2026-11-06' WHERE user_id=5")
+        self.book("2026-11-06")                                       # the last day
+        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-07", 2, 5), msg="not active on that date")
+
+    def test_internal_hours_follow_the_same_dates(self):
+        self.con.execute("UPDATE app_user SET end_date='2026-11-04' WHERE user_id=5")
+        self.blocked(NEW_ENTRY, (5, 7, 8, None, 4, None, "2026-11-05", 2, 5), msg="not active on that date")
+        self.con.execute(NEW_ENTRY, (5, 7, 8, None, 4, None, "2026-11-04", 2, 5))
+
+    def test_a_person_with_no_end_date_stays_live(self):
+        self.assertIsNone(self.scalar("select end_date from app_user where user_id=5"))
+        self.con.execute("INSERT INTO period (week_start) VALUES ('2026-12-14')")  # a far later week, opened
+        self.book("2026-12-18")                                                    # still allowed: no end date
+
+    def test_a_paaf_stops_covering_hours_after_it_expires(self):
+        self.con.execute("UPDATE paaf SET expiry_date='2026-11-05' WHERE paaf_id=1")
+        self.book("2026-11-05")                                                                              # the expiry day is covered
+        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 2, 5), msg="PAAF has expired")
+        # internal hours never needed a PAAF, so an expired one changes nothing
+        self.con.execute(NEW_ENTRY, (5, 7, 8, None, 4, None, "2026-11-06", 2, 5))
+
+    def test_a_paaf_with_no_expiry_date_is_open_ended(self):
+        self.assertIsNone(self.scalar("select expiry_date from paaf where paaf_id=1"))
+        self.book("2026-11-06")
+
+    def test_the_seed_data_respects_the_rules(self):
+        # every booking in the seed is on or after the person's start date, on or before their end date, and within their PAAF
+        bad = self.scalar("select count(*) from time_entry t join app_user u on u.user_id=t.user_id where t.work_date < u.start_date "
+                          "or (u.end_date is not null and t.work_date > u.end_date)")
+        self.assertEqual(bad, 0)
+        bad = self.scalar("select count(*) from time_entry t join paaf p on p.paaf_id=t.paaf_id where p.expiry_date is not null and t.work_date > p.expiry_date")
+        self.assertEqual(bad, 0)
+
+
 class TestInternalHours(Base):
     """Internal hours: paid by NMC, booked to Internal codes. No PAAF, no rate, kept out of the client reports."""
     # David Hart (user 4) has no approved PAAF for any client. INT01 Business Services is scope 7, phase 8.

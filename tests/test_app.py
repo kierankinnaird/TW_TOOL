@@ -357,6 +357,156 @@ class TestApp(unittest.TestCase):
             sees[u] = "David Hart" in self.report_page(u)[2].split("Internal hours")[1]
         self.assertEqual(sees, {4: True, 5: False, 7: True, 29: True})
 
+    # ---------- missing timesheets (R31) ----------
+    def missing(self, u, **params):
+        """The Missing timesheets page as (page, {person: [cells]}) for week/filter params."""
+        page = self.get("/missing?u=%d&%s" % (u, "&".join("%s=%s" % kv for kv in params.items())))
+        rows = {}
+        for r in page.split("<tr>")[1:]:
+            cells = [re.sub(r"<[^>]+>", "", c) for c in re.findall(r"<td[^>]*>(.*?)</td>", r)]
+            if len(cells) == 8:
+                rows[cells[0]] = cells  # person, NMC ID, job title, employment, status, submitted hrs, draft hrs, sent back
+        return page, rows
+
+    def test_only_cost_controllers_and_approvers_can_open_missing_timesheets(self):
+        for u in (5, 30):  # a standard user, the IT admin
+            self.assertIn("not available to your role", self.get("/missing?u=%d" % u), u)
+        for u in (7, 8, 29):  # the two approvers and the cost controller
+            self.assertNotIn("not available to your role", self.get("/missing?u=%d" % u), u)
+        for u, expected in ((5, False), (30, False), (7, True), (8, True), (29, True)):
+            self.assertEqual('href="/missing?u=%d"' % u in self.get("/timesheet?u=%d" % u), expected, u)  # the menu link
+
+    def test_a_cost_controller_sees_everyone_and_how_far_each_has_got(self):
+        page, rows = self.missing(29, w="2026-11-02", s="all")
+        self.assertEqual(len(rows), 30)  # everyone is active that week
+        self.assertEqual(rows["Ewan Shaw"][4], "Submitted")
+        self.assertEqual(rows["David Hart"][4], "Not started")
+        # Ajin Sabu: two entries submitted (16 hrs) and one sent back to draft (8 hrs)
+        self.assertEqual(rows["Ajin Sabu"][4:], ["Partly submitted", "16", "8", "1"])
+        self.assertIn("1 partly submitted", page)
+        # the default view shows only people who have not submitted, so Ewan Shaw is not in it
+        page, rows = self.missing(29, w="2026-11-02")
+        self.assertNotIn("Ewan Shaw", rows)
+        self.assertIn("David Hart", rows)
+        self.assertIn("Ajin Sabu", rows)
+        self.assertEqual({r[4] for r in rows.values()}, {"Not started", "Partly submitted"})
+        # filters
+        self.assertEqual(set(self.missing(29, w="2026-11-02", s="Partly%20submitted")[1]), {"Ajin Sabu"})
+        self.assertEqual({r[4] for r in self.missing(29, w="2026-11-02", s="Submitted")[1].values()}, {"Submitted"})
+        self.assertEqual(self.missing(29, w="2026-11-02", s="nonsense")[1].keys(), rows.keys())  # an unknown filter falls back to the default
+
+    def test_a_draft_only_week_is_reported_as_draft_only(self):
+        self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "h_8_4_2026-11-04": "3.5", "reason": ""})  # David Hart, INT01
+        row = self.missing(29, w="2026-11-02", s="all")[1]["David Hart"]
+        self.assertEqual(row[4:], ["Draft only", "", "3.5", ""])
+        self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Submit week", "reason": ""})
+        self.assertEqual(self.missing(29, w="2026-11-02", s="all")[1]["David Hart"][4:], ["Submitted", "3.5", "", ""])
+
+    def test_an_approver_sees_only_their_own_people(self):
+        _, kenneth = self.missing(8, w="2026-11-02", s="all")   # Spirit
+        _, alisdair = self.missing(7, w="2026-11-02", s="all")  # Apache
+        # Spirit PAAF holders are Kenneth's people, Apache PAAF holders are Alisdair's; neither sees themselves
+        self.assertIn("Ajin Sabu", kenneth)
+        self.assertIn("Gary Bridge", kenneth)        # Spirit only
+        self.assertNotIn("Gary Bridge", alisdair)
+        self.assertIn("Ewan Shaw", alisdair)         # Apache only
+        self.assertNotIn("Ewan Shaw", kenneth)
+        self.assertNotIn("Kenneth Nicolson", kenneth)
+        self.assertNotIn("Alisdair Woodhead", alisdair)
+        # a PAAF that is only 'Sent' does not count: David Hart is in neither list until he books to an internal code
+        self.assertNotIn("David Hart", alisdair)
+        self.assertNotIn("David Hart", kenneth)
+        self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "h_8_4_2026-11-04": "2", "reason": ""})  # INT01: Alisdair's code
+        self.assertEqual(self.missing(7, w="2026-11-02", s="all")[1]["David Hart"][4], "Draft only")
+        self.assertNotIn("David Hart", self.missing(8, w="2026-11-02", s="all")[1])
+        # and each approver's list is a subset of everyone
+        everyone = set(self.missing(29, w="2026-11-02", s="all")[1])
+        self.assertLess(set(alisdair), everyone)
+        self.assertLess(set(kenneth), everyone)
+
+    def test_only_people_active_in_the_week_are_expected(self):
+        def add(nmc, name, start, end):
+            self.admin_post("/admin/add", {"t": "users", "nmc_id": nmc, "name": name, "employment_type": "Staff", "role_id": "6",
+                                           "permission": "user", "start_date": start, "end_date": end})
+        add("A951", "Starts Later", "2026-11-09", "")          # starts the Monday after the week
+        add("A952", "Left Before", "2026-10-01", "2026-11-01")  # left the Sunday before the week
+        add("A953", "Starts Midweek", "2026-11-05", "")        # starts on the Thursday
+        add("A954", "Leaves Monday", "2026-10-01", "2026-11-02")  # last day is the Monday of the week
+        rows = self.missing(29, w="2026-11-02", s="all")[1]
+        self.assertNotIn("Starts Later", rows)
+        self.assertNotIn("Left Before", rows)
+        self.assertEqual(rows["Starts Midweek"][4], "Not started")
+        self.assertEqual(rows["Leaves Monday"][4], "Not started")
+        self.assertIn("Starts Later", self.missing(29, w="2026-11-09", s="all")[1])  # expected from the week it starts
+
+    def test_the_week_defaults_to_the_last_completed_week_and_can_be_changed(self):
+        last = app.monday(datetime.date.today()) - datetime.timedelta(days=7)
+        self.assertIn("Week commencing %s" % last.strftime("%d/%m/%Y"), self.get("/missing?u=29"))
+        self.assertIn("Week commencing %s" % last.strftime("%d/%m/%Y"), self.get("/missing?u=29&w=not-a-date"))
+        page = self.get("/missing?u=29&w=2026-11-04")  # any day snaps to its Monday
+        self.assertIn("Week commencing 02/11/2026", page)
+        self.assertIn("w=2026-10-26", page)  # previous week
+        self.assertIn("w=2026-11-09", page)  # next week
+        self.assertIn('href="/missing?u=29&amp;w=%s&amp;s=missing">This week so far' % app.monday(datetime.date.today()).isoformat(), page)
+
+    def test_an_approver_with_no_people_is_told_why(self):
+        # Jamie Ireland (6) approves only a new internal code that nobody has booked to, so she has no people yet
+        self.assertIn("not available to your role", self.get("/missing?u=6&w=2026-11-02"))  # not an approver until she is named on a code
+        self.admin_post("/admin/add", {"t": "internal", "description": "Facilities", "approver_user_id": "6"})
+        page = self.get("/missing?u=6&w=2026-11-02")
+        self.assertIn("Nobody is expected", page)
+        self.assertIn("approved PAAF for a client you approve", page)
+        # once someone books to her internal code, that person is hers
+        code = self.one("select s.scope_id, ph.phase_id from scope s join phase ph on ph.scope_id=s.scope_id where s.description='Facilities'")
+        self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft", "h_%d_4_2026-11-04" % code[1]: "1", "reason": ""})
+        self.assertIn("Ewan Shaw", self.missing(6, w="2026-11-02", s="all")[1])
+
+    # ---------- start and end dates, PAAF expiry (R07) ----------
+    def test_no_input_boxes_outside_a_persons_start_and_end_dates(self):
+        # Ewan Shaw (5) leaves on Wednesday 4 Nov: there are no boxes from the Thursday, and saving there is refused
+        self.admin_post("/admin/save", {"t": "users", "id": "5", "name": "Ewan Shaw", "employment_type": "Contract", "role_id": "4",
+                                        "permission": "user", "end_date": "2026-11-04"})
+        page = self.get("/timesheet?u=5&w=2026-11-02")
+        self.assertIn('name="h_1_4_2026-11-04"', page)  # his last day still has a box
+        for day in ("05", "06", "07", "08"):
+            self.assertNotIn('name="h_1_4_2026-11-%s"' % day, page, day)
+        self.assertIn("until 04/11/2026", page)  # the note says why
+        page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft", "h_1_4_2026-11-06": "5", "reason": ""})
+        self.assertIn("not active on that date", page)
+        self.assertEqual(self.one("select count(*) from time_entry where user_id=5 and work_date='2026-11-06'")[0], 0)
+
+    def test_a_week_outside_the_employment_dates_cannot_be_booked(self):
+        self.admin_post("/admin/add", {"t": "users", "nmc_id": "A955", "name": "Not Started Yet", "employment_type": "Staff", "role_id": "6",
+                                       "permission": "user", "start_date": "2026-11-09", "end_date": ""})
+        uid = self.one("select user_id from app_user where nmc_id='A955'")[0]
+        page = self.get("/timesheet?u=%d&w=2026-11-02" % uid)
+        self.assertIn("outside your start and end dates", page)
+        self.assertIn("you start on 09/11/2026", page)
+        self.assertNotIn("Add row", page)
+        self.assertIn("Add row", self.get("/timesheet?u=%d&w=2026-11-09" % uid))  # open from the week they start
+        # a week part-way through is open, with a note: Midweek Starter begins on the Thursday
+        self.admin_post("/admin/add", {"t": "users", "nmc_id": "A956", "name": "Midweek Starter", "employment_type": "Staff", "role_id": "6",
+                                       "permission": "user", "start_date": "2026-11-05", "end_date": ""})
+        uid = self.one("select user_id from app_user where nmc_id='A956'")[0]
+        page = self.get("/timesheet?u=%d&w=2026-11-02&add_phase=8&add_role=6" % uid)  # INT01 as Cost Engineer
+        self.assertIn("from 05/11/2026", page)
+        self.assertNotIn("h_8_6_2026-11-03", page)
+        self.assertIn("h_8_6_2026-11-05", page)
+
+    def test_client_hours_cannot_be_booked_after_the_paaf_expires(self):
+        # David Hart's Apache PAAF (4) is only 'Sent'. Approve it, valid until Wednesday 4 Nov.
+        self.assertIn("approved", self.admin_post("/admin/paaf", {"paaf_id": "4", "action": "Approve",
+                                                                  "document_ref": "paaf/apache/A004.pdf", "expiry_date": "2026-11-04"}))
+        self.assertIn("Apache &gt; Wellbay Decommissioning", self.get("/timesheet?u=4&w=2026-11-02"))      # valid for part of that week
+        self.assertNotIn("Apache &gt;", self.get("/timesheet?u=4&w=2026-11-09"))                           # expired before this one starts
+        self.assertIn("1 entry saved", self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft",
+                                                                    "h_1_4_2026-11-03": "4", "reason": ""}))
+        late = self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "h_1_4_2026-11-05": "4", "reason": ""})
+        self.assertIn("PAAF has expired", late)
+        # internal hours do not depend on the PAAF
+        self.assertIn("1 entry saved", self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft",
+                                                                    "h_8_4_2026-11-05": "2", "reason": ""}))
+
     # ---------- approvers book time too; a cost controller approves it ----------
     def test_an_approver_can_book_to_their_own_scope_and_a_cost_controller_approves_it(self):
         # Kenneth Nicolson (8) approves the Spirit scopes and holds a Spirit PAAF, so he can book to A1500 (phase 6) as Head of Projects (role 30)
