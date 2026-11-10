@@ -105,7 +105,7 @@ INSERT INTO app_user (user_id, nmc_id, employment_type, name, role_id, permissio
  (4, 'A004','Staff',   'Fraser Gordon',     4,'user', '2026-01-01',NULL),
  (5, 'A005','Contract','Ewan Mackay',       4,'user', '2026-03-01',NULL),
  (6, 'A006','Staff',   'Rhona Campbell',    1,'user', '2026-01-01',NULL),
- (7, 'A007','Staff',   'Alasdair Murray',   2,'admin','2026-01-01',NULL),
+ (7, 'A007','Staff',   'Alasdair Murray',   2,'user', '2026-01-01',NULL),
  (8, 'A008','Staff',   'Niall Robertson',   1,'user', '2026-01-01',NULL),
  (9, 'A009','Staff',   'Gregor Munro',      3,'user', '2026-02-01',NULL),
  (10,'A010','Staff',   'Catriona Duff',     4,'user', '2026-02-01',NULL),
@@ -126,7 +126,11 @@ INSERT INTO app_user (user_id, nmc_id, employment_type, name, role_id, permissio
  (25,'A025','Staff','Bethany Cruickshank',9,'user','2026-01-01',NULL),
  (26,'A026','Contract','Murdo Ferrier',8,'user','2026-01-01',NULL),
  (27,'A027','Staff','Gavin Ross',29,'user','2026-01-01',NULL),
- (28,'A028','Staff','Isobel Hay',25,'user','2026-01-01',NULL);
+ (28,'A028','Staff','Isobel Hay',25,'user','2026-01-01',NULL),
+ -- Demo accounts for the other permission levels. Cost controllers manage codes, scopes, rates and PAAFs and see all reports with values;
+ -- the admin (IT) account manages users and job roles only. Neither approves hours.
+ (29,'A029','Staff','Eilidh Rankin',5,'controller','2026-01-01',NULL),
+ (30,'A030','Staff','Hugh Calder',10,'admin','2026-01-01',NULL);
 
 -- PAAFs: one per user per client. Rate = client sales rate for the user's own role.
 INSERT INTO paaf (paaf_id, user_id, client_id, rate_id, status, sent_date, decided_date, document_ref) VALUES

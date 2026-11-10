@@ -35,7 +35,7 @@ CREATE TABLE app_user (
     employment_type TEXT NOT NULL CHECK (employment_type IN ('Staff','Contract')),
     name            TEXT NOT NULL,
     role_id         INTEGER NOT NULL REFERENCES role(role_id),
-    permission      TEXT NOT NULL DEFAULT 'user' CHECK (permission IN ('user','admin')),
+    permission      TEXT NOT NULL DEFAULT 'user' CHECK (permission IN ('user','controller','admin')),
     start_date      TEXT NOT NULL,
     end_date        TEXT
 );
@@ -82,6 +82,24 @@ CREATE TABLE phase (
     status     TEXT NOT NULL DEFAULT 'Open' CHECK (status IN ('Open','Closed')),
     UNIQUE (scope_id, name)
 );
+
+-- Approver is not a permission: it means being named as approver on a scope. Only standard users can be named.
+-- Cost controllers and admins never approve, so they cannot be approvers.
+CREATE TRIGGER trg_scope_approver_insert BEFORE INSERT ON scope
+BEGIN
+    SELECT RAISE(ABORT, 'Only a standard user can be named as a scope approver')
+    WHERE (SELECT permission FROM app_user WHERE user_id = NEW.approver_user_id) <> 'user';
+END;
+CREATE TRIGGER trg_scope_approver_update BEFORE UPDATE OF approver_user_id ON scope
+BEGIN
+    SELECT RAISE(ABORT, 'Only a standard user can be named as a scope approver')
+    WHERE (SELECT permission FROM app_user WHERE user_id = NEW.approver_user_id) <> 'user';
+END;
+CREATE TRIGGER trg_user_permission_update BEFORE UPDATE OF permission ON app_user
+BEGIN
+    SELECT RAISE(ABORT, 'Remove this person as scope approver before making them a controller or admin')
+    WHERE NEW.permission <> 'user' AND EXISTS (SELECT 1 FROM scope WHERE approver_user_id = NEW.user_id);
+END;
 
 -- A scope sits under a project of the same client.
 CREATE TRIGGER trg_scope_project_client_insert BEFORE INSERT ON scope
@@ -220,13 +238,14 @@ BEGIN
     WHERE OLD.status = 'Submitted' AND NEW.status = 'Draft'
       AND (NEW.reject_reason IS NULL OR NEW.reject_reason = '');
 
-    -- approval: by the scope's approver or an admin, never the entry owner
-    SELECT RAISE(ABORT, 'Only the scope approver or an admin can approve (and not their own entry)')
+    -- approval: only the person named as the scope's approver, never the entry owner.
+    -- Cost controllers and admins never approve, even if they were named approver.
+    SELECT RAISE(ABORT, 'Only the scope approver can approve (and not their own entry)')
     WHERE NEW.status = 'Approved' AND OLD.status <> 'Approved'
       AND (NEW.approved_by IS NULL
            OR NEW.approved_by = NEW.user_id
-           OR (NEW.approved_by <> (SELECT approver_user_id FROM scope WHERE scope_id = NEW.scope_id)
-               AND (SELECT permission FROM app_user WHERE user_id = NEW.approved_by) <> 'admin'));
+           OR NEW.approved_by <> (SELECT approver_user_id FROM scope WHERE scope_id = NEW.scope_id)
+           OR (SELECT permission FROM app_user WHERE user_id = NEW.approved_by) <> 'user');
 END;
 
 CREATE TRIGGER trg_time_entry_audit_insert

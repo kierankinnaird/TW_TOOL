@@ -74,10 +74,17 @@ def me_row(con, u):
         "where u.user_id=?", (u,)).fetchone()
 
 
-def pending_for(con, u):
+def permission_of(con, u):
     me = me_row(con, u)
-    if me and me["permission"] == "admin":
-        return con.execute("select count(*) from time_entry where status in ('Submitted','Edited')").fetchone()[0]
+    return me["permission"] if me else None
+
+
+def is_approver(con, u):
+    """Approver is not a permission: it means being named as approver on at least one scope."""
+    return con.execute("select 1 from scope where approver_user_id=? limit 1", (u,)).fetchone() is not None
+
+
+def pending_for(con, u):
     return con.execute(
         "select count(*) from time_entry t join scope s on s.scope_id=t.scope_id "
         "where t.status in ('Submitted','Edited') and s.approver_user_id=?", (u,)).fetchone()[0]
@@ -88,13 +95,16 @@ def layout(con, u, title, body):
                         "join role r on r.role_id=a.role_id order by a.name").fetchall()
     opts = "".join('<option value="%d"%s>%s - %s%s</option>' % (
         x["user_id"], " selected" if x["user_id"] == u else "", esc(x["name"]), esc(x["role_name"]),
-        " (admin)" if x["permission"] == "admin" else "") for x in users)
+        " (%s)" % x["permission"] if x["permission"] != "user" else "") for x in users)
     me = me_row(con, u)
-    menu = ['<a href="/timesheet?u=%d">My Timesheet</a>' % u,
-            '<a href="/approvals?u=%d">Approvals (%d)</a>' % (u, pending_for(con, u)),
-            '<a href="/reports?u=%d">Reports</a>' % u]
-    if me and me["permission"] == "admin":
-        menu += ['<a href="/admin?u=%d&amp;t=periods">Admin</a>' % u, '<a href="/audit?u=%d">Audit trail</a>' % u]
+    perm = me["permission"] if me else None
+    menu = ['<a href="/timesheet?u=%d">My Timesheet</a>' % u]
+    if is_approver(con, u):
+        menu.append('<a href="/approvals?u=%d">Approvals (%d)</a>' % (u, pending_for(con, u)))
+    if perm != "admin":  # Admin (IT) manages users and job roles only: no reports
+        menu.append('<a href="/reports?u=%d">Reports</a>' % u)
+    if perm in ("controller", "admin"):
+        menu += ['<a href="/admin?u=%d">Admin</a>' % u, '<a href="/audit?u=%d">Audit trail</a>' % u]
     who = "%s<br>%s (%s)<br>%s, %s" % (esc(me["name"]), esc(me["role_name"]), esc(me["skill_code"]), esc(me["family"]), esc(me["permission"])) if me else ""
     return (
         "<html><head><title>%s</title></head><body>"
@@ -104,6 +114,10 @@ def layout(con, u, title, body):
         '<table width="100%%" border="0"><tr valign="top"><td width="160">%s<br><br><small>%s</small></td>'
         "<td><h3>%s</h3>%s</td></tr></table></body></html>"
     ) % (esc(title), opts, "<br>".join(menu), who, esc(title), body)
+
+
+def no_access(con, u, title):
+    return layout(con, u, title, "<p>This page is not available to your role.</p>")
 
 
 def msgs_html(msgs, ok=False):
@@ -358,8 +372,10 @@ def save_timesheet(con, form):
 
 # ---------- Approvals ----------
 def view_approvals(con, u, msgs=None, ok=False):
-    me = me_row(con, u)
-    where = "" if me and me["permission"] == "admin" else "and s.approver_user_id=%d" % u
+    if not is_approver(con, u):
+        return layout(con, u, "Approvals", msgs_html(msgs, ok) + "<p>Hours are approved by the approver named on each booking code. "
+                      "You are not named as an approver on any code, so there is nothing for you to approve.</p>")
+    where = "and s.approver_user_id=%d" % u
     rows = con.execute(
         "select t.entry_id, bu.name as booked_by, c.name as client, pr.name as project, s.scope_code, ph.name as phase, ro.skill_code, t.work_date, t.hours, "
         "t.status, t.last_change_reason, (select old_hours from time_entry_audit a where a.entry_id=t.entry_id "
@@ -395,12 +411,18 @@ def act_approval(con, form):
     ids = [int(x) for x in form.get("entry_id", [])]
     action, reason = form["action"][0], form.get("reason", [""])[0].strip()
     approve = action.startswith("Approve")
+    if not is_approver(con, u):
+        return view_approvals(con, u)
     if not ids:
         return view_approvals(con, u, ["Tick at least one entry first."])
     if not approve and not reason:
         return view_approvals(con, u, ["Give a reason to reject."])
     done, msgs = 0, []
     for eid in ids:
+        owner = con.execute("select s.approver_user_id from time_entry t join scope s on s.scope_id=t.scope_id where t.entry_id=?", (eid,)).fetchone()
+        if not owner or owner[0] != u:
+            msgs.append("Entry %d: only the approver named on its booking code can approve or reject it." % eid)
+            continue
         try:
             if approve:
                 con.execute("update time_entry set status='Approved', approved_by=?, approved_at=?, last_edited_by=?, "
@@ -573,6 +595,8 @@ def period_filters(con, q):
 
 
 def view_reports(con, u, q):
+    if permission_of(con, u) == "admin":  # Admin (IT) has no reports
+        return no_access(con, u, "Reports")
     d_from = q.get("from", [""])[0] or "2026-10-01"
     d_to = q.get("to", [""])[0] or "2026-12-31"
     (client, project, scope, phase), (clients, projects, scopes, phases) = period_filters(con, q)
@@ -655,6 +679,8 @@ def view_reports(con, u, q):
 
 def view_ctr(con, u, q):
     """One CTR (a phase): a Summary tab plus one tab per job family, like the tabs in the CTR workbook."""
+    if permission_of(con, u) == "admin":  # Admin (IT) has no reports
+        return no_access(con, u, "CTR")
     try:
         pid = int(q.get("phase", ["0"])[0])
     except ValueError:
@@ -752,9 +778,23 @@ ADMIN_TABS = [("periods", "Weekly periods"), ("users", "Users"), ("roles", "Job 
               ("internal", "Internal codes")]
 
 
-def is_admin(con, u):
-    me = me_row(con, u)
-    return bool(me and me["permission"] == "admin")
+# Who may use each Admin tab. IT manages users and job roles; cost controllers manage clients, rate cards, PAAFs, scopes and internal codes.
+# Weekly periods is open to both controllers and admins until the cost team confirms who owns it (the audit trail is handled the same way).
+TAB_ACCESS = {"periods": ("controller", "admin"), "users": ("admin",), "roles": ("admin",), "clients": ("controller",),
+              "rates": ("controller",), "paafs": ("controller",), "scopes": ("controller",), "internal": ("controller",)}
+PERMISSION_OPTIONS = [("user", "user"), ("controller", "controller (cost controller)"), ("admin", "admin (IT)")]
+
+
+def tab_of(t):
+    return {"projects": "scopes", "phases": "scopes"}.get(t, t)  # projects and phases are edited from the scopes tab
+
+
+def can_use_tab(con, u, t):
+    return permission_of(con, u) in TAB_ACCESS.get(tab_of(t), ())
+
+
+def allowed_tabs(con, u):
+    return [(k, v) for k, v in ADMIN_TABS if can_use_tab(con, u, k)]
 
 
 def sel(name, options, selected=None, blank=False, blank_label="-", attrs=""):
@@ -802,6 +842,11 @@ def opts_scopes(con):
 
 def opts_users(con):
     return [tuple(r) for r in con.execute("select user_id, name from app_user order by name")]
+
+
+def opts_approvers(con):
+    """Only standard users can be named as an approver (cost controllers and admins never approve)."""
+    return [tuple(r) for r in con.execute("select user_id, name from app_user where permission='user' order by name")]
 
 
 def need_date(value, label, required=True):
@@ -852,7 +897,7 @@ def admin_body(con, u, t):
                  "<tr><td>End date (optional)</td><td>%s</td></tr></table><input type=\"submit\" value=\"Add user\"></form>"
                  % (hidden(u=u, t="users"), txt("nmc_id", "", 8), txt("name", "", 30),
                     sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")]), sel("role_id", opts_roles(con)),
-                    sel("permission", [("user", "user"), ("admin", "admin")]), date_input("start_date", datetime.date.today().isoformat()),
+                    sel("permission", PERMISSION_OPTIONS), date_input("start_date", datetime.date.today().isoformat()),
                     date_input("end_date")))
     elif t == "roles":
         rows = [[r["family"], r["skill_code"], r["name"], "Yes" if r["active"] else "No", edit_link(u, "roles", r["role_id"])]
@@ -913,7 +958,7 @@ def admin_body(con, u, t):
         b.append('<h4>Add an internal code</h4><form method="post" action="/admin/add">%s<table border="0" cellpadding="2">'
                  "<tr><td>Name</td><td>%s</td></tr><tr><td>Approver</td><td>%s</td></tr></table>"
                  '<input type="submit" value="Add internal code"></form>'
-                 % (hidden(u=u, t="internal"), txt("description", "", 40), sel("approver_user_id", opts_users(con))))
+                 % (hidden(u=u, t="internal"), txt("description", "", 40), sel("approver_user_id", opts_approvers(con))))
     elif t == "scopes":
         b.append("<p><small>Structure: client &gt; project &gt; scope &gt; phase. Hours are booked to a phase and approved by the scope's approver.</small></p>")
         b.append("<h4>Projects</h4>")
@@ -936,7 +981,7 @@ def admin_body(con, u, t):
                  "<tr><td>Approver</td><td>%s</td></tr></table><input type=\"submit\" value=\"Add scope\"></form>"
                  % (hidden(u=u, t="scopes"), sel("project_id", opts_projects(con)), txt("scope_code", "", 10), txt("description", "", 40),
                     sel("status", [("Open", "Open"), ("Pipeline", "Pipeline"), ("Closed", "Closed")]),
-                    sel("approver_user_id", opts_users(con))))
+                    sel("approver_user_id", opts_approvers(con))))
         b.append("<h4>Phases</h4>")
         rows = [[r["client"], r["scope_code"], r["description"], r["name"], r["status"], edit_link(u, "phases", r["phase_id"])]
                 for r in con.execute("select ph.*, s.scope_code, s.description, c.name as client from phase ph join scope s on s.scope_id=ph.scope_id "
@@ -948,17 +993,18 @@ def admin_body(con, u, t):
 
 
 def view_admin(con, u, t, msgs=None, ok=False):
-    if not is_admin(con, u):
-        return layout(con, u, "Admin", "<p>Admin only. Switch to Alasdair Murray to see this page.</p>")
-    t = t if t in dict(ADMIN_TABS) else "periods"
-    links = " | ".join('<a href="/admin?u=%d&amp;t=%s">%s</a>' % (u, k, esc(v)) for k, v in ADMIN_TABS)
-    body = "%s<p>%s</p><h4>%s</h4>%s" % (msgs_html(msgs, ok), links, esc(dict(ADMIN_TABS)[t]), admin_body(con, u, t))
+    tabs = allowed_tabs(con, u)
+    if not tabs or (t in dict(ADMIN_TABS) and not can_use_tab(con, u, t)):
+        return no_access(con, u, "Admin")
+    t = t if t in dict(tabs) else tabs[0][0]
+    links = " | ".join('<a href="/admin?u=%d&amp;t=%s">%s</a>' % (u, k, esc(v)) for k, v in tabs)
+    body = "%s<p>%s</p><h4>%s</h4>%s" % (msgs_html(msgs, ok), links, esc(dict(tabs)[t]), admin_body(con, u, t))
     return layout(con, u, "Admin", body)
 
 
 def view_admin_edit(con, u, t, i, msgs=None):
-    if not is_admin(con, u):
-        return layout(con, u, "Admin", "<p>Admin only.</p>")
+    if not can_use_tab(con, u, t):
+        return no_access(con, u, "Admin")
     back = '<p><a href="/admin?u=%d&amp;t=%s">&lt;&lt; Back</a></p>' % (u, "scopes" if t in ("projects", "phases") else t)
     if t == "users":
         r = con.execute("select * from app_user where user_id=?", (i,)).fetchone()
@@ -969,7 +1015,7 @@ def view_admin_edit(con, u, t, i, msgs=None):
                 "<tr><td>End date</td><td>%s</td></tr>" % (
                     esc(r["nmc_id"]), txt("name", r["name"], 30), sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")], r["employment_type"]),
                     sel("role_id", opts_roles(con, active_only=False), r["role_id"]),
-                    sel("permission", [("user", "user"), ("admin", "admin")], r["permission"]), esc(r["start_date"]), date_input("end_date", r["end_date"] or "")))
+                    sel("permission", PERMISSION_OPTIONS, r["permission"]), esc(r["start_date"]), date_input("end_date", r["end_date"] or "")))
         note = "<p><small>Changing someone's role does not change their existing PAAFs or booked hours.</small></p>"
     elif t == "roles":
         r = con.execute("select * from role where role_id=?", (i,)).fetchone()
@@ -986,7 +1032,7 @@ def view_admin_edit(con, u, t, i, msgs=None):
                 "<tr><td>Status</td><td>%s</td></tr><tr><td>Approver</td><td>%s</td></tr>" % (
                     esc(r["client"]), esc(r["scope_code"]), txt("description", r["description"], 40),
                     sel("status", [("Open", "Open"), ("Pipeline", "Pipeline"), ("Closed", "Closed")], r["status"]),
-                    sel("approver_user_id", opts_users(con), r["approver_user_id"])))
+                    sel("approver_user_id", opts_approvers(con), r["approver_user_id"])))
         note = "<p><small>Changing the approver moves any waiting entries to the new approver's queue. Closing a scope stops new bookings.</small></p>"
     elif t == "projects":
         r = con.execute("select p.*, c.name as client from project p join client c on c.client_id=p.client_id where project_id=?", (i,)).fetchone()
@@ -1011,7 +1057,7 @@ def view_admin_edit(con, u, t, i, msgs=None):
 
 def admin_add(con, form):
     u, t = int(form["u"][0]), form["t"][0]
-    if not is_admin(con, u):
+    if not can_use_tab(con, u, t):
         return view_admin(con, u, t)
     g = lambda k: form.get(k, [""])[0].strip()
     try:
@@ -1092,7 +1138,7 @@ def admin_add(con, form):
 
 def admin_save(con, form):
     u, t, i = int(form["u"][0]), form["t"][0], int(form["id"][0])
-    if not is_admin(con, u):
+    if not can_use_tab(con, u, t):
         return view_admin(con, u, t)
     g = lambda k: form.get(k, [""])[0].strip()
     try:
@@ -1123,7 +1169,7 @@ def admin_save(con, form):
 
 def act_paaf(con, form):
     u, pid, action = int(form["u"][0]), int(form["paaf_id"][0]), form["action"][0]
-    if not is_admin(con, u):
+    if not can_use_tab(con, u, "paafs"):
         return view_admin(con, u, "paafs")
     today = datetime.date.today().isoformat()
     g = lambda k: form.get(k, [""])[0].strip()
@@ -1160,7 +1206,7 @@ def act_paaf(con, form):
 
 def act_period(con, form):
     u, ws, action = int(form["u"][0]), form["week_start"][0].strip(), form["action"][0]
-    if not is_admin(con, u):
+    if not can_use_tab(con, u, "periods"):
         return view_admin(con, u, "periods")
     try:
         if action == "open":
@@ -1178,9 +1224,8 @@ def act_period(con, form):
 
 
 def view_audit(con, u):
-    me = me_row(con, u)
-    if not me or me["permission"] != "admin":
-        return layout(con, u, "Audit trail", "<p>Admin only.</p>")
+    if permission_of(con, u) not in ("controller", "admin"):  # who owns the audit trail is still to be confirmed with the cost team
+        return no_access(con, u, "Audit trail")
     rows = con.execute(
         "select a.audit_id, a.changed_at, ch.name as changed_by, a.action, bu.name as booked_by, s.scope_code, t.work_date, "
         "a.old_status, a.new_status, a.old_hours, a.new_hours, a.reason from time_entry_audit a "
@@ -1234,7 +1279,7 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/ctr":
                 self.send_html(view_ctr(con, u, q))
             elif url.path == "/admin":
-                self.send_html(view_admin(con, u, q.get("t", ["periods"])[0]))
+                self.send_html(view_admin(con, u, q.get("t", [""])[0]))
             elif url.path == "/admin/edit":
                 self.send_html(view_admin_edit(con, u, q.get("t", [""])[0], int(q.get("id", ["0"])[0])))
             elif url.path == "/audit":

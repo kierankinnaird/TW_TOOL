@@ -72,8 +72,10 @@ class TestApp(unittest.TestCase):
         eid = con.execute("select entry_id from time_entry where status='Submitted' and scope_id=1 limit 1").fetchone()[0]
         owner = con.execute("select user_id from time_entry where entry_id=?", (eid,)).fetchone()[0]
         con.close()
-        self.assertIn("scope approver or an admin", self.post("/approvals/act", {"u": "1", "entry_id": str(eid), "action": "Approve"}))
-        self.assertIn("not their own", self.post("/approvals/act", {"u": str(owner), "entry_id": str(eid), "action": "Approve"}))
+        # neither a stranger nor the owner is an approver of this scope, so neither can approve it
+        self.assertIn("not named as an approver", self.post("/approvals/act", {"u": "1", "entry_id": str(eid), "action": "Approve"}))
+        self.assertIn("not named as an approver", self.post("/approvals/act", {"u": str(owner), "entry_id": str(eid), "action": "Approve"}))
+        self.assertEqual(self.one("select status from time_entry where entry_id=?", eid)[0], "Submitted")
 
     def test_changing_approved_hours_needs_reason_then_becomes_edited(self):
         con = app.db()
@@ -113,13 +115,13 @@ class TestApp(unittest.TestCase):
         self.assertIn("approved hours cannot be cleared", page)
 
     def test_admin_only_pages_and_period_actions(self):
-        self.assertIn("Admin only", self.get("/admin?u=5"))
+        self.assertIn("not available to your role", self.get("/admin?u=5"))
         # a far-future Monday, so it is never the current week (the current week opens by itself)
-        page = self.post("/admin/period", {"u": "7", "action": "open", "week_start": "2030-01-07"})
+        page = self.post("/admin/period", {"u": "29", "action": "open", "week_start": "2030-01-07"})
         self.assertIn("opened", page)
-        page = self.post("/admin/period", {"u": "7", "action": "open", "week_start": "2030-01-07"})  # already there
+        page = self.post("/admin/period", {"u": "29", "action": "open", "week_start": "2030-01-07"})  # already there
         self.assertIn("already exists", page)
-        page = self.post("/admin/period", {"u": "7", "action": "open", "week_start": "2030-01-08"})  # not a Monday
+        page = self.post("/admin/period", {"u": "29", "action": "open", "week_start": "2030-01-08"})  # not a Monday
         self.assertNotIn("opened", page)
 
     def test_reports_date_range(self):
@@ -204,14 +206,20 @@ class TestApp(unittest.TestCase):
         page = self.get("/timesheet?u=4&w=2026-11-02")
         self.assertNotIn("IT Services", page)  # closed codes stop taking bookings
         self.assertNotIn("IT Support", page)
-        self.assertIn("IT Services", self.get("/admin?u=7&t=internal"))
-        self.assertIn("IT Services", self.get("/admin/edit?u=7&t=internal&id=%d" % sid))
-        self.assertIn("Internal (not billed)", self.get("/admin?u=7&t=clients"))
+        self.assertIn("IT Services", self.get("/admin?u=29&t=internal"))
+        self.assertIn("IT Services", self.get("/admin/edit?u=29&t=internal&id=%d" % sid))
+        self.assertIn("Internal (not billed)", self.get("/admin?u=29&t=clients"))
         for t in ("rates", "paafs"):  # the internal client is not offered for rate cards or PAAFs
-            self.assertNotIn(">Internal</option>", self.get("/admin?u=7&t=" + t))
+            self.assertNotIn(">Internal</option>", self.get("/admin?u=29&t=" + t))
         before = self.one("select count(*) from scope")[0]
-        self.admin_post("/admin/add", {"t": "internal", "description": "Sneaky", "approver_user_id": "7"}, u="5")
+        for who in ("5", self.IT_ADMIN):  # a standard user, and the IT admin, cannot add codes
+            self.admin_post("/admin/add", {"t": "internal", "description": "Sneaky", "approver_user_id": "7"}, u=who)
         self.assertEqual(self.one("select count(*) from scope")[0], before)
+        # approvers on a code are standard users only: the controller and admin are not offered
+        page = self.get("/admin?u=29&t=internal")
+        self.assertNotIn(">Eilidh Rankin</option>", page.split("Add an internal code")[1])
+        self.assertNotIn(">Hugh Calder</option>", page.split("Add an internal code")[1])
+        self.assertIn("Only a standard user", self.admin_post("/admin/add", {"t": "internal", "description": "Bad", "approver_user_id": "29"}))
 
     def test_current_week_opens_automatically_and_closed_weeks_stay_closed(self):
         week = app.monday(datetime.date.today()).isoformat()
@@ -246,8 +254,8 @@ class TestApp(unittest.TestCase):
         self.assertIn('<input type="date" name="from" value="2026-10-26">', page)
         self.assertIn('<input type="date" name="to" value="2026-11-02">', page)
         self.assertNotIn("(yyyy-mm-dd)", page)
-        for path, names in (("/admin?u=7&t=periods", ["week_start"]), ("/admin?u=7&t=users", ["start_date", "end_date"]),
-                            ("/admin?u=7&t=rates", ["effective_from"]), ("/admin/edit?u=7&t=users&id=1", ["end_date"])):
+        for path, names in (("/admin?u=29&t=periods", ["week_start"]), ("/admin?u=30&t=users", ["start_date", "end_date"]),
+                            ("/admin?u=29&t=rates", ["effective_from"]), ("/admin/edit?u=30&t=users&id=1", ["end_date"])):
             page = self.get(path)
             for name in names:
                 self.assertIn('<input type="date" name="%s"' % name, page, path)
@@ -265,7 +273,7 @@ class TestApp(unittest.TestCase):
         self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft", "h_1_4_2026-11-06": "7.5", "reason": ""})
         self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Submit week", "reason": ""})
         self.admin_post("/admin/period", {"action": "close", "week_start": "2026-11-02"})
-        for path in ("/audit?u=7", "/admin?u=7&t=periods"):
+        for path in ("/audit?u=29", "/admin?u=29&t=periods"):
             page = self.get(path)
             self.assertRegex(page, r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?!\.\d)", path)  # a time to the second is there...
             self.assertNotRegex(page, r"\d\d:\d\d:\d\d\.\d", path)  # ...and no fractions of a second
@@ -285,7 +293,13 @@ class TestApp(unittest.TestCase):
         self.assertEqual(tuple(self.one("select hours, status from time_entry where user_id=5 and work_date='2026-11-06'")), (6, "Submitted"))
 
     # ---------- admin forms ----------
-    def admin_post(self, path, data, u="7"):
+    # Demo accounts: 29 Eilidh Rankin is a cost controller, 30 Hugh Calder is the IT admin, 7 Alasdair Murray is a standard
+    # user who approves. Users and job roles belong to the admin; clients, rates, PAAFs, scopes and internal codes to the controller.
+    CONTROLLER, IT_ADMIN = "29", "30"
+
+    def admin_post(self, path, data, u=None):
+        if u is None:
+            u = self.IT_ADMIN if data.get("t") in ("users", "roles") else self.CONTROLLER
         d = {"u": u}
         d.update(data)
         return self.post(path, d)
@@ -298,10 +312,11 @@ class TestApp(unittest.TestCase):
             con.close()
 
     def test_all_admin_tabs_and_edit_pages_load(self):
-        for t in ["periods", "users", "roles", "clients", "rates", "paafs", "scopes"]:
-            self.assertIn("Admin", self.get("/admin?u=7&t=%s" % t), t)
-        for t, i in [("users", 1), ("roles", 1), ("scopes", 1)]:
-            self.assertIn("Save changes", self.get("/admin/edit?u=7&t=%s&id=%d" % (t, i)), t)
+        for t, who in [("periods", 29), ("periods", 30), ("users", 30), ("roles", 30), ("clients", 29), ("rates", 29),
+                       ("paafs", 29), ("scopes", 29), ("internal", 29)]:
+            self.assertIn("Admin", self.get("/admin?u=%d&t=%s" % (who, t)), t)
+        for t, i, who in [("users", 1, 30), ("roles", 1, 30), ("scopes", 1, 29), ("internal", 7, 29)]:
+            self.assertIn("Save changes", self.get("/admin/edit?u=%d&t=%s&id=%d" % (who, t, i)), t)
 
     def test_non_admin_cannot_use_admin_forms(self):
         before = self.one("select count(*) from client")[0]
@@ -309,7 +324,55 @@ class TestApp(unittest.TestCase):
         self.assertEqual(self.one("select count(*) from client")[0], before)
         self.admin_post("/admin/period", {"action": "open", "week_start": "2030-01-07"}, u="5")
         self.assertIsNone(self.one("select 1 from period where week_start='2030-01-07'"))
-        self.assertIn("Admin only", self.get("/admin/edit?u=5&t=users&id=1"))
+        self.assertIn("not available to your role", self.get("/admin/edit?u=5&t=users&id=1"))
+
+    def test_each_admin_tab_is_limited_to_its_role(self):
+        # The IT admin manages users and job roles only; the cost controller manages codes, clients, rates and PAAFs.
+        # Neither can use the other's tabs, and a standard user has none.
+        for who, allowed in (("30", {"periods", "users", "roles"}), ("29", {"periods", "clients", "rates", "paafs", "scopes", "internal"}), ("5", set())):
+            page = self.get("/admin?u=%s" % who)
+            for tab in ("periods", "users", "roles", "clients", "rates", "paafs", "scopes", "internal"):
+                self.assertEqual("t=%s\"" % tab in page, tab in allowed, (who, tab))
+            for tab in ("users", "roles", "clients", "rates", "paafs", "scopes", "internal"):
+                if tab not in allowed:
+                    self.assertIn("not available to your role", self.get("/admin?u=%s&t=%s" % (who, tab)), (who, tab))
+        before = self.one("select count(*) from client")[0], self.one("select count(*) from app_user")[0]
+        self.admin_post("/admin/add", {"t": "clients", "name": "FromIT"}, u="30")
+        self.admin_post("/admin/add", {"t": "users", "nmc_id": "A950", "name": "FromController", "employment_type": "Staff", "role_id": "6",
+                                       "permission": "user", "start_date": "2026-11-01", "end_date": ""}, u="29")
+        self.assertEqual((self.one("select count(*) from client")[0], self.one("select count(*) from app_user")[0]), before)
+
+    def test_menus_follow_the_role(self):
+        def menu(u):
+            page = self.get("/timesheet?u=%d" % u)
+            return {k: ('href="/%s?u=%d' % (path, u)) in page for k, path in
+                    (("approvals", "approvals"), ("reports", "reports"), ("admin", "admin"), ("audit", "audit"))}
+        self.assertEqual(menu(5), {"approvals": False, "reports": True, "admin": False, "audit": False})    # standard user
+        self.assertEqual(menu(6), {"approvals": True, "reports": True, "admin": False, "audit": False})     # approver
+        self.assertEqual(menu(29), {"approvals": False, "reports": True, "admin": True, "audit": True})     # cost controller
+        self.assertEqual(menu(30), {"approvals": False, "reports": False, "admin": True, "audit": True})    # IT admin
+        self.assertIn("not available to your role", self.get("/reports?u=30"))
+        self.assertIn("not available to your role", self.get("/ctr?u=30&phase=1"))
+
+    def test_only_a_named_approver_sees_approvals_and_controllers_and_admins_cannot_approve(self):
+        for u in (5, 29, 30):  # a standard user who is not an approver, the controller, the IT admin
+            self.assertIn("not named as an approver", self.get("/approvals?u=%d" % u))
+        eid = self.one("select entry_id from time_entry where status='Submitted' and scope_id=1 limit 1")[0]
+        for u in ("5", "29", "30"):
+            self.assertIn("not named as an approver", self.post("/approvals/act", {"u": u, "entry_id": str(eid), "action": "Approve selected"}))
+        self.assertEqual(self.one("select status from time_entry where entry_id=?", eid)[0], "Submitted")
+        # an approver of a different scope is refused too
+        self.assertIn("only the approver named", self.post("/approvals/act", {"u": "8", "entry_id": str(eid), "action": "Approve selected"}))
+        self.assertIn("only the approver named", self.post("/approvals/act", {"u": "8", "entry_id": str(eid), "action": "Reject selected", "reason": "x"}))
+        self.assertEqual(self.one("select status from time_entry where entry_id=?", eid)[0], "Submitted")
+
+    def test_an_approver_cannot_approve_their_own_hours(self):
+        # Alasdair (7) approves INT01 and can also book to it, but not approve his own entry
+        self.post("/timesheet/save", {"u": "7", "w": "2026-11-02", "action": "Save draft", "h_8_2_2026-11-04": "2", "reason": ""})
+        self.post("/timesheet/save", {"u": "7", "w": "2026-11-02", "action": "Submit week", "reason": ""})
+        eid = self.one("select entry_id from time_entry where user_id=7 and work_date='2026-11-04'")[0]
+        self.assertIn("not their own", self.post("/approvals/act", {"u": "7", "entry_id": str(eid), "action": "Approve selected"}))
+        self.assertEqual(self.one("select status from time_entry where entry_id=?", eid)[0], "Submitted")
 
     def test_add_client_role_and_reject_duplicates_and_blanks(self):
         self.assertIn("Client added", self.admin_post("/admin/add", {"t": "clients", "name": "Shell"}))
@@ -373,6 +436,13 @@ class TestApp(unittest.TestCase):
         self.assertEqual(self.one("select approver_user_id from scope where scope_id=?", sid)[0], 8)
         self.assertIn("Saved", self.admin_post("/admin/save", {"t": "scopes", "id": str(sid), "description": "New Study", "status": "Closed", "approver_user_id": "6"}))
         self.assertEqual(tuple(self.one("select status, approver_user_id from scope where scope_id=?", sid)), ("Closed", 6))
+        # only standard users can be named: the cost controller and the IT admin never approve
+        for bad in ("29", "30"):
+            self.assertIn("Only a standard user", self.admin_post("/admin/save", {"t": "scopes", "id": str(sid), "description": "New Study",
+                                                                                  "status": "Open", "approver_user_id": bad}))
+            self.assertIn("Only a standard user", self.admin_post("/admin/add", {"t": "scopes", "scope_code": "BB0004", "project_id": "1",
+                                                                                 "description": "X", "status": "Open", "approver_user_id": bad}))
+        self.assertEqual(self.one("select approver_user_id from scope where scope_id=?", sid)[0], 6)
 
     def test_deactivated_role_is_hidden_from_new_timesheet_rows(self):
         self.admin_post("/admin/save", {"t": "roles", "id": "2", "skill_code": "EM-02", "name": "Engineering Manager", "family": "Engineering Management", "active": "0"})
@@ -384,12 +454,13 @@ class TestApp(unittest.TestCase):
 
     def test_user_switcher_shows_each_persons_job_title(self):
         page = self.get("/reports?u=7")
-        for label in ["Alasdair Murray - Engineering Manager (admin)", "Hamish Lennox - Operations Superintendent",
+        for label in ["Alasdair Murray - Engineering Manager</option>", "Eilidh Rankin - Project Controls Manager (controller)",
+                      "Hugh Calder - Document Controller (admin)", "Hamish Lennox - Operations Superintendent",
                       "Lachlan Rennie - Subsea Pipeline Engineer", "Mairi Thomson - Lead Technical Safety Engineer"]:
             self.assertIn(label, page)
 
     def test_roles_tab_groups_job_titles_by_family(self):
-        page = self.get("/admin?u=7&t=roles")
+        page = self.get("/admin?u=30&t=roles")
         for text in ["Job family", "Piping Engineering", "Technical Safety", "Lead Process Engineer", "Document Controller"]:
             self.assertIn(text, page)
 
@@ -402,9 +473,8 @@ class TestApp(unittest.TestCase):
     def queue_ids(self, approver):
         con = app.db()
         try:
-            where = "" if approver == 7 else "and s.approver_user_id=%d" % approver
             return [r[0] for r in con.execute("select t.entry_id from time_entry t join scope s on s.scope_id=t.scope_id "
-                                              "where t.status='Submitted' %s" % where)]
+                                              "where t.status='Submitted' and s.approver_user_id=?", (approver,))]
         finally:
             con.close()
 
@@ -430,8 +500,11 @@ class TestApp(unittest.TestCase):
 
     def test_bulk_approve_reports_wrong_approver_without_stopping(self):
         ids = self.queue_ids(6)
-        page = self.post("/approvals/act", {"u": "1", "entry_id": [str(i) for i in ids], "action": "Approve selected"})
-        self.assertIn("scope approver or an admin", page)
+        # Niall (8) approves other scopes, not this one: every entry is refused and reported, none is approved
+        page = self.post("/approvals/act", {"u": "8", "entry_id": [str(i) for i in ids], "action": "Approve selected"})
+        self.assertIn("only the approver named on its booking code", page)
+        self.assertEqual(self.one("select count(*) from time_entry where entry_id in (%s) and status='Submitted'"
+                                  % ",".join(str(i) for i in ids))[0], len(ids))
 
     def test_timesheet_shows_total_for_all_statuses(self):
         page = self.get("/timesheet?u=5&w=2026-11-02")

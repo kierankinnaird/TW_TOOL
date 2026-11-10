@@ -35,9 +35,23 @@ python scripts/build.py
 python app/app.py                            # then open http://localhost:8000
 ```
 
-Pages: My Timesheet (weekly grid), Approvals, Reports (CTR and weekly period reports), Admin and Audit trail (admin users only, e.g. Alasdair Murray). Rebuilding the database resets the data.
+Pages: My Timesheet (weekly grid), Approvals (approvers only), Reports (CTR and weekly period reports), Admin and Audit trail (cost controllers and the IT admin, each seeing their own tabs). Rebuilding the database resets the data.
 
-Admin has a tab for each of: weekly periods (close a week, or open a missed one), users, roles / skill codes, clients, client rate cards, PAAFs (raise, mark sent, approve with the signed form reference, reject), projects, scopes (each needs an approver) and phases, and internal codes. Users, roles, scopes and internal codes can be edited; rates are never edited, you add a new one with a later effective date.
+## Roles
+
+Each person has one permission level: `user`, `controller` (cost controller) or `admin` (IT). Everyone can enter, save and submit their own time. Approver is not a level: it means being named as the approver on a scope, and only standard users can be named. Cost controllers and admins never approve hours.
+
+| | Standard user | Approver (a user named on a scope) | Cost controller | Admin (IT) |
+|---|---|---|---|---|
+| Own timesheet | Yes | Yes | Yes | Yes |
+| Approvals page, approve or reject | No | Yes, for their scopes only, never their own hours | No | No |
+| Reports | Yes | Yes | Yes | No |
+| Admin tabs | None | None | Weekly periods, clients, rate cards, PAAFs, projects / scopes / phases, internal codes | Weekly periods, users, job roles |
+| Audit trail | No | No | Yes | Yes |
+
+The demo accounts are Eilidh Rankin (controller) and Hugh Calder (admin). Alasdair Murray is a standard user who approves several scopes. Still to come from the roles matrix: reports limited to a person's own hours or codes and values hidden from everyone but cost controllers, a missing-timesheets view, reopening a timesheet, transaction controls, and more. Who owns weekly periods and the audit trail is still to be confirmed with the cost team, so for now both controllers and admins can use them.
+
+Admin tabs: weekly periods (close a week, or open a missed one), users, roles / skill codes, clients, client rate cards, PAAFs (raise, mark sent, approve with the signed form reference, reject), projects, scopes (each needs an approver) and phases, and internal codes. Users, roles, scopes and internal codes can be edited; rates are never edited, you add a new one with a later effective date.
 
 Weekly periods open themselves: the first request in a new week creates that week's period, so nobody has to open it by hand. A week an admin has closed stays closed. The admin tab can still open a week that was missed, for example after the app was not used for a while.
 
@@ -65,7 +79,7 @@ SELECT * FROM v_period_report
 
 - Booking is to a phase and needs an Open project, scope and phase, an Approved PAAF for the scope's client, a rate that matches the client and worked role, and an Open weekly period. Internal codes need none of the PAAF and rate, and cannot carry them.
 - Lifecycle: Draft, Submitted, Approved, Edited. Reject returns to Draft with a reason. Editing an approved entry sets Edited, needs a reason, and needs re-approval.
-- Approval is by the scope's approver or an admin, never the entry owner.
+- Approval is only by the person named as the scope's approver, never the entry owner. Cost controllers and admins never approve, and cannot be named as an approver.
 - Every edit names its editor; every create, edit, status change and deletion is audited. Only Draft entries can be deleted (clear draft).
 
 ## CTR page

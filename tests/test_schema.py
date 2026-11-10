@@ -32,7 +32,7 @@ class Base(unittest.TestCase):
 
 class TestSeed(Base):
     def test_counts(self):
-        self.assertEqual(self.scalar("select count(*) from app_user"), 28)
+        self.assertEqual(self.scalar("select count(*) from app_user"), 30)
         self.assertEqual(self.scalar("select count(*) from time_entry"), 52)
         self.assertEqual(self.scalar("select count(*) from rate"), 58)
 
@@ -195,11 +195,14 @@ class TestLifecycle(Base):
                          "last_edited_at='t2' WHERE entry_id=?", (eid,))
         self.assertEqual(self.scalar("select reason from time_entry_audit where entry_id=? and new_status='Draft'", eid), "No")
 
-    def test_only_scope_approver_or_admin_can_approve(self):
+    def test_only_the_named_scope_approver_can_approve(self):
         eid = self.first("status='Submitted' and scope_id=1")  # scope 1 approver = Rhona (6)
         sql = "UPDATE time_entry SET status='Approved', approved_by=?, last_edited_by=?, last_edited_at='t1' WHERE entry_id=?"
-        self.blocked(sql, (1, 1, eid), "scope approver or an admin")   # Isla: neither
-        self.con.execute(sql, (7, 7, eid))                              # Alasdair: admin
+        self.blocked(sql, (1, 1, eid), "Only the scope approver")   # Isla: not an approver
+        self.blocked(sql, (7, 7, eid), "Only the scope approver")   # Alasdair approves other scopes, not this one
+        self.blocked(sql, (29, 29, eid), "Only the scope approver")  # the cost controller never approves
+        self.blocked(sql, (30, 30, eid), "Only the scope approver")  # nor does the IT admin
+        self.con.execute(sql, (6, 6, eid))                          # Rhona: the named approver
 
     def test_nobody_approves_their_own_entry(self):
         eid = self.scalar("select entry_id from time_entry where user_id=5 and status='Submitted' limit 1")
@@ -267,6 +270,30 @@ class TestViews(Base):
             "select skill_code from v_ctr where scope_code='BB0001'").fetchall()
         self.assertIn(("PM-04",), lines)
         self.assertIn(("PM-02",), lines)
+
+
+class TestPermissionLevels(Base):
+    """user / controller / admin. Approver is not a level: it means being named on a scope, and only standard users can be."""
+    def test_there_are_three_levels_and_the_demo_has_one_controller_and_one_admin(self):
+        levels = dict(self.con.execute("select permission, count(*) from app_user group by permission").fetchall())
+        self.assertEqual(levels, {"user": 28, "controller": 1, "admin": 1})
+        self.blocked("UPDATE app_user SET permission='superuser' WHERE user_id=1")
+
+    def test_no_controller_or_admin_is_an_approver_in_the_demo_data(self):
+        self.assertEqual(self.scalar("select count(*) from scope s join app_user u on u.user_id=s.approver_user_id where u.permission<>'user'"), 0)
+
+    def test_only_a_standard_user_can_be_named_as_approver(self):
+        new = ("INSERT INTO scope (scope_code, client_id, project_id, description, status, approver_user_id) "
+               "VALUES ('Z1', 1, 1, 'Test', 'Open', ?)")
+        self.blocked(new, (29,), "standard user")   # the cost controller
+        self.blocked(new, (30,), "standard user")   # the IT admin
+        self.con.execute(new, (6,))                 # a standard user is fine
+        self.blocked("UPDATE scope SET approver_user_id=29 WHERE scope_code='BB0001'", msg="standard user")
+
+    def test_an_approver_cannot_be_made_a_controller_or_admin_while_still_named(self):
+        self.blocked("UPDATE app_user SET permission='controller' WHERE user_id=6", msg="Remove this person as scope approver")
+        self.blocked("UPDATE app_user SET permission='admin' WHERE user_id=7", msg="Remove this person as scope approver")
+        self.con.execute("UPDATE app_user SET permission='controller' WHERE user_id=1")  # Isla approves nothing, so this is fine
 
 
 class TestInternalHours(Base):
