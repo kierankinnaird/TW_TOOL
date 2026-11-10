@@ -372,10 +372,10 @@ class TestActiveDatesAndPaafExpiry(Base):
 
 
 class TestHourTypes(Base):
-    """Every entry has a location (On site / Offshore) and an overtime flag. Overtime has no separate rate yet."""
+    """Every entry has a location (On site / Offshore / Office / WFH) and an overtime flag. Overtime has no separate rate yet."""
     def test_the_locations_are_seeded_and_new_entries_default_to_on_site_normal_time(self):
         self.assertEqual([tuple(r) for r in self.con.execute("select location_id, name, active from location order by location_id")],
-                         [(1, "On site", 1), (2, "Offshore", 1)])
+                         [(1, "On site", 1), (2, "Offshore", 1), (3, "Office", 1), (4, "WFH", 1)])
         eid = self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 8, 5)).lastrowid
         self.assertEqual(tuple(self.con.execute("select location_id, overtime from time_entry where entry_id=?", (eid,)).fetchone()), (1, 0))
 

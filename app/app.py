@@ -195,7 +195,8 @@ def layout(con, u, title, body):
         " (%s)" % x["permission"] if x["permission"] != "user" else "") for x in users)
     me = me_row(con, u)
     perm = me["permission"] if me else None
-    items = [("timesheet", "My Timesheet", "/timesheet?u=%d" % u)]
+    n_back = con.execute("select count(*) from time_entry where user_id=? and status='Draft' and reject_reason is not null", (u,)).fetchone()[0]
+    items = [("timesheet", "My Timesheet%s" % (" (%d sent back)" % n_back if n_back else ""), "/timesheet?u=%d" % u)]
     if approval_queue(con, u) is not None:
         items.append(("approvals", "Approvals (%d)" % pending_for(con, u), "/approvals?u=%d" % u))
     if perm == "controller" or is_approver(con, u):  # who has not completed a timesheet: everyone for cost controllers, their own people for approvers
@@ -340,6 +341,28 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
             "from %s" % dmy(start) if start > d0 and (end is None or end >= d6) else
             "until %s" % dmy(end) if (start <= d0) else "from %s until %s" % (dmy(start), dmy(end))))
 
+    sent_back = [e for e in entries if e["status"] == "Draft" and e["reject_reason"]]
+    if sent_back:
+        def when(t):  # 2026-11-06 10:00:00 -> 06/11/2026 10:00
+            return "%s/%s/%s %s" % (t[8:10], t[5:7], t[0:4], t[11:16]) if t and len(t) >= 16 else ""
+        lines = []
+        for e in sent_back:
+            a = con.execute("select ch.name as who, a.changed_at from time_entry_audit a left join app_user ch on ch.user_id=a.changed_by "
+                            "where a.entry_id=? and a.old_status='Submitted' and a.new_status='Draft' order by a.audit_id desc limit 1",
+                            (e["entry_id"],)).fetchone()
+            lines.append("<li>%s %s, %s: %s hours (%s%s). <b>Reason:</b> %s%s</li>" % (
+                esc(e["scope_code"]), esc(e["phase"]), datetime.date.fromisoformat(e["work_date"]).strftime("%a %d/%m"), fmt(e["hours"]),
+                esc(e["location_name"]), ", overtime" if e["overtime"] else "", esc(e["reject_reason"]),
+                " (sent back by %s on %s)" % (esc(a["who"] or "an approver"), when(a["changed_at"])) if a else ""))
+        b.append('<div class="msg bad"><p><b>Sent back for correction</b></p><ul>%s</ul>'
+                 "<p>Change the hours or the code if needed, then <b>Submit week</b> again.</p></div>" % "".join(lines))
+    elsewhere = [r for r in con.execute(
+        "select date(work_date,'weekday 0','-6 days') as wk, count(*) as n from time_entry "
+        "where user_id=? and status='Draft' and reject_reason is not null group by wk order by wk", (u,)) if r["wk"] != d0]
+    if elsewhere:
+        b.append("<p><small>You also have hours sent back in: %s.</small></p>" % ", ".join(
+            '<a href="/timesheet?u=%d&amp;w=%s">week commencing %s (%d)</a>' % (
+                u, r["wk"], datetime.date.fromisoformat(r["wk"]).strftime("%d/%m/%Y"), r["n"]) for r in elsewhere))
     prev_d = w - datetime.timedelta(days=7)
     prev_n = con.execute("select count(*) from time_entry where user_id=? and work_date between ? and ?",
                          (u, prev_d.isoformat(), (prev_d + datetime.timedelta(days=6)).isoformat())).fetchone()[0]
@@ -378,7 +401,8 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
                     cell = fmt(e["hours"])
                     fixed = ' data-h="%s"' % fmt(e["hours"])
                 else:
-                    cell = '<input type="text" size="4" name="%s" value="%s">' % (name, fmt(e["hours"]))
+                    why = ' title="Sent back: %s"' % esc(e["reject_reason"]) if e["status"] == "Draft" and e["reject_reason"] else ""
+                    cell = '<input type="text" size="4" name="%s" value="%s"%s>' % (name, fmt(e["hours"]), why)
             tds.append('<td align="center" class="c" data-day="%s"%s>%s</td>' % (iso, fixed, cell))
         tds.append('<td align="right" class="rt">%s</td>' % fmt(rt))
         trs.append('<tr class="row" data-ot="%d">%s</tr>' % (ot, "".join(tds)))

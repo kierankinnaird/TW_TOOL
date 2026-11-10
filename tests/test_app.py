@@ -490,6 +490,26 @@ class TestApp(unittest.TestCase):
         self.assertIn('class="go"><b>2</b>', page)
         self.assertIn('class="gt"><b>12</b>', page)
 
+    def test_office_and_wfh_are_standard_choices(self):
+        page = self.get("/timesheet?u=4&w=2026-11-02")
+        for name in ("On site", "Offshore", "Office", "WFH"):
+            self.assertIn('>%s</option>' % name, page, name)  # all four are in the Add row dropdown
+        # David Hart (4) books INT01 from the office on Monday and from home on Tuesday
+        self.assertIn("2 entries saved", self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "reason": "",
+                                                                      "h_8_4_3_0_2026-11-02": "7.5", "h_8_4_4_0_2026-11-03": "7.5"}))
+        self.assertEqual(self.hours_of(4, "2026-11-02"), [(3, 0, 7.5, "Draft")])
+        self.assertEqual(self.hours_of(4, "2026-11-03"), [(4, 0, 7.5, "Draft")])
+        page = self.get("/timesheet?u=4&w=2026-11-02&add_phase=8&add_role=4&add_loc=4")  # a WFH row from the dropdown
+        self.assertIn("h_8_4_4_0_2026-11-05", page)
+        self.assertIn(">WFH</td>", page)
+        self.assertIn(">Office</td>", page)
+        # they show up in the report by location once approved
+        eid = self.one("select entry_id from time_entry where user_id=4 and work_date='2026-11-03'")[0]
+        self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Submit week", "reason": ""})
+        self.post("/approvals/act", {"u": "7", "entry_id": str(eid), "action": "Approve selected"})
+        section = self.get("/reports?u=29&from=2026-01-01&to=2026-12-31").split("Hours by location and overtime")[1]
+        self.assertIn('<td>WFH</td><td align="right">7.5</td><td align="right">0</td><td align="right">7.5</td>', section)
+
     def test_the_same_cell_is_updated_not_duplicated(self):
         post = {"u": "4", "w": "2026-11-02", "action": "Save draft", "reason": ""}
         self.post("/timesheet/save", dict(post, **{"h_8_4_2_1_2026-11-03": "3"}))
@@ -551,7 +571,8 @@ class TestApp(unittest.TestCase):
                                                                     "h_8_4_%d_0_2026-11-05" % rid: "2"}))
         self.assertEqual(self.hours_of(5, "2026-11-06"), [(rid, 0, 2, "Draft")])
         # at least one location must stay switched on
-        self.admin_post("/admin/save", {"t": "locations", "id": "2", "name": "Offshore", "active": "0"})
+        for lid, name in ((2, "Offshore"), (3, "Office"), (4, "WFH")):
+            self.assertIn("Saved", self.admin_post("/admin/save", {"t": "locations", "id": str(lid), "name": name, "active": "0"}))
         self.assertIn("At least one location must stay active", self.admin_post("/admin/save", {"t": "locations", "id": "1", "name": "On site", "active": "0"}))
 
     def test_the_timesheet_script_totals_normal_time_overtime_and_the_total(self):
@@ -606,6 +627,57 @@ class TestApp(unittest.TestCase):
         self.assertIn("Copy last week", self.get("/timesheet?u=24&w=2026-11-02"))
         self.admin_post("/admin/period", {"action": "close", "week_start": "2026-11-02"})
         self.assertNotIn("Copy last week", self.get("/timesheet?u=24&w=2026-11-02"))
+
+    # ---------- a rejected entry tells the person why (R24) ----------
+    def test_the_seeded_rejection_is_shown_with_its_reason_and_who_sent_it_back(self):
+        # Ajin Sabu (10): A1600 on Wed 4 Nov was sent back by Kenneth Nicolson with a reason
+        page = self.get("/timesheet?u=10&w=2026-11-02")
+        self.assertIn("Sent back for correction", page)
+        self.assertIn("A1600 Define, Wed 04/11", page)
+        self.assertIn("Project Controls Manager cover not agreed with client, please confirm", page)
+        self.assertIn("sent back by Kenneth Nicolson on 06/11/2026 10:00", page)
+        self.assertIn('title="Sent back: Project Controls Manager cover', page)  # a hover note on the box itself
+        self.assertIn("My Timesheet (1 sent back)", page)                          # and in the menu, on any page
+        self.assertIn("My Timesheet (1 sent back)", self.get("/reports?u=10"))
+        # people with nothing sent back see none of it
+        page = self.get("/timesheet?u=5&w=2026-11-02")
+        self.assertNotIn("Sent back", page)
+        self.assertIn(">My Timesheet</a>", page)
+
+    def test_other_weeks_with_sent_back_hours_are_pointed_out(self):
+        page = self.get("/timesheet?u=10&w=2026-11-09")
+        self.assertNotIn("Sent back for correction", page)  # nothing in this week
+        self.assertIn("You also have hours sent back in", page)
+        self.assertIn('w=2026-11-02">week commencing 02/11/2026 (1)', page)
+
+    def test_a_rejection_made_in_the_app_reaches_the_person(self):
+        # David Hart (4) books INT01 and submits; Alisdair Woodhead (7) approves INT01 and rejects it
+        self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "reason": "", "h_8_4_1_0_2026-11-04": "3"})
+        self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Submit week", "reason": ""})
+        self.assertNotIn("Sent back", self.get("/timesheet?u=4&w=2026-11-02"))
+        eid = self.one("select entry_id from time_entry where user_id=4 and work_date='2026-11-04'")[0]
+        self.post("/approvals/act", {"u": "7", "entry_id": str(eid), "action": "Reject selected", "reason": "Wrong <b>code</b>, use training"})
+        page = self.get("/timesheet?u=4&w=2026-11-02")
+        self.assertIn("Sent back for correction", page)
+        self.assertIn("INT01 General, Wed 04/11", page)
+        self.assertIn("Alisdair Woodhead", page)
+        self.assertIn("Wrong &lt;b&gt;code&lt;/b&gt;, use training", page)  # the reason is shown as text, never as HTML
+        self.assertNotIn("Wrong <b>code</b>", page)
+        self.assertIn("My Timesheet (1 sent back)", page)
+        # submitting the week again clears the notice
+        self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Submit week", "reason": ""})
+        page = self.get("/timesheet?u=4&w=2026-11-02")
+        self.assertNotIn("Sent back", page)
+        self.assertIn(">My Timesheet</a>", page)
+
+    def test_a_cost_controllers_rejection_of_an_approvers_own_hours_names_the_controller(self):
+        self.post("/timesheet/save", {"u": "8", "w": "2026-11-02", "action": "Save draft", "reason": "", "h_6_30_1_0_2026-11-04": "4"})  # Kenneth on A1500
+        self.post("/timesheet/save", {"u": "8", "w": "2026-11-02", "action": "Submit week", "reason": ""})
+        eid = self.one("select entry_id from time_entry where user_id=8 and work_date='2026-11-04'")[0]
+        self.post("/approvals/act", {"u": "29", "entry_id": str(eid), "action": "Reject selected", "reason": "Not agreed with Spirit"})
+        page = self.get("/timesheet?u=8&w=2026-11-02")
+        self.assertIn("Not agreed with Spirit", page)
+        self.assertIn("sent back by Stephanie Apedaile", page)
 
     # ---------- start and end dates, PAAF expiry (R07) ----------
     def test_no_input_boxes_outside_a_persons_start_and_end_dates(self):

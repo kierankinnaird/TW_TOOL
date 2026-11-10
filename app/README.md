@@ -7,7 +7,7 @@ SQLite mock of the v1 data model for the in-house timesheet system (CMAP replace
 ```
 db/
   schema.sql      tables, triggers (business rules), views
-  seed.sql        demo data (2 locations, 2 clients plus the Internal client with 3 internal codes, 32 job titles in job families (3 with no rate card), 30 users, 4 projects, 9 scopes, 10 phases, 52 entries over 2 weeks)
+  seed.sql        demo data (4 locations, 2 clients plus the Internal client with 3 internal codes, 32 job titles in job families (3 with no rate card), 30 users, 4 projects, 9 scopes, 10 phases, 52 entries over 2 weeks)
 app/
   app.py          front end (plain HTML and one inline stylesheet, standard library only, no framework)
   static/         the TASA Orbiter font file, the only static file the app serves
@@ -65,11 +65,13 @@ Weekly periods open themselves: the first request in a new week creates that wee
 
 On the timesheet, the row, day and week totals update as hours are typed, before saving. Under the grid there are three lines: Normal time, Overtime and Total.
 
+**Sent back:** when an approver (or, for an approver's own hours, a cost controller) rejects an entry, it goes back to the person as a draft with the reason. The person sees it three ways: a "Sent back for correction" notice on that week's timesheet (the entry, the reason, who sent it back and when), a hover note on the box itself, and "My Timesheet (n sent back)" in the menu on every page, plus a pointer to any other weeks that have some. The notice disappears when the week is submitted again. Reasons are shown as plain text. No email is sent: users have no email address stored.
+
 **Copy last week:** when last week has hours and this week is open, the timesheet offers two buttons. "Copy last week's rows and hours" saves last week's hours as drafts on the same weekdays, with the same code, skill code, location and overtime flag; "Copy last week's rows only" adds the same empty rows for you to fill in. Anything already filled in is left alone, and anything that cannot be copied (for example a PAAF that has expired, or a day outside your start and end dates) is reported, not skipped silently. Copying uses the same booking rules as saving, so rates are looked up for the new date.
 
 ## Hour types: location and overtime
 
-Every timesheet row has a **location** (On site or Offshore) and a **type** (Normal or Overtime), so one person can book the same code on the same day as normal time, as overtime, on site and offshore, each on its own row. "Add row" has a Location dropdown and an Overtime tick box. Every entry stores both (`location_id` and `overtime`); changing either on approved hours is a controlled edit (needs a reason, goes back for approval) and the audit trail keeps the old values.
+Every timesheet row has a **location** (On site, Offshore, Office or WFH) and a **type** (Normal or Overtime), so one person can book the same code on the same day as normal time, as overtime, on site and offshore, each on its own row. "Add row" has a Location dropdown and an Overtime tick box. Every entry stores both (`location_id` and `overtime`); changing either on approved hours is a controlled edit (needs a reason, goes back for approval) and the audit trail keeps the old values.
 
 - The list of locations is managed by the IT admin on the Locations tab (add, rename, switch off). A location that is switched off stops new bookings; hours already booked keep it. At least one must stay active.
 - **Overtime has no separate rate yet**, so overtime hours are valued at the normal rate in the CTR and weekly report totals. When the cost team has overtime rates they will need a place on the rate card (a second rate or a multiplier).
