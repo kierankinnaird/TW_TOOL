@@ -1,4 +1,4 @@
-"""Basic front end for the v1 mock database. Plain HTML, no styling, standard library only.
+"""Front end for the v1 mock database. Plain HTML with one inline stylesheet, standard library only.
 
 Run from the repo root:   python app/app.py        then open  http://localhost:8000
 Uses build/timewriting.db (create it first with: python scripts/build.py).
@@ -14,6 +14,8 @@ from urllib.parse import parse_qs, quote, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
+# Static files the app may serve. Only these exact URLs, never a path built from the request.
+ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "TASAOrbiterVF.woff2"), "font/woff2")}
 
 
 # ---------- helpers ----------
@@ -90,6 +92,75 @@ def pending_for(con, u):
         "where t.status in ('Submitted','Edited') and s.approver_user_id=?", (u,)).fetchone()[0]
 
 
+STYLE = """
+@font-face{font-family:"TASA Orbiter";font-style:normal;font-weight:400 600;font-display:swap;
+  src:local("TASA Orbiter"),local("TASAOrbiter"),url(/static/TASAOrbiterVF.woff2) format("woff2")}
+:root{--black:#0f0f12;--ink:#1e1e24;--grey-dark:#4b4b50;--grey-mid:#8f8f92;--grey-light:#bcbcbd;--line:#e5e5e6;
+  --bg:#f5f5f6;--white:#fff;--orange:#fe6700;--tint:rgba(254,103,0,.07)}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{font-family:"TASA Orbiter","TASAOrbiter","Segoe UI",system-ui,-apple-system,Arial,sans-serif;font-size:15px;line-height:1.4;letter-spacing:-.02em;
+  color:var(--black);background:var(--bg);-webkit-font-smoothing:antialiased}
+a{color:var(--black);text-decoration:none}
+a:hover{color:var(--orange)}
+.top{background:var(--black);color:var(--white);display:flex;align-items:center;justify-content:space-between;gap:1rem;
+  padding:.7rem 1.5rem;border-bottom:3px solid var(--orange)}
+.brand{font-size:1.1rem;font-weight:500;letter-spacing:-.02em}
+.brand .tag{font-size:.7rem;font-weight:400;color:var(--grey-light);border:1px solid rgba(255,255,255,.3);padding:.1rem .5rem;margin-left:.5rem}
+.who{display:flex;align-items:center;gap:.6rem;font-size:.85rem;color:var(--grey-light);margin:0}
+.top select{background:var(--ink);color:var(--white);border:1px solid rgba(255,255,255,.25)}
+.top input[type=submit]{background:transparent;color:var(--white);border:1px solid rgba(255,255,255,.3)}
+.top input[type=submit]:hover{background:var(--orange);border-color:var(--orange);color:var(--white)}
+.shell{display:flex;align-items:flex-start;gap:1.5rem;padding:1.5rem}
+.side{flex:0 0 200px;position:sticky;top:1rem}
+.side a{display:block;position:relative;padding:.5rem .8rem .5rem 1rem;color:var(--grey-dark)}
+.side a:hover{background:var(--white);color:var(--black)}
+.side a.cur{background:var(--white);color:var(--black);font-weight:500}
+.side a.cur::before{content:"";position:absolute;left:0;top:.45rem;bottom:.45rem;width:3px;background:var(--orange)}
+.me{margin-top:1.2rem;padding:.8rem 1rem;background:var(--white);border:1px solid var(--line);font-size:.8rem;color:var(--grey-dark)}
+.me b{display:block;color:var(--black);font-size:.9rem;font-weight:500}
+main{flex:1;min-width:0}
+h1{font-size:1.6rem;font-weight:450;letter-spacing:-.02em;margin:0 0 1rem}
+.card{background:var(--white);border:1px solid var(--line);padding:1.2rem 1.4rem;overflow-x:auto}
+h4{font-size:1.05rem;font-weight:500;letter-spacing:-.01em;margin:1.8rem 0 .4rem}
+h4:first-child,.card>h4:first-child{margin-top:0}
+p{margin:.55rem 0}
+small{color:var(--grey-dark);font-size:.8rem}
+.card a{text-decoration:underline;text-decoration-color:var(--grey-light);text-underline-offset:3px}
+.card a:hover{text-decoration-color:var(--orange)}
+table[border]{border:0;border-collapse:collapse;font-size:.85rem;margin:.4rem 0}
+.card .tabs{display:flex;flex-wrap:wrap;gap:.4rem;margin:0 0 .6rem}
+.card .tabs a{text-decoration:none;padding:.3rem .85rem;border:1px solid rgba(30,30,36,.3);font-size:.85rem}
+.card .tabs a:hover{border-color:var(--black);color:var(--orange)}
+.card .tabs a.cur{background:var(--black);color:var(--white);border-color:var(--black)}
+table[border] th{background:var(--black);color:var(--white);font-weight:450;text-align:left;padding:.45rem .65rem;border:0}
+table[border] td{padding:.35rem .65rem;border:0;border-bottom:1px solid var(--line)}
+table[border] tr:hover td{background:var(--tint)}
+table[border] td[align=right],table[border] td[align=center]{font-variant-numeric:tabular-nums}
+table[border="0"] th,table[border="0"] td,table[border="0"] tr:hover td{background:none;color:inherit;border:0;padding:.15rem .6rem .15rem 0}
+input[type=text],input[type=date],select{font:inherit;font-size:.9rem;height:2rem;padding:0 .6rem;color:var(--black);background:var(--white);
+  border:1px solid var(--grey-light);}
+input[type=text]:focus,input[type=date]:focus,select:focus{outline:2px solid var(--orange);outline-offset:1px;border-color:var(--orange)}
+table[border] input[type=text]{height:1.8rem;text-align:center;padding:0 .3rem}
+input[type=submit],input[type=button]{font:inherit;font-size:.85rem;font-weight:450;height:2.2rem;padding:0 1.1rem;cursor:pointer;
+  transition:color .3s,border-color .3s,background-color .3s}
+input[type=submit]{background:var(--black);color:var(--white);border:1px solid var(--black)}
+input[type=submit]:hover{background:var(--orange);border-color:var(--orange)}
+input[type=button]{background:transparent;color:var(--black);border:1px solid rgba(30,30,36,.3)}
+input[type=button]:hover{border-color:var(--black);color:var(--orange)}
+input[type=checkbox]{accent-color:var(--orange);width:1rem;height:1rem}
+.msg{margin:0 0 1rem;padding:.7rem 1rem;background:var(--bg);border-left:4px solid var(--black)}
+.msg.bad{border-left-color:var(--orange);background:var(--tint)}
+.msg p{margin:0 0 .3rem}
+.msg ul{margin:0;padding-left:1.2rem}
+.tg{color:var(--orange)}
+@media (max-width:820px){.shell{flex-direction:column}.side{position:static;flex:none;width:100%}.top{flex-wrap:wrap}}
+"""
+
+NAV_KEY = {"My": "timesheet", "Approvals": "approvals", "Reports": "reports", "CTR": "reports",
+           "Admin": "admin", "Edit": "admin", "Audit": "audit"}
+
+
 def layout(con, u, title, body):
     users = con.execute("select a.user_id, a.name, r.name as role_name, a.permission from app_user a "
                         "join role r on r.role_id=a.role_id order by a.name").fetchall()
@@ -98,22 +169,25 @@ def layout(con, u, title, body):
         " (%s)" % x["permission"] if x["permission"] != "user" else "") for x in users)
     me = me_row(con, u)
     perm = me["permission"] if me else None
-    menu = ['<a href="/timesheet?u=%d">My Timesheet</a>' % u]
+    items = [("timesheet", "My Timesheet", "/timesheet?u=%d" % u)]
     if is_approver(con, u):
-        menu.append('<a href="/approvals?u=%d">Approvals (%d)</a>' % (u, pending_for(con, u)))
+        items.append(("approvals", "Approvals (%d)" % pending_for(con, u), "/approvals?u=%d" % u))
     if perm != "admin":  # Admin (IT) manages users and job roles only: no reports
-        menu.append('<a href="/reports?u=%d">Reports</a>' % u)
+        items.append(("reports", "Reports", "/reports?u=%d" % u))
     if perm in ("controller", "admin"):
-        menu += ['<a href="/admin?u=%d">Admin</a>' % u, '<a href="/audit?u=%d">Audit trail</a>' % u]
-    who = "%s<br>%s (%s)<br>%s, %s" % (esc(me["name"]), esc(me["role_name"]), esc(me["skill_code"]), esc(me["family"]), esc(me["permission"])) if me else ""
+        items += [("admin", "Admin", "/admin?u=%d" % u), ("audit", "Audit trail", "/audit?u=%d" % u)]
+    cur = NAV_KEY.get(title.split(" ")[0])
+    menu = "".join('<a href="%s"%s>%s</a>' % (href, ' class="cur"' if key == cur else "", esc(label)) for key, label, href in items)
+    who = "<b>%s</b>%s (%s)<br>%s, %s" % (esc(me["name"]), esc(me["role_name"]), esc(me["skill_code"]), esc(me["family"]), esc(me["permission"])) if me else ""
     return (
-        "<html><head><title>%s</title></head><body>"
-        '<table width="100%%" border="0"><tr><td><b>NMC Timewriting</b> (mock)</td>'
-        '<td align="right"><form method="get" action="/timesheet">Signed in as: '
-        '<select name="u">%s</select> <input type="submit" value="Switch user"></form></td></tr></table><hr>'
-        '<table width="100%%" border="0"><tr valign="top"><td width="160">%s<br><br><small>%s</small></td>'
-        "<td><h3>%s</h3>%s</td></tr></table></body></html>"
-    ) % (esc(title), opts, "<br>".join(menu), who, esc(title), body)
+        '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>%s - NMC Timewriting</title><style>%s</style></head><body>"
+        '<header class="top"><div class="brand">NMC Timewriting<span class="tag">mock</span></div>'
+        '<form class="who" method="get" action="/timesheet">Signed in as '
+        '<select name="u">%s</select><input type="submit" value="Switch user"></form></header>'
+        '<div class="shell"><nav class="side">%s<div class="me">%s</div></nav>'
+        '<main><h1>%s</h1><div class="card">%s</div></main></div></body></html>'
+    ) % (esc(title), STYLE, opts, menu, who, esc(title), body)
 
 
 def no_access(con, u, title):
@@ -123,7 +197,8 @@ def no_access(con, u, title):
 def msgs_html(msgs, ok=False):
     if not msgs:
         return ""
-    return "<p><b>%s</b></p><ul>%s</ul>" % ("Done:" if ok else "Problems:", "".join("<li>%s</li>" % esc(m) for m in msgs))
+    return '<div class="msg%s"><p><b>%s</b></p><ul>%s</ul></div>' % (
+        "" if ok else " bad", "Done:" if ok else "Problems:", "".join("<li>%s</li>" % esc(m) for m in msgs))
 
 
 # ---------- My Timesheet ----------
@@ -212,7 +287,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
     trs = []
     day_tot = {d.isoformat(): 0.0 for d in days}
     for (pid, rid), r in rows.items():
-        tds = ["<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>" % (
+        tds = ['<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td style="white-space:nowrap">%s</td>' % (
             esc(r["client"]), esc(r["project"]), esc(r["scope"]), esc(r["phase"]), esc(r["skill"]))]
         rt = 0.0
         for d in days:
@@ -997,8 +1072,8 @@ def view_admin(con, u, t, msgs=None, ok=False):
     if not tabs or (t in dict(ADMIN_TABS) and not can_use_tab(con, u, t)):
         return no_access(con, u, "Admin")
     t = t if t in dict(tabs) else tabs[0][0]
-    links = " | ".join('<a href="/admin?u=%d&amp;t=%s">%s</a>' % (u, k, esc(v)) for k, v in tabs)
-    body = "%s<p>%s</p><h4>%s</h4>%s" % (msgs_html(msgs, ok), links, esc(dict(tabs)[t]), admin_body(con, u, t))
+    links = "".join('<a href="/admin?u=%d&amp;t=%s"%s>%s</a>' % (u, k, ' class="cur"' if k == t else "", esc(v)) for k, v in tabs)
+    body = '%s<p class="tabs">%s</p><h4>%s</h4>%s' % (msgs_html(msgs, ok), links, esc(dict(tabs)[t]), admin_body(con, u, t))
     return layout(con, u, "Admin", body)
 
 
@@ -1250,6 +1325,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_asset(self, path):
+        try:
+            with open(ASSETS[path][0], "rb") as f:
+                data = f.read()
+        except OSError:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ASSETS[path][1])
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
     def user_id(self, con, q):
         try:
             return int(q["u"][0])
@@ -1258,6 +1348,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlparse(self.path)
+        if url.path in ASSETS:
+            return self.send_asset(url.path)
         q = parse_qs(url.query)
         con = db()
         try:

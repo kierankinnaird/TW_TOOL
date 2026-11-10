@@ -7,19 +7,23 @@ SQLite mock of the v1 data model for the in-house timesheet system (CMAP replace
 ```
 db/
   schema.sql      tables, triggers (business rules), views
-  seed.sql        fake data (2 clients plus the Internal client with 3 internal codes, 29 job titles in job families, 28 users, 4 projects, 9 scopes, 10 phases, 52 entries over 2 weeks)
+  seed.sql        fake data (2 clients plus the Internal client with 3 internal codes, 29 job titles in job families, 30 users, 4 projects, 9 scopes, 10 phases, 52 entries over 2 weeks)
 app/
-  app.py          basic front end (plain HTML, standard library only)
+  app.py          front end (plain HTML and one inline stylesheet, standard library only, no framework)
+  static/         the TASA Orbiter font file, the only static file the app serves
 scripts/
   build.py        builds build/timewriting.db from schema + seed
   export_schema_tables.py   writes build/schema_tables.csv (columns as a table)
 tests/
   test_schema.py  unittest suite for the rules and views
   test_app.py     front-end smoke tests
-docs/
-  open-questions.md   gaps parked for later iterations
+docs/             source documents such as the SOR (git-ignored, kept on the local machine only)
 build/            generated .db files (git-ignored)
 ```
+
+## Look and feel
+
+NMC brand colours (orange `#fe6700`, black `#0f0f12`, off-white `#f5f5f6`), the TASA Orbiter font and square corners, all in one stylesheet in `app.py` (the `STYLE` block) with no external requests. The font is used from the machine if it is installed, otherwise the copy in `app/static/` is served; the route serves that one file only, never a path taken from the request. If the font file is missing, the app falls back to the system sans-serif font.
 
 ## Use
 

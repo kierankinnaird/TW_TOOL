@@ -43,6 +43,24 @@ class TestApp(unittest.TestCase):
                      "/admin?u=7&t=users", "/admin?u=7&t=periods", "/audit?u=7"]:
             self.assertIn("NMC Timewriting", self.get(path), path)
 
+    def test_brand_font_is_served_and_used(self):
+        with urllib.request.urlopen(self.base + "/static/TASAOrbiterVF.woff2") as r:
+            self.assertEqual(r.headers["Content-Type"], "font/woff2")
+            self.assertEqual(r.read(4), b"wOF2")
+        page = self.get("/reports?u=5")
+        self.assertIn('font-family:"TASA Orbiter"', page)
+        self.assertIn("/static/TASAOrbiterVF.woff2", page)
+
+    def test_only_the_listed_static_file_is_served(self):
+        for path in ["/static/app.py", "/static/../app.py", "/static/%2e%2e/app.py", "/static/TASAOrbiterVF.woff2/x"]:
+            with self.assertRaises(urllib.error.HTTPError, msg=path) as cm:
+                urllib.request.urlopen(self.base + path)
+            self.assertEqual(cm.exception.code, 404, path)
+            cm.exception.close()
+
+    def test_styling_has_square_corners(self):
+        self.assertNotIn("border-radius", self.get("/reports?u=5"))
+
     def test_timesheet_shows_cover_rows_and_totals(self):
         page = self.get("/timesheet?u=5&w=2026-11-02")
         self.assertIn("PM-04", page)
