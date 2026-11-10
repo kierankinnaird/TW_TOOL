@@ -559,6 +559,54 @@ class TestApp(unittest.TestCase):
         for marker in ("td.dn", "td.do", "td.dt", "td.gn", "td.go", "td.gt", "data-ot"):
             self.assertIn(marker, page, marker)
 
+    # ---------- copy last week (R15) ----------
+    def test_copy_last_weeks_rows_and_hours_as_drafts(self):
+        # Rob Millman (24) worked 4 hours offshore on BB0001 Define on Wednesday 28 Oct
+        self.assertIn("Copy last week's rows and hours", self.get("/timesheet?u=24&w=2026-11-02"))
+        page = self.post("/timesheet/copy", {"u": "24", "w": "2026-11-02", "copy_hours": "x"})
+        self.assertIn("1 entry copied from the week commencing 26/10/2026 as drafts", page)
+        self.assertEqual(self.hours_of(24, "2026-11-04"), [(2, 0, 4, "Draft")])  # the same weekday a week on, still offshore, a draft
+        # copying again changes nothing: what is filled in is left alone
+        self.assertIn("already filled in", self.post("/timesheet/copy", {"u": "24", "w": "2026-11-02", "copy_hours": "x"}))
+        self.assertEqual(self.hours_of(24, "2026-11-04"), [(2, 0, 4, "Draft")])
+
+    def test_copy_keeps_the_overtime_flag(self):
+        # Neil Pennock (21) did 8 hours of overtime on Monday 2 Nov on BB0001 Execute: copy it onto the week of 9 Nov
+        self.admin_post("/admin/period", {"action": "open", "week_start": "2026-11-09"})  # it may exist already, which is fine
+        self.assertIn("1 entry copied", self.post("/timesheet/copy", {"u": "21", "w": "2026-11-09", "copy_hours": "x"}))
+        self.assertEqual(self.hours_of(21, "2026-11-09"), [(1, 1, 8, "Draft")])
+
+    def test_copy_rows_only_adds_empty_rows_and_saves_nothing(self):
+        # Arlene Chalmers (23) booked BB0001 Define on Tuesday 27 Oct as a Document Controller (role 10)
+        page = self.post("/timesheet/copy", {"u": "23", "w": "2026-11-02", "copy_rows": "x"})
+        self.assertIn("1 row copied from the week commencing 26/10/2026", page)
+        self.assertIn('name="h_1_10_1_0_2026-11-03"', page)  # an empty box for that row
+        self.assertEqual(self.one("select count(*) from time_entry where user_id=23 and work_date >= '2026-11-02'")[0], 0)
+        # the row stays through Save draft, which keeps unsaved rows
+        page = self.post("/timesheet/save", {"u": "23", "w": "2026-11-02", "action": "Save draft", "reason": "",
+                                             "add": "1:10:1:0", "h_1_10_1_0_2026-11-03": "3"})
+        self.assertIn("1 entry saved", page)
+        self.assertEqual(self.hours_of(23, "2026-11-03"), [(1, 0, 3, "Draft")])
+
+    def test_copy_says_what_it_could_not_copy(self):
+        con = app.db()
+        con.execute("update paaf set expiry_date='2026-10-31' where user_id=24 and client_id=1")  # Rob's Apache PAAF ends before 4 Nov
+        con.commit()
+        con.close()
+        page = self.post("/timesheet/copy", {"u": "24", "w": "2026-11-02", "copy_hours": "x"})
+        self.assertIn("1 entry could not be copied", page)
+        self.assertIn("PAAF has expired", page)
+        self.assertEqual(self.hours_of(24, "2026-11-04"), [])
+
+    def test_nothing_to_copy_and_no_buttons_when_copying_is_not_possible(self):
+        # David Hart (4) has no hours in the week of 26 Oct
+        self.assertIn("Nothing to copy", self.post("/timesheet/copy", {"u": "4", "w": "2026-11-02", "copy_hours": "x"}))
+        self.assertNotIn("Copy last week", self.get("/timesheet?u=4&w=2026-11-02"))
+        # a closed week offers no copying either
+        self.assertIn("Copy last week", self.get("/timesheet?u=24&w=2026-11-02"))
+        self.admin_post("/admin/period", {"action": "close", "week_start": "2026-11-02"})
+        self.assertNotIn("Copy last week", self.get("/timesheet?u=24&w=2026-11-02"))
+
     # ---------- start and end dates, PAAF expiry (R07) ----------
     def test_no_input_boxes_outside_a_persons_start_and_end_dates(self):
         # Ewan Shaw (5) leaves on Wednesday 4 Nov: there are no boxes from the Thursday, and saving there is refused

@@ -65,6 +65,8 @@ Weekly periods open themselves: the first request in a new week creates that wee
 
 On the timesheet, the row, day and week totals update as hours are typed, before saving. Under the grid there are three lines: Normal time, Overtime and Total.
 
+**Copy last week:** when last week has hours and this week is open, the timesheet offers two buttons. "Copy last week's rows and hours" saves last week's hours as drafts on the same weekdays, with the same code, skill code, location and overtime flag; "Copy last week's rows only" adds the same empty rows for you to fill in. Anything already filled in is left alone, and anything that cannot be copied (for example a PAAF that has expired, or a day outside your start and end dates) is reported, not skipped silently. Copying uses the same booking rules as saving, so rates are looked up for the new date.
+
 ## Hour types: location and overtime
 
 Every timesheet row has a **location** (On site or Offshore) and a **type** (Normal or Overtime), so one person can book the same code on the same day as normal time, as overtime, on site and offshore, each on its own row. "Add row" has a Location dropdown and an Overtime tick box. Every entry stores both (`location_id` and `overtime`); changing either on approved hours is a controlled edit (needs a reason, goes back for approval) and the audit trail keeps the old values.

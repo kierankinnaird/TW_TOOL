@@ -340,6 +340,17 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
             "from %s" % dmy(start) if start > d0 and (end is None or end >= d6) else
             "until %s" % dmy(end) if (start <= d0) else "from %s until %s" % (dmy(start), dmy(end))))
 
+    prev_d = w - datetime.timedelta(days=7)
+    prev_n = con.execute("select count(*) from time_entry where user_id=? and work_date between ? and ?",
+                         (u, prev_d.isoformat(), (prev_d + datetime.timedelta(days=6)).isoformat())).fetchone()[0]
+    if prev_n and open_week and not week_inactive:
+        b.append('<form method="post" action="/timesheet/copy"><input type="hidden" name="u" value="%d"><input type="hidden" name="w" value="%s">'
+                 '<p>Last week (commencing %s) you booked %d entr%s. '
+                 '<input type="submit" name="copy_hours" value="Copy last week\'s rows and hours"> '
+                 '<input type="submit" name="copy_rows" value="Copy last week\'s rows only"> '
+                 '<small>Copied hours are saved as drafts for you to check. Nothing already filled in is changed.</small></p></form>' % (
+                     u, d0, prev_d.strftime("%d/%m/%Y"), prev_n, "y" if prev_n == 1 else "ies"))
+
     adds_hidden = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"])
     b.append('<form method="post" action="/timesheet/save">'
              '<input type="hidden" name="u" value="%d"><input type="hidden" name="w" value="%s">%s' % (u, d0, adds_hidden))
@@ -425,6 +436,33 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
     return layout(con, u, "My Timesheet", "".join(b))
 
 
+def book_entry(con, u, pid, rid, lid, ot, date, hours):
+    """Create one Draft entry for u. Returns None when it is booked, or a short reason when it cannot be (no rate, no PAAF, location
+    switched off). The database rules (open scope, start and end dates, PAAF expiry, open week) raise sqlite3.DatabaseError instead."""
+    info = con.execute("select s.scope_id, s.client_id, c.is_internal from phase ph join scope s on s.scope_id=ph.scope_id "
+                       "join client c on c.client_id=s.client_id where ph.phase_id=?", (pid,)).fetchone()
+    if not info:
+        return "that booking code does not exist."
+    loc = con.execute("select active from location where location_id=?", (lid,)).fetchone()
+    if not loc or not loc[0] or ot not in (0, 1):
+        return "that location is not available."
+    if info["is_internal"]:  # NMC pays for these hours: no PAAF, no sales rate
+        paaf_id = rate_id = None
+    else:
+        rate = con.execute("select rate_id from rate where client_id=? and role_id=? and effective_from<=? "
+                           "order by effective_from desc limit 1", (info["client_id"], rid, date)).fetchone()
+        paaf = con.execute("select paaf_id from paaf where user_id=? and client_id=?", (u, info["client_id"])).fetchone()
+        if not rate:
+            return "no rate for that skill code on this client."
+        if not paaf:
+            return "you have no PAAF for this client."
+        paaf_id, rate_id = paaf[0], rate[0]
+    con.execute("insert into time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, "
+                "status, created_by, location_id, overtime) values (?,?,?,?,?,?,?,?, 'Draft', ?, ?, ?)",
+                (u, info["scope_id"], pid, paaf_id, rid, rate_id, date, hours, u, lid, ot))
+    return None
+
+
 def save_timesheet(con, form):
     u, w = int(form["u"][0]), datetime.date.fromisoformat(form["w"][0])
     action = form.get("action", ["Save draft"])[0]
@@ -445,7 +483,6 @@ def save_timesheet(con, form):
                            "where ph.phase_id=?", (pid,)).fetchone()
         if not info:
             continue
-        sid = info["scope_id"]
         label = "%s %s, %s" % (info["scope_code"], info["phase"], date)
         existing = con.execute("select * from time_entry where user_id=? and phase_id=? and worked_role_id=? and work_date=? "
                                "and location_id=? and overtime=?", (u, pid, rid, date, lid, ot)).fetchone()
@@ -481,28 +518,10 @@ def save_timesheet(con, form):
                                 "last_change_reason=?, last_edited_by=?, last_edited_at=? where entry_id=?",
                                 (hours, reason, u, stamp(), existing["entry_id"]))
             else:
-                loc = con.execute("select active from location where location_id=?", (lid,)).fetchone()
-                if not loc or not loc[0] or ot not in (0, 1):
-                    msgs.append("%s: that location is not available." % label)
+                problem = book_entry(con, u, pid, rid, lid, ot, date, hours)
+                if problem:
+                    msgs.append("%s: %s" % (label, problem))
                     continue
-                client_id, internal = con.execute("select s.client_id, c.is_internal from scope s join client c on c.client_id=s.client_id "
-                                                  "where s.scope_id=?", (sid,)).fetchone()
-                if internal:  # NMC pays for these hours: no PAAF, no sales rate
-                    paaf_id = rate_id = None
-                else:
-                    rate = con.execute("select rate_id from rate where client_id=? and role_id=? and effective_from<=? "
-                                       "order by effective_from desc limit 1", (client_id, rid, date)).fetchone()
-                    paaf = con.execute("select paaf_id from paaf where user_id=? and client_id=?", (u, client_id)).fetchone()
-                    if not rate:
-                        msgs.append("%s: no rate for that skill code on this client." % label)
-                        continue
-                    if not paaf:
-                        msgs.append("%s: you have no PAAF for this client." % label)
-                        continue
-                    paaf_id, rate_id = paaf[0], rate[0]
-                con.execute("insert into time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, "
-                            "status, created_by, location_id, overtime) values (?,?,?,?,?,?,?,?, 'Draft', ?, ?, ?)",
-                            (u, sid, pid, paaf_id, rid, rate_id, date, hours, u, lid, ot))
             saved += 1
         except sqlite3.DatabaseError as e:
             msgs.append("%s: %s" % (label, e))
@@ -521,6 +540,46 @@ def save_timesheet(con, form):
     con.commit()
     body_msgs = ok_msgs if not msgs else msgs + ok_msgs
     return view_timesheet(con, u, w, body_msgs, adds, ok=not msgs)
+
+
+def copy_week(con, form):
+    """Copy last week onto the week shown: just the rows (phase, skill code, location, overtime), or the rows and the hours on the same
+    weekdays, saved as drafts. Anything already filled in is left alone, and what cannot be copied is reported."""
+    u, w = int(form["u"][0]), datetime.date.fromisoformat(form["w"][0])
+    prev = w - datetime.timedelta(days=7)
+    src = con.execute("select * from time_entry where user_id=? and work_date between ? and ? order by work_date, entry_id",
+                      (u, prev.isoformat(), (prev + datetime.timedelta(days=6)).isoformat())).fetchall()
+    since = prev.strftime("%d/%m/%Y")
+    if not src:
+        return view_timesheet(con, u, w, ["Nothing to copy: you have no hours in the week commencing %s." % since])
+    if "copy_rows" in form:  # empty rows for the same codes, nothing is saved until hours are typed in
+        rows = list(dict.fromkeys((e["phase_id"], e["worked_role_id"], e["location_id"], e["overtime"]) for e in src))
+        return view_timesheet(con, u, w, ["%d row%s copied from the week commencing %s. Fill in the hours, then Save draft." % (
+            len(rows), "" if len(rows) == 1 else "s", since)], rows, ok=True)
+    copied = skipped = 0
+    problems = {}
+    for e in src:
+        date = (datetime.date.fromisoformat(e["work_date"]) + datetime.timedelta(days=7)).isoformat()
+        if con.execute("select 1 from time_entry where user_id=? and phase_id=? and worked_role_id=? and work_date=? "
+                       "and location_id=? and overtime=?", (u, e["phase_id"], e["worked_role_id"], date, e["location_id"], e["overtime"])).fetchone():
+            skipped += 1
+            continue
+        try:
+            problem = book_entry(con, u, e["phase_id"], e["worked_role_id"], e["location_id"], e["overtime"], date, e["hours"])
+        except sqlite3.DatabaseError as ex:
+            problem = str(ex)
+        if problem:
+            problems[problem] = problems.get(problem, 0) + 1
+        else:
+            copied += 1
+    con.commit()
+    msgs = ["%d entr%s could not be copied: %s" % (n, "y" if n == 1 else "ies", reason) for reason, n in problems.items()]
+    if copied:
+        msgs.append("%d entr%s copied from the week commencing %s as drafts. Check the hours, then Submit week." % (
+            copied, "y" if copied == 1 else "ies", since))
+    if skipped:
+        msgs.append("%d already filled in, left as %s." % (skipped, "it is" if skipped == 1 else "they are"))
+    return view_timesheet(con, u, w, msgs, ok=not problems)
 
 
 # ---------- Approvals ----------
@@ -1693,6 +1752,8 @@ class Handler(BaseHTTPRequestHandler):
             ensure_current_period(con)
             if self.path == "/timesheet/save":
                 self.send_html(save_timesheet(con, form))
+            elif self.path == "/timesheet/copy":
+                self.send_html(copy_week(con, form))
             elif self.path == "/approvals/act":
                 self.send_html(act_approval(con, form))
             elif self.path == "/admin/period":
