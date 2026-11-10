@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, quote, urlparse
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
 # Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
-REQUIRED_SCHEMA = 4
+REQUIRED_SCHEMA = 5
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
 ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "TASAOrbiterVF.woff2"), "font/woff2")}
 
@@ -183,7 +183,7 @@ input[type=checkbox]{accent-color:var(--orange);width:1rem;height:1rem}
 @media (max-width:820px){.shell{flex-direction:column}.side{position:static;flex:none;width:100%}.top{flex-wrap:wrap}}
 """
 
-NAV_KEY = {"My": "timesheet", "Approvals": "approvals", "Missing": "missing", "Reports": "reports", "CTR": "reports",
+NAV_KEY = {"My": "timesheet", "Approvals": "approvals", "Missing": "missing", "Reopen": "reopen", "Reports": "reports", "CTR": "reports",
            "Admin": "admin", "Edit": "admin", "Audit": "audit"}
 
 
@@ -195,12 +195,16 @@ def layout(con, u, title, body):
         " (%s)" % x["permission"] if x["permission"] != "user" else "") for x in users)
     me = me_row(con, u)
     perm = me["permission"] if me else None
-    n_back = con.execute("select count(*) from time_entry where user_id=? and status='Draft' and reject_reason is not null", (u,)).fetchone()[0]
-    items = [("timesheet", "My Timesheet%s" % (" (%d sent back)" % n_back if n_back else ""), "/timesheet?u=%d" % u)]
+    n_back, n_open = con.execute("select sum(reject_reason is not null), sum(reopen_reason is not null) from time_entry "
+                                 "where user_id=? and status='Draft'", (u,)).fetchone()
+    note = ", ".join(x for x in ("%d sent back" % n_back if n_back else "", "%d reopened" % n_open if n_open else "") if x)
+    items = [("timesheet", "My Timesheet%s" % (" (%s)" % note if note else ""), "/timesheet?u=%d" % u)]
     if approval_queue(con, u) is not None:
         items.append(("approvals", "Approvals (%d)" % pending_for(con, u), "/approvals?u=%d" % u))
     if perm == "controller" or is_approver(con, u):  # who has not completed a timesheet: everyone for cost controllers, their own people for approvers
         items.append(("missing", "Missing timesheets", "/missing?u=%d" % u))
+    if perm == "controller":  # reopening a person's submitted or approved timesheet
+        items.append(("reopen", "Reopen timesheet", "/reopen?u=%d" % u))
     if perm != "admin":  # Admin (IT) manages users and job roles only: no reports
         items.append(("reports", "Reports", "/reports?u=%d" % u))
     if perm in ("controller", "admin"):
@@ -341,37 +345,48 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
             "from %s" % dmy(start) if start > d0 and (end is None or end >= d6) else
             "until %s" % dmy(end) if (start <= d0) else "from %s until %s" % (dmy(start), dmy(end))))
 
+    def when(t):  # 2026-11-06 10:00:00 -> 06/11/2026 10:00
+        return "%s/%s/%s %s" % (t[8:10], t[5:7], t[0:4], t[11:16]) if t and len(t) >= 16 else ""
+
+    def banner(title, advice, found, reason_key, audit_sql, verb):
+        groups = {}  # entries sent back or reopened together share one reason, so it is shown once
+        for e in found:
+            a = con.execute(audit_sql, (e["entry_id"],)).fetchone()
+            by = " (%s by %s on %s)" % (verb, esc(a["who"] or "someone"), when(a["changed_at"])) if a else ""
+            groups.setdefault((e[reason_key], by), []).append("%s %s, %s: %s hours (%s%s)" % (
+                esc(e["scope_code"]), esc(e["phase"]), datetime.date.fromisoformat(e["work_date"]).strftime("%a %d/%m"), fmt(e["hours"]),
+                esc(e["location_name"]), ", overtime" if e["overtime"] else ""))
+        lines = ["<li><b>Reason:</b> %s%s<br>%s</li>" % (esc(reason), by, "; ".join(items)) for (reason, by), items in groups.items()]
+        b.append('<div class="msg bad"><p><b>%s</b></p><ul>%s</ul><p>%s</p></div>' % (title, "".join(lines), advice))
+
     sent_back = [e for e in entries if e["status"] == "Draft" and e["reject_reason"]]
     if sent_back:
-        def when(t):  # 2026-11-06 10:00:00 -> 06/11/2026 10:00
-            return "%s/%s/%s %s" % (t[8:10], t[5:7], t[0:4], t[11:16]) if t and len(t) >= 16 else ""
-        lines = []
-        for e in sent_back:
-            a = con.execute("select ch.name as who, a.changed_at from time_entry_audit a left join app_user ch on ch.user_id=a.changed_by "
-                            "where a.entry_id=? and a.old_status='Submitted' and a.new_status='Draft' order by a.audit_id desc limit 1",
-                            (e["entry_id"],)).fetchone()
-            lines.append("<li>%s %s, %s: %s hours (%s%s). <b>Reason:</b> %s%s</li>" % (
-                esc(e["scope_code"]), esc(e["phase"]), datetime.date.fromisoformat(e["work_date"]).strftime("%a %d/%m"), fmt(e["hours"]),
-                esc(e["location_name"]), ", overtime" if e["overtime"] else "", esc(e["reject_reason"]),
-                " (sent back by %s on %s)" % (esc(a["who"] or "an approver"), when(a["changed_at"])) if a else ""))
-        b.append('<div class="msg bad"><p><b>Sent back for correction</b></p><ul>%s</ul>'
-                 "<p>Change the hours or the code if needed, then <b>Submit week</b> again.</p></div>" % "".join(lines))
+        banner("Sent back for correction", "Change the hours or the code if needed, then <b>Submit week</b> again.", sent_back, "reject_reason",
+               "select ch.name as who, a.changed_at from time_entry_audit a left join app_user ch on ch.user_id=a.changed_by "
+               "where a.entry_id=? and a.old_status='Submitted' and a.new_status='Draft' order by a.audit_id desc limit 1", "sent back")
+    reopened = [e for e in entries if e["status"] == "Draft" and e["reopen_reason"]]
+    if reopened:
+        banner("Reopened by a cost controller", "Change what is needed, then <b>Submit week</b> again.", reopened, "reopen_reason",
+               "select ch.name as who, a.changed_at from time_entry_audit a left join app_user ch on ch.user_id=a.changed_by "
+               "where a.entry_id=? and a.new_status='Draft' and a.reason like 'Reopened:%' order by a.audit_id desc limit 1", "reopened")
     elsewhere = [r for r in con.execute(
         "select date(work_date,'weekday 0','-6 days') as wk, count(*) as n from time_entry "
-        "where user_id=? and status='Draft' and reject_reason is not null group by wk order by wk", (u,)) if r["wk"] != d0]
+        "where user_id=? and status='Draft' and (reject_reason is not null or reopen_reason is not null) group by wk order by wk", (u,)) if r["wk"] != d0]
     if elsewhere:
-        b.append("<p><small>You also have hours sent back in: %s.</small></p>" % ", ".join(
+        b.append("<p><small>You also have hours sent back or reopened in: %s.</small></p>" % ", ".join(
             '<a href="/timesheet?u=%d&amp;w=%s">week commencing %s (%d)</a>' % (
                 u, r["wk"], datetime.date.fromisoformat(r["wk"]).strftime("%d/%m/%Y"), r["n"]) for r in elsewhere))
     prev_d = w - datetime.timedelta(days=7)
     prev_n = con.execute("select count(*) from time_entry where user_id=? and work_date between ? and ?",
                          (u, prev_d.isoformat(), (prev_d + datetime.timedelta(days=6)).isoformat())).fetchone()[0]
-    if prev_n and open_week and not week_inactive:
-        b.append('<form method="post" action="/timesheet/copy"><input type="hidden" name="u" value="%d"><input type="hidden" name="w" value="%s">'
+    locked_n = sum(1 for e in entries if e["status"] != "Draft")
+    if prev_n and open_week and not week_inactive and not locked_n:  # a week with submitted or approved hours in it cannot be replaced
+        has_drafts = any(e["status"] == "Draft" for e in entries)
+        b.append('<form method="post" action="/timesheet/copy"%s><input type="hidden" name="u" value="%d"><input type="hidden" name="w" value="%s">'
                  '<p>Last week (commencing %s) you booked %d entr%s. '
-                 '<input type="submit" name="copy_hours" value="Copy last week\'s rows and hours"> '
-                 '<input type="submit" name="copy_rows" value="Copy last week\'s rows only"> '
-                 '<small>Copied hours are saved as drafts for you to check. Nothing already filled in is changed.</small></p></form>' % (
+                 '<input type="submit" name="copy_hours" value="Copy last week"> '
+                 '<small>This replaces whatever is in this week now with last week\'s rows and hours, saved as drafts for you to check.</small></p></form>' % (
+                     ' onsubmit="return confirm(\'This clears the draft hours already in this week. Continue?\');"' if has_drafts else "",
                      u, d0, prev_d.strftime("%d/%m/%Y"), prev_n, "y" if prev_n == 1 else "ies"))
 
     adds_hidden = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"])
@@ -397,11 +412,12 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
                 rt += e["hours"]
                 day_tot[iso] += e["hours"]
                 (day_ot if ot else day_norm)[iso] += e["hours"]
-                if e["status"] == "Submitted" or (e["status"] == "Draft" and not open_week):
+                if e["status"] != "Draft" or not open_week:  # submitted, approved and edited hours are locked until a cost controller reopens them
                     cell = fmt(e["hours"])
                     fixed = ' data-h="%s"' % fmt(e["hours"])
                 else:
-                    why = ' title="Sent back: %s"' % esc(e["reject_reason"]) if e["status"] == "Draft" and e["reject_reason"] else ""
+                    why = (' title="Sent back: %s"' % esc(e["reject_reason"]) if e["status"] == "Draft" and e["reject_reason"] else
+                           ' title="Reopened: %s"' % esc(e["reopen_reason"]) if e["status"] == "Draft" and e["reopen_reason"] else "")
                     cell = '<input type="text" size="4" name="%s" value="%s"%s>' % (name, fmt(e["hours"]), why)
             tds.append('<td align="center" class="c" data-day="%s"%s>%s</td>' % (iso, fixed, cell))
         tds.append('<td align="right" class="rt">%s</td>' % fmt(rt))
@@ -422,8 +438,8 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
     b.append("<p><b>Hours this week (all statuses): %s</b> &nbsp; Approved %s, Edited %s, Submitted %s, Draft %s</p>" % (
         fmt(sum(by_status.values())), fmt(by_status["Approved"]), fmt(by_status["Edited"]), fmt(by_status["Submitted"]), fmt(by_status["Draft"])))
     b.append("<p><small>To clear a draft entry, empty its box and click Save draft.</small></p>")
-    b.append('<p>Reason for changing approved hours (needed if you change hours that have already been approved): '
-             '<input type="text" name="reason" size="60"></p>')
+    if any(e["status"] != "Draft" for e in entries):
+        b.append("<p><small>Submitted and approved hours are locked. If one needs changing, ask a cost controller to reopen the timesheet.</small></p>")
     b.append('<p><input type="submit" name="action" value="Save draft"> '
              '<input type="submit" name="action" value="Submit week"></p></form>')
 
@@ -490,7 +506,6 @@ def book_entry(con, u, pid, rid, lid, ot, date, hours):
 def save_timesheet(con, form):
     u, w = int(form["u"][0]), datetime.date.fromisoformat(form["w"][0])
     action = form.get("action", ["Save draft"])[0]
-    reason = form.get("reason", [""])[0].strip()
     adds = parse_adds(form.get("add", []))
     msgs, saved, cleared = [], 0, 0
     d0, d6 = w.isoformat(), (w + datetime.timedelta(days=6)).isoformat()
@@ -519,8 +534,8 @@ def save_timesheet(con, form):
                     cleared += 1
                 except sqlite3.DatabaseError as e:
                     msgs.append("%s: %s" % (label, e))
-            elif existing and existing["status"] != "Submitted":
-                msgs.append("%s: approved hours cannot be cleared. Change the hours (with a reason) or ask an admin." % label)
+            elif existing:
+                msgs.append("%s: %s hours are locked. Ask a cost controller to reopen the timesheet." % (label, existing["status"].lower()))
             continue
         try:
             hours = float(raw)
@@ -529,18 +544,13 @@ def save_timesheet(con, form):
             continue
         try:
             if existing:
-                if existing["status"] == "Submitted" or abs(existing["hours"] - hours) < 1e-9:
+                if abs(existing["hours"] - hours) < 1e-9:
                     continue
-                if existing["status"] == "Draft":
-                    con.execute("update time_entry set hours=?, last_edited_by=?, last_edited_at=? where entry_id=?",
-                                (hours, u, stamp(), existing["entry_id"]))
-                else:
-                    if not reason:
-                        msgs.append("%s: a reason is needed to change approved hours." % label)
-                        continue
-                    con.execute("update time_entry set hours=?, status='Edited', edit_count=edit_count+1, "
-                                "last_change_reason=?, last_edited_by=?, last_edited_at=? where entry_id=?",
-                                (hours, reason, u, stamp(), existing["entry_id"]))
+                if existing["status"] != "Draft":
+                    msgs.append("%s: %s hours are locked. Ask a cost controller to reopen the timesheet." % (label, existing["status"].lower()))
+                    continue
+                con.execute("update time_entry set hours=?, last_edited_by=?, last_edited_at=? where entry_id=?",
+                            (hours, u, stamp(), existing["entry_id"]))
             else:
                 problem = book_entry(con, u, pid, rid, lid, ot, date, hours)
                 if problem:
@@ -567,8 +577,8 @@ def save_timesheet(con, form):
 
 
 def copy_week(con, form):
-    """Copy last week onto the week shown: just the rows (phase, skill code, location, overtime), or the rows and the hours on the same
-    weekdays, saved as drafts. Anything already filled in is left alone, and what cannot be copied is reported."""
+    """Replace the week shown with last week's rows and hours on the same weekdays, saved as drafts. The draft hours already in the week
+    are cleared first. A week that has submitted or approved hours cannot be replaced, and what cannot be copied is reported."""
     u, w = int(form["u"][0]), datetime.date.fromisoformat(form["w"][0])
     prev = w - datetime.timedelta(days=7)
     src = con.execute("select * from time_entry where user_id=? and work_date between ? and ? order by work_date, entry_id",
@@ -576,18 +586,19 @@ def copy_week(con, form):
     since = prev.strftime("%d/%m/%Y")
     if not src:
         return view_timesheet(con, u, w, ["Nothing to copy: you have no hours in the week commencing %s." % since])
-    if "copy_rows" in form:  # empty rows for the same codes, nothing is saved until hours are typed in
-        rows = list(dict.fromkeys((e["phase_id"], e["worked_role_id"], e["location_id"], e["overtime"]) for e in src))
-        return view_timesheet(con, u, w, ["%d row%s copied from the week commencing %s. Fill in the hours, then Save draft." % (
-            len(rows), "" if len(rows) == 1 else "s", since)], rows, ok=True)
-    copied = skipped = 0
+    d0, d6 = w.isoformat(), (w + datetime.timedelta(days=6)).isoformat()
+    if con.execute("select 1 from time_entry where user_id=? and status<>'Draft' and work_date between ? and ?", (u, d0, d6)).fetchone():
+        return view_timesheet(con, u, w, ["This week has submitted or approved hours, so it cannot be replaced. "
+                                          "Ask a cost controller to reopen the timesheet first."])
+    cleared = 0
+    for e in con.execute("select entry_id from time_entry where user_id=? and status='Draft' and work_date between ? and ?", (u, d0, d6)).fetchall():
+        con.execute("update time_entry set last_edited_by=?, last_edited_at=? where entry_id=?", (u, stamp(), e["entry_id"]))
+        con.execute("delete from time_entry where entry_id=?", (e["entry_id"],))
+        cleared += 1
+    copied = 0
     problems = {}
     for e in src:
         date = (datetime.date.fromisoformat(e["work_date"]) + datetime.timedelta(days=7)).isoformat()
-        if con.execute("select 1 from time_entry where user_id=? and phase_id=? and worked_role_id=? and work_date=? "
-                       "and location_id=? and overtime=?", (u, e["phase_id"], e["worked_role_id"], date, e["location_id"], e["overtime"])).fetchone():
-            skipped += 1
-            continue
         try:
             problem = book_entry(con, u, e["phase_id"], e["worked_role_id"], e["location_id"], e["overtime"], date, e["hours"])
         except sqlite3.DatabaseError as ex:
@@ -601,8 +612,9 @@ def copy_week(con, form):
     if copied:
         msgs.append("%d entr%s copied from the week commencing %s as drafts. Check the hours, then Submit week." % (
             copied, "y" if copied == 1 else "ies", since))
-    if skipped:
-        msgs.append("%d already filled in, left as %s." % (skipped, "it is" if skipped == 1 else "they are"))
+    if cleared:
+        msgs.append("%d draft entr%s that w%s in this week %s replaced." % (
+            cleared, "y" if cleared == 1 else "ies", "as" if cleared == 1 else "ere", "was" if cleared == 1 else "were"))
     return view_timesheet(con, u, w, msgs, ok=not problems)
 
 
@@ -673,7 +685,7 @@ def act_approval(con, form):
                 if cur and cur[0] != "Submitted":
                     msgs.append("Entry %d: only submitted entries can be rejected." % eid)
                     continue
-                con.execute("update time_entry set status='Draft', reject_reason=?, last_edited_by=?, last_edited_at=? "
+                con.execute("update time_entry set status='Draft', reject_reason=?, reopen_reason=NULL, last_edited_by=?, last_edited_at=? "
                             "where entry_id=?", (reason, u, stamp(), eid))
             done += 1
         except sqlite3.DatabaseError as e:
@@ -727,7 +739,7 @@ def view_missing(con, u, q):
     week = {r["user_id"]: r for r in con.execute(
         "select user_id, sum(status<>'Draft') as n_sub, sum(status='Draft') as n_draft, "
         "sum(case when status<>'Draft' then hours else 0 end) as h_sub, sum(case when status='Draft' then hours else 0 end) as h_draft, "
-        "sum(status='Draft' and reject_reason is not null) as n_back from time_entry where work_date between ? and ? group by user_id", (d0, d6))}
+        "sum(status='Draft' and (reject_reason is not null or reopen_reason is not null)) as n_back from time_entry where work_date between ? and ? group by user_id", (d0, d6))}
 
     order = ["Submitted", "Partly submitted", "Draft only", "Not started"]
     counts = dict.fromkeys(order, 0)
@@ -737,11 +749,13 @@ def view_missing(con, u, q):
         status = week_status(a["n_sub"] if a else 0, a["n_draft"] if a else 0)
         counts[status] += 1
         if show == "all" or show == status or (show == "missing" and status != "Submitted"):
-            rows.append('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td align="right">%s</td><td align="right">%s</td><td align="right">%s</td></tr>' % (
+            rows.append('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td align="right">%s</td><td align="right">%s</td><td align="right">%s</td>%s</tr>' % (
                 esc(p["name"]), esc(p["nmc_id"]), esc(p["title"]), esc(p["employment_type"]),
                 status if status == "Submitted" else "<b>%s</b>" % status,
                 fmt(a["h_sub"]) if a and a["h_sub"] else "", fmt(a["h_draft"]) if a and a["h_draft"] else "",
-                a["n_back"] if a and a["n_back"] else ""))
+                a["n_back"] if a and a["n_back"] else "",
+                ('<td><a href="/reopen?u=%d&amp;person=%d&amp;w=%s">Reopen</a></td>' % (u, p["user_id"], d0)
+                 if status in ("Submitted", "Partly submitted") else "<td></td>") if perm == "controller" else ""))
 
     def link(w_, s_, label):
         return '<a href="/missing?u=%d&amp;w=%s&amp;s=%s">%s</a>' % (u, w_.isoformat(), quote(s_), label)
@@ -760,16 +774,113 @@ def view_missing(con, u, q):
     b.append("<p><b>%d</b> expected: %s.</p>" % (len(people), ", ".join(
         link(w, st, "%d %s" % (counts[st], st.lower())) for st in order)))
     b.append("<p><small>%s Submitted counts submitted, approved and edited hours. Draft hours are saved but not submitted. "
-             "Sent back is the number of entries an approver rejected that have not been submitted again. "
+             "Sent back counts entries an approver rejected or a cost controller reopened that have not been submitted again. "
              "Everyone whose start and end dates cover any part of the week is expected, including the weeks still in progress.</small></p>" % (
                  "Everyone who is active that week." if perm == "controller" else
                  "Your people: those with an approved PAAF for a client you approve, and anyone who has booked to your internal codes."))
     if rows:
         b.append('<table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>NMC ID</th><th>Job title</th><th>Employment</th>'
-                 '<th>Status</th><th>Submitted hrs</th><th>Draft hrs</th><th>Sent back</th></tr>%s</table>' % "".join(rows))
+                 '<th>Status</th><th>Submitted hrs</th><th>Draft hrs</th><th>Sent back</th>%s</tr>%s</table>' % (
+                     "<th></th>" if perm == "controller" else "", "".join(rows)))
     else:
         b.append("<p>%s</p>" % ("Everyone has submitted for this week." if show == "missing" else "Nobody matches this filter."))
     return layout(con, u, "Missing timesheets", "".join(b))
+
+
+# ---------- Reopen a timesheet ----------
+def view_reopen(con, u, q, msgs=None, ok=False):
+    """A cost controller picks a person and a week, sees what they booked, and sends the submitted or approved hours back to Draft."""
+    if permission_of(con, u) != "controller":
+        return no_access(con, u, "Reopen timesheet")
+    try:
+        person = int(q.get("person", [""])[0])
+    except ValueError:
+        person = None
+    try:
+        w = monday(datetime.date.fromisoformat(q["w"][0]))
+    except (KeyError, ValueError):
+        w = monday(datetime.date.today()) - datetime.timedelta(days=7)  # the last completed week
+    d0, d6 = w.isoformat(), (w + datetime.timedelta(days=6)).isoformat()
+    people = [tuple(r) for r in con.execute("select user_id, name from app_user order by name")]
+    if person not in [p[0] for p in people]:
+        person = None
+    b = [msgs_html(msgs, ok),
+         "<p><small>Reopening sends a person's submitted, approved or edited hours for a week back to Draft, so they can correct them and "
+         "submit again. The approval is cleared, so reopened hours leave the approved totals in the reports until they are submitted and "
+         "approved again. You must give a reason: it is shown to the person and kept in the audit trail. You cannot reopen your own timesheet.</small></p>",
+         '<form method="get" action="/reopen">%s<p>Person %s Week containing %s <input type="submit" value="Show"></p></form>' % (
+             hidden(u=u), sel("person", people, person, True, "Choose a person"), date_input("w", d0))]
+    if person is None:
+        return layout(con, u, "Reopen timesheet", "".join(b))
+    name = dict(people)[person]
+    ents = con.execute(
+        "select t.*, s.scope_code, ph.name as phase, ro.skill_code, lo.name as location_name, ap.name as approved_name "
+        "from time_entry t join scope s on s.scope_id=t.scope_id join phase ph on ph.phase_id=t.phase_id "
+        "join role ro on ro.role_id=t.worked_role_id join location lo on lo.location_id=t.location_id "
+        "left join app_user ap on ap.user_id=t.approved_by where t.user_id=? and t.work_date between ? and ? "
+        "order by t.work_date, s.scope_code, ph.name", (person, d0, d6)).fetchall()
+    b.append("<h4>%s, week commencing %s</h4>" % (esc(name), w.strftime("%d/%m/%Y")))
+    if not ents:
+        b.append("<p>%s has no hours in this week.</p>" % esc(name))
+        return layout(con, u, "Reopen timesheet", "".join(b))
+    b.append(table(["Date", "Code", "Skill code", "Location", "Type", "Hours", "Status", "Approved by"],
+                   [[e["work_date"], "%s %s" % (e["scope_code"], e["phase"]), e["skill_code"], e["location_name"],
+                     "Overtime" if e["overtime"] else "Normal", fmt(e["hours"]), e["status"], e["approved_name"] or ""] for e in ents]))
+    reopenable = [e for e in ents if e["status"] != "Draft"]
+    period = con.execute("select status from period where week_start=?", (d0,)).fetchone()
+    closed = period is None or period["status"] != "Open"
+    if person == u:
+        b.append("<p>You cannot reopen your own timesheet. Ask another cost controller.</p>")
+    elif not reopenable:
+        b.append("<p>Every entry in this week is already a draft, so there is nothing to reopen.</p>")
+    else:
+        extra = ""
+        if closed:
+            extra = ('<p><label><input type="checkbox" name="reopen_period" value="1" checked> Also reopen the weekly period</label> '
+                     "<small>This week is closed, so %s cannot change these hours until it is open again. You can close it again from Admin "
+                     "once they have been resubmitted.</small></p>" % esc(name))
+        n = len(reopenable)
+        b.append('<form method="post" action="/reopen/act">%s%s<p>Reason (shown to %s and kept in the audit trail) %s</p>'
+                 '<p><input type="submit" value="Reopen %d entr%s"></p></form>' % (
+                     hidden(u=u, person=person, w=d0), extra, esc(name), txt("reason", "", 60), n, "y" if n == 1 else "ies"))
+    return layout(con, u, "Reopen timesheet", "".join(b))
+
+
+def reopen_week(con, form):
+    """Send a person's submitted, approved and edited hours for one week back to Draft. Needs a reason, and a cost controller who is not that person."""
+    u = int(form["u"][0])
+    if permission_of(con, u) != "controller":
+        return no_access(con, u, "Reopen timesheet")
+    person, w = int(form["person"][0]), monday(datetime.date.fromisoformat(form["w"][0]))
+    q = {"person": [str(person)], "w": [w.isoformat()]}
+    reason = form.get("reason", [""])[0].strip()
+    if not reason:
+        return view_reopen(con, u, q, ["Give a reason: it is shown to the person and kept in the audit trail."])
+    if person == u:
+        return view_reopen(con, u, q, ["You cannot reopen your own timesheet. Ask another cost controller."])
+    d0, d6 = w.isoformat(), (w + datetime.timedelta(days=6)).isoformat()
+    ids = [r[0] for r in con.execute("select entry_id from time_entry where user_id=? and status<>'Draft' and work_date between ? and ? "
+                                     "order by entry_id", (person, d0, d6))]
+    if not ids:
+        return view_reopen(con, u, q, ["Nothing to reopen: there are no submitted or approved hours in that week."])
+    msgs, n = [], 0
+    for eid in ids:
+        try:
+            con.execute("update time_entry set status='Draft', approved_by=NULL, approved_at=NULL, reject_reason=NULL, reopen_reason=?, "
+                        "last_edited_by=?, last_edited_at=? where entry_id=?", (reason, u, stamp(), eid))
+            n += 1
+        except sqlite3.DatabaseError as e:
+            msgs.append("Entry %d: %s" % (eid, e))
+    ok_msgs = []
+    if n:
+        who = con.execute("select name from app_user where user_id=?", (person,)).fetchone()[0]
+        ok_msgs.append("%d entr%s reopened. They are drafts again, with your reason, for %s to correct and submit." % (n, "y" if n == 1 else "ies", who))
+        if "reopen_period" in form:
+            con.execute("insert or ignore into period (week_start) values (?)", (d0,))
+            con.execute("update period set status='Open', closed_by=NULL, closed_at=NULL where week_start=?", (d0,))
+            ok_msgs.append("The week commencing %s is open again." % w.strftime("%d/%m/%Y"))
+    con.commit()
+    return view_reopen(con, u, q, msgs + ok_msgs, ok=not msgs)
 
 
 # ---------- Reports ----------
@@ -1319,7 +1430,12 @@ def admin_body(con, u, t):
                          '<input type="submit" value="Close week %s"></form> ' % (hidden(u=u, week_start=r[0], action="close"), r[0])
                          for r in rows if r[1] == "Open")
         b.append("<p>%s</p>" % closes)
-        b.append("<p><small>Each week opens automatically when the week starts. Close a week here when it should stop taking new hours.</small></p>")
+        reopens = "".join('<form method="post" action="/admin/period" style="display:inline">%s'
+                          '<input type="submit" value="Reopen week %s"></form> ' % (hidden(u=u, week_start=r[0], action="reopen"), r[0])
+                          for r in rows if r[1] == "Closed")
+        if reopens:
+            b.append("<p>%s</p>" % reopens)
+        b.append("<p><small>Each week opens automatically when the week starts. Close a week here when it should stop taking new hours. A closed week can be reopened, for example so a reopened timesheet can be corrected.</small></p>")
         b.append('<form method="post" action="/admin/period">%s<b>Open a missed week</b> - Monday date %s '
                  '<input type="submit" value="Open week"></form>' % (hidden(u=u, action="open"), date_input("week_start")))
     elif t == "users":
@@ -1674,6 +1790,9 @@ def act_period(con, form):
                 return view_admin(con, u, "periods", ["Week %s already exists, so there is nothing to open." % ws])
             con.execute("insert into period (week_start) values (?)", (ws,))
             msg = ["Week %s opened." % ws]
+        elif action == "reopen":
+            con.execute("update period set status='Open', closed_by=NULL, closed_at=NULL where week_start=?", (ws,))
+            msg = ["Week %s reopened." % ws]
         else:
             con.execute("update period set status='Closed', closed_by=?, closed_at=? where week_start=?", (u, stamp(), ws))
             msg = ["Week %s closed." % ws]
@@ -1753,6 +1872,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html(view_approvals(con, u))
             elif url.path == "/missing":
                 self.send_html(view_missing(con, u, q))
+            elif url.path == "/reopen":
+                self.send_html(view_reopen(con, u, q))
             elif url.path == "/reports":
                 self.send_html(view_reports(con, u, q))
             elif url.path == "/ctr":
@@ -1778,6 +1899,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html(save_timesheet(con, form))
             elif self.path == "/timesheet/copy":
                 self.send_html(copy_week(con, form))
+            elif self.path == "/reopen/act":
+                self.send_html(reopen_week(con, form))
             elif self.path == "/approvals/act":
                 self.send_html(act_approval(con, form))
             elif self.path == "/admin/period":

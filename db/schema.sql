@@ -2,9 +2,10 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 4;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+PRAGMA user_version = 5;  -- 2: a cost controller approves the hours a scope approver books to their own scope
                           -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
-                          -- 4: every entry has a location (On site / Offshore) and an overtime flag
+                          -- 4: every entry has a location (On site / Offshore / Standard) and an overtime flag
+                          -- 5: a cost controller can reopen submitted or approved hours (reopen_reason)
 
 -- Controlled list of job titles, grouped into job families. Editable by admin/superuser.
 CREATE TABLE role (
@@ -164,6 +165,7 @@ CREATE TABLE time_entry (
     approved_by INTEGER REFERENCES app_user(user_id),
     approved_at TEXT,
     reject_reason      TEXT,                          -- set when sent back to Draft
+    reopen_reason      TEXT,                          -- set when a cost controller reopens submitted or approved hours
     last_change_reason TEXT,                          -- required for controlled edits
     edit_count  INTEGER NOT NULL DEFAULT 0,           -- times edited after approval
     created_by     INTEGER NOT NULL REFERENCES app_user(user_id),  -- who keyed it (may differ from user_id)
@@ -256,10 +258,25 @@ BEGIN
       AND (NEW.last_change_reason IS NULL OR NEW.last_change_reason = ''
            OR NEW.last_change_reason IS OLD.last_change_reason);
 
-    -- reject (Submitted -> Draft) needs a reason
+    -- reject (Submitted -> Draft) needs a reason: a reject_reason, or a reopen_reason when a cost controller reopens it
     SELECT RAISE(ABORT, 'Rejecting an entry needs a reason (reject_reason)')
     WHERE OLD.status = 'Submitted' AND NEW.status = 'Draft'
-      AND (NEW.reject_reason IS NULL OR NEW.reject_reason = '');
+      AND (NEW.reject_reason IS NULL OR NEW.reject_reason = '')
+      AND (NEW.reopen_reason IS NULL OR NEW.reopen_reason = '' OR NEW.reopen_reason IS OLD.reopen_reason);
+
+    -- reopen: only a cost controller can send submitted or approved hours back to Draft, and only with a reason
+    SELECT RAISE(ABORT, 'Only a cost controller can reopen submitted or approved hours, and they must give a reason (reopen_reason)')
+    WHERE NEW.status = 'Draft' AND OLD.status IN ('Approved','Edited')
+      AND (NEW.reopen_reason IS NULL OR NEW.reopen_reason = '' OR NEW.reopen_reason IS OLD.reopen_reason
+           OR (SELECT permission FROM app_user WHERE user_id = NEW.last_edited_by) <> 'controller');
+    SELECT RAISE(ABORT, 'Only a cost controller can reopen submitted hours')
+    WHERE NEW.status = 'Draft' AND OLD.status = 'Submitted'
+      AND NEW.reopen_reason IS NOT NULL AND NEW.reopen_reason IS NOT OLD.reopen_reason
+      AND (SELECT permission FROM app_user WHERE user_id = NEW.last_edited_by) <> 'controller';
+    SELECT RAISE(ABORT, 'A cost controller cannot reopen their own hours')
+    WHERE NEW.status = 'Draft' AND OLD.status <> 'Draft'
+      AND NEW.reopen_reason IS NOT NULL AND NEW.reopen_reason IS NOT OLD.reopen_reason
+      AND NEW.last_edited_by = NEW.user_id;
 
     -- approval: the person named as the scope's approver, never the entry owner. One exception: hours booked BY the scope's
     -- approver have nobody else who may approve them, so a cost controller approves those. Admins never approve.
@@ -291,7 +308,9 @@ BEGIN
     VALUES (OLD.entry_id,
         CASE WHEN OLD.status <> NEW.status THEN 'STATUS' ELSE 'UPDATE' END,
         NEW.last_edited_by, NEW.last_edited_at,
-        CASE WHEN NEW.status = 'Draft' AND OLD.status = 'Submitted' THEN NEW.reject_reason
+        CASE WHEN NEW.status = 'Draft' AND OLD.status <> 'Draft' AND NEW.reopen_reason IS NOT NULL AND NEW.reopen_reason IS NOT OLD.reopen_reason
+                  THEN 'Reopened: ' || NEW.reopen_reason
+             WHEN NEW.status = 'Draft' AND OLD.status = 'Submitted' THEN NEW.reject_reason
              WHEN NEW.status = 'Edited' THEN NEW.last_change_reason END,
         OLD.status, NEW.status, OLD.hours, NEW.hours,
         OLD.scope_id, OLD.phase_id, OLD.worked_role_id, OLD.rate_id, OLD.work_date, OLD.location_id, OLD.overtime);

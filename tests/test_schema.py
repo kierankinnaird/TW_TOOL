@@ -371,11 +371,60 @@ class TestActiveDatesAndPaafExpiry(Base):
         self.assertEqual(bad, 0)
 
 
+class TestReopen(Base):
+    """A cost controller can reopen submitted or approved hours (back to Draft) with a reason, and nobody else can."""
+    REOPEN = ("UPDATE time_entry SET status='Draft', approved_by=NULL, approved_at=NULL, reopen_reason=?, "
+              "last_edited_by=?, last_edited_at=? WHERE entry_id=?")
+
+    def entry(self, status, user=5):
+        return self.scalar("select entry_id from time_entry where status=? and user_id=? limit 1", status, user)
+
+    def test_a_cost_controller_reopens_approved_and_submitted_hours_with_a_reason(self):
+        for n, (status, user) in enumerate((("Approved", 5), ("Submitted", 3))):
+            eid = self.entry(status, user)
+            self.con.execute(self.REOPEN, ("Wrong code booked", 29, "t%d" % n, eid))  # Stephanie Apedaile, a cost controller
+            row = self.con.execute("select status, approved_by, reopen_reason from time_entry where entry_id=?", (eid,)).fetchone()
+            self.assertEqual(tuple(row), ("Draft", None, "Wrong code booked"), status)
+            audit = self.con.execute("select action, reason, old_status, new_status, changed_by from time_entry_audit where entry_id=? "
+                                     "order by audit_id desc limit 1", (eid,)).fetchone()
+            self.assertEqual(tuple(audit), ("STATUS", "Reopened: Wrong code booked", status, "Draft", 29))
+
+    def test_nobody_else_can_reopen(self):
+        approved, submitted = self.entry("Approved", 5), self.entry("Submitted", 3)
+        for who in (7, 8, 30, 5):  # an approver, the other approver, the IT admin, a standard user
+            self.blocked(self.REOPEN, ("Because", who, "t1", approved), "Only a cost controller")
+            self.blocked(self.REOPEN, ("Because", who, "t2", submitted), "Only a cost controller")
+
+    def test_reopening_needs_a_reason_and_approved_hours_have_no_other_way_back_to_draft(self):
+        eid = self.entry("Approved", 5)
+        self.blocked(self.REOPEN, ("", 29, "t1", eid), "must give a reason")
+        self.blocked(self.REOPEN, (None, 29, "t2", eid), "must give a reason")
+        # a plain status change, or a rejection reason, does not turn approved hours back into a draft
+        self.blocked("UPDATE time_entry SET status='Draft', last_edited_by=29, last_edited_at='t3' WHERE entry_id=?", (eid,), "must give a reason")
+        self.blocked("UPDATE time_entry SET status='Draft', reject_reason='No', last_edited_by=7, last_edited_at='t4' WHERE entry_id=?", (eid,),
+                     "must give a reason")
+        self.assertEqual(self.scalar("select status from time_entry where entry_id=?", eid), "Approved")
+
+    def test_a_cost_controller_cannot_reopen_their_own_hours(self):
+        # Stephanie (29) books INT01 (no PAAF needed) and cannot reopen it herself
+        mine = self.con.execute(NEW_ENTRY, (29, 7, 8, None, 32, None, "2026-11-04", 2, 29)).lastrowid  # role 32 = Commercial Lead
+        self.blocked(self.REOPEN, ("Oops", 29, "t1", mine), "cannot reopen their own")
+        self.con.execute(self.REOPEN, ("Oops", 1, "t2", mine))  # another cost controller (Emma Noble) can
+
+    def test_rejecting_still_works_and_is_not_recorded_as_a_reopen(self):
+        eid = self.entry("Submitted", 3)
+        self.con.execute("UPDATE time_entry SET status='Draft', reject_reason='Wrong scope', last_edited_by=7, last_edited_at='t1' WHERE entry_id=?", (eid,))
+        audit = self.con.execute("select reason from time_entry_audit where entry_id=? order by audit_id desc limit 1", (eid,)).fetchone()
+        self.assertEqual(audit[0], "Wrong scope")
+        self.blocked("UPDATE time_entry SET status='Draft', last_edited_by=7, last_edited_at='t2' WHERE entry_id=?", (self.entry("Submitted", 3),),
+                     "needs a reason")
+
+
 class TestHourTypes(Base):
-    """Every entry has a location (On site / Offshore / Office / WFH) and an overtime flag. Overtime has no separate rate yet."""
+    """Every entry has a location (On site / Offshore / Standard) and an overtime flag. Overtime has no separate rate yet."""
     def test_the_locations_are_seeded_and_new_entries_default_to_on_site_normal_time(self):
         self.assertEqual([tuple(r) for r in self.con.execute("select location_id, name, active from location order by location_id")],
-                         [(1, "On site", 1), (2, "Offshore", 1), (3, "Office", 1), (4, "WFH", 1)])
+                         [(1, "On site", 1), (2, "Offshore", 1), (3, "Standard", 1)])
         eid = self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 8, 5)).lastrowid
         self.assertEqual(tuple(self.con.execute("select location_id, overtime from time_entry where entry_id=?", (eid,)).fetchone()), (1, 0))
 

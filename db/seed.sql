@@ -207,8 +207,8 @@ INSERT INTO phase (phase_id, scope_id, name) VALUES
  (8,7,'General'),(9,8,'General'),(10,9,'General');
 
 -- Hour types: where hours are worked. Entries default to location 1 (On site) and normal time; overtime is a flag on the entry.
--- The standard choices are On site, Offshore, Office and WFH; the IT admin can add more on the Locations tab.
-INSERT INTO location (location_id, name) VALUES (1,'On site'),(2,'Offshore'),(3,'Office'),(4,'WFH');
+-- The choices are On site, Offshore and Standard (office or working from home); the IT admin can add more on the Locations tab.
+INSERT INTO location (location_id, name) VALUES (1,'On site'),(2,'Offshore'),(3,'Standard');
 
 -- Weekly periods: week of 26 Oct (to be closed later) and week of 2 Nov.
 INSERT INTO period (week_start) VALUES ('2026-10-26'),('2026-11-02');

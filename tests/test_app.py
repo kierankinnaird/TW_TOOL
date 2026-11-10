@@ -97,19 +97,32 @@ class TestApp(unittest.TestCase):
         self.assertIn("not named as an approver", self.post("/approvals/act", {"u": str(owner), "entry_id": str(eid), "action": "Approve"}))
         self.assertEqual(self.one("select status from time_entry where entry_id=?", eid)[0], "Submitted")
 
-    def test_changing_approved_hours_needs_reason_then_becomes_edited(self):
-        con = app.db()
-        row = con.execute("select scope_id, worked_role_id, work_date, entry_id from time_entry "
-                          "where user_id=5 and status='Approved' and work_date='2026-11-03'").fetchone()
-        con.close()
-        key = "h_%d_%d_1_0_%s" % (row[0], row[1], row[2])
-        page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft", key: "6", "reason": ""})
-        self.assertIn("reason is needed", page)
-        page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft", key: "6", "reason": "Site log"})
-        self.assertIn("1 entry saved", page)
-        con = app.db()
-        self.assertEqual(con.execute("select status, hours, edit_count from time_entry where entry_id=?", (row[3],)).fetchone()[:], ("Edited", 6, 1))
-        con.close()
+    def test_submitted_and_approved_hours_are_locked_on_the_page_and_on_the_server(self):
+        # Ewan Shaw (5): Tue 3 Nov is approved. It is plain text, with no box to type in, and the page does not ask for a reason to change it
+        page = self.get("/timesheet?u=5&w=2026-11-02")
+        self.assertNotIn('name="h_1_4_1_0_2026-11-03"', page)
+        self.assertNotIn("Reason for changing approved hours", page)
+        self.assertIn("Submitted and approved hours are locked", page)
+        key = "h_1_4_1_0_2026-11-03"
+        before = self.one("select hours, status from time_entry where user_id=5 and work_date='2026-11-03'")[:]
+        # a hand-made request cannot change or clear them either
+        self.assertIn("approved hours are locked", self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft", key: "6", "reason": "Site log"}))
+        self.assertIn("approved hours are locked", self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft", key: ""}))
+        self.assertEqual(self.one("select hours, status from time_entry where user_id=5 and work_date='2026-11-03'")[:], before)
+
+    def test_a_partly_submitted_week_has_boxes_only_for_the_days_still_in_draft(self):
+        # Jason Pang (22) has submitted and approved hours this week. He fills in a missing day and submits again: nothing may turn into a box
+        filled = r'<input type="text" size="4" name="(h_[^"]+)" value="[^"]+"'  # a box that holds hours
+        page = self.get("/timesheet?u=22&w=2026-11-02")
+        self.assertEqual(re.findall(filled, page), [])
+        empty = re.findall(r'name="(h_[0-9_]+_2026-11-0[2-6])" value=""', page)
+        self.assertTrue(empty, "there should be a missing day to fill in")
+        self.post("/timesheet/save", {"u": "22", "w": "2026-11-02", "action": "Save draft", empty[0]: "8"})
+        self.assertEqual(re.findall(filled, self.get("/timesheet?u=22&w=2026-11-02")), [empty[0]])  # the new draft day is the only box
+        page = self.post("/timesheet/save", {"u": "22", "w": "2026-11-02", "action": "Submit week"})
+        self.assertIn("1 entry submitted", page)
+        self.assertEqual(re.findall(filled, page), [], "submitted, approved or edited hours must never be shown in a box")
+        self.assertEqual(re.findall(filled, self.get("/timesheet?u=22&w=2026-11-02")), [])
 
     def test_closed_week_blocks_new_hours_and_unapproved_paaf_blocks_booking(self):
         page = self.post("/timesheet/save", {"u": "5", "w": "2026-10-26", "action": "Save draft",
@@ -132,17 +145,17 @@ class TestApp(unittest.TestCase):
         # approved entry (Ewan Shaw, Tue 3 Nov) cannot be cleared
         page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Save draft",
                                              "h_1_4_1_0_2026-11-03": "", "reason": ""})
-        self.assertIn("approved hours cannot be cleared", page)
+        self.assertIn("approved hours are locked", page)
 
     def test_admin_only_pages_and_period_actions(self):
         self.assertIn("not available to your role", self.get("/admin?u=5"))
         # a far-future Monday, so it is never the current week (the current week opens by itself)
         page = self.post("/admin/period", {"u": "29", "action": "open", "week_start": "2030-01-07"})
-        self.assertIn("opened", page)
+        self.assertIn("Week 2030-01-07 opened", page)
         page = self.post("/admin/period", {"u": "29", "action": "open", "week_start": "2030-01-07"})  # already there
         self.assertIn("already exists", page)
         page = self.post("/admin/period", {"u": "29", "action": "open", "week_start": "2030-01-08"})  # not a Monday
-        self.assertNotIn("opened", page)
+        self.assertNotIn("Week 2030-01-08 opened", page)
 
     def test_reports_date_range(self):
         page = self.get("/reports?u=5&from=2026-10-26&to=2026-10-26")
@@ -364,8 +377,8 @@ class TestApp(unittest.TestCase):
         rows = {}
         for r in page.split("<tr>")[1:]:
             cells = [re.sub(r"<[^>]+>", "", c) for c in re.findall(r"<td[^>]*>(.*?)</td>", r)]
-            if len(cells) == 8:
-                rows[cells[0]] = cells  # person, NMC ID, job title, employment, status, submitted hrs, draft hrs, sent back
+            if len(cells) >= 8:
+                rows[cells[0]] = cells[:8]  # person, NMC ID, job title, employment, status, submitted hrs, draft hrs, sent back (then a Reopen link for controllers)
         return page, rows
 
     def test_only_cost_controllers_and_approvers_can_open_missing_timesheets(self):
@@ -490,25 +503,26 @@ class TestApp(unittest.TestCase):
         self.assertIn('class="go"><b>2</b>', page)
         self.assertIn('class="gt"><b>12</b>', page)
 
-    def test_office_and_wfh_are_standard_choices(self):
+    def test_standard_is_one_choice_for_office_and_working_from_home(self):
         page = self.get("/timesheet?u=4&w=2026-11-02")
-        for name in ("On site", "Offshore", "Office", "WFH"):
-            self.assertIn('>%s</option>' % name, page, name)  # all four are in the Add row dropdown
-        # David Hart (4) books INT01 from the office on Monday and from home on Tuesday
+        for name in ("On site", "Offshore", "Standard"):
+            self.assertIn('>%s</option>' % name, page, name)  # all three are in the Add row dropdown
+        for gone in ("Office", "WFH"):
+            self.assertNotIn('>%s</option>' % gone, page, gone)
+        # David Hart (4) books INT01 as Standard on Monday and Tuesday
         self.assertIn("2 entries saved", self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "reason": "",
-                                                                      "h_8_4_3_0_2026-11-02": "7.5", "h_8_4_4_0_2026-11-03": "7.5"}))
+                                                                      "h_8_4_3_0_2026-11-02": "7.5", "h_8_4_3_0_2026-11-03": "7.5"}))
         self.assertEqual(self.hours_of(4, "2026-11-02"), [(3, 0, 7.5, "Draft")])
-        self.assertEqual(self.hours_of(4, "2026-11-03"), [(4, 0, 7.5, "Draft")])
-        page = self.get("/timesheet?u=4&w=2026-11-02&add_phase=8&add_role=4&add_loc=4")  # a WFH row from the dropdown
-        self.assertIn("h_8_4_4_0_2026-11-05", page)
-        self.assertIn(">WFH</td>", page)
-        self.assertIn(">Office</td>", page)
+        self.assertEqual(self.hours_of(4, "2026-11-03"), [(3, 0, 7.5, "Draft")])
+        page = self.get("/timesheet?u=4&w=2026-11-02&add_phase=8&add_role=4&add_loc=3")  # a Standard row from the dropdown
+        self.assertIn("h_8_4_3_0_2026-11-05", page)
+        self.assertIn(">Standard</td>", page)
         # they show up in the report by location once approved
         eid = self.one("select entry_id from time_entry where user_id=4 and work_date='2026-11-03'")[0]
         self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Submit week", "reason": ""})
         self.post("/approvals/act", {"u": "7", "entry_id": str(eid), "action": "Approve selected"})
         section = self.get("/reports?u=29&from=2026-01-01&to=2026-12-31").split("Hours by location and overtime")[1]
-        self.assertIn('<td>WFH</td><td align="right">7.5</td><td align="right">0</td><td align="right">7.5</td>', section)
+        self.assertIn('<td>Standard</td><td align="right">7.5</td><td align="right">0</td><td align="right">7.5</td>', section)
 
     def test_the_same_cell_is_updated_not_duplicated(self):
         post = {"u": "4", "w": "2026-11-02", "action": "Save draft", "reason": ""}
@@ -571,7 +585,7 @@ class TestApp(unittest.TestCase):
                                                                     "h_8_4_%d_0_2026-11-05" % rid: "2"}))
         self.assertEqual(self.hours_of(5, "2026-11-06"), [(rid, 0, 2, "Draft")])
         # at least one location must stay switched on
-        for lid, name in ((2, "Offshore"), (3, "Office"), (4, "WFH")):
+        for lid, name in ((2, "Offshore"), (3, "Standard")):
             self.assertIn("Saved", self.admin_post("/admin/save", {"t": "locations", "id": str(lid), "name": name, "active": "0"}))
         self.assertIn("At least one location must stay active", self.admin_post("/admin/save", {"t": "locations", "id": "1", "name": "On site", "active": "0"}))
 
@@ -583,31 +597,36 @@ class TestApp(unittest.TestCase):
     # ---------- copy last week (R15) ----------
     def test_copy_last_weeks_rows_and_hours_as_drafts(self):
         # Rob Millman (24) worked 4 hours offshore on BB0001 Define on Wednesday 28 Oct
-        self.assertIn("Copy last week's rows and hours", self.get("/timesheet?u=24&w=2026-11-02"))
+        page = self.get("/timesheet?u=24&w=2026-11-02")
+        self.assertIn('value="Copy last week"', page)  # a single button, no separate "rows only" choice
+        self.assertNotIn("rows only", page)
         page = self.post("/timesheet/copy", {"u": "24", "w": "2026-11-02", "copy_hours": "x"})
         self.assertIn("1 entry copied from the week commencing 26/10/2026 as drafts", page)
         self.assertEqual(self.hours_of(24, "2026-11-04"), [(2, 0, 4, "Draft")])  # the same weekday a week on, still offshore, a draft
-        # copying again changes nothing: what is filled in is left alone
-        self.assertIn("already filled in", self.post("/timesheet/copy", {"u": "24", "w": "2026-11-02", "copy_hours": "x"}))
+        # copying again gives the same result: it clears the week first, so nothing is doubled up
+        page = self.post("/timesheet/copy", {"u": "24", "w": "2026-11-02", "copy_hours": "x"})
+        self.assertIn("1 draft entry that was in this week was replaced", page)
         self.assertEqual(self.hours_of(24, "2026-11-04"), [(2, 0, 4, "Draft")])
+
+    def test_copy_clears_what_is_in_the_week_and_will_not_touch_submitted_hours(self):
+        # Rob Millman (24) types something different, then copies: the typed draft is cleared and last week's row and hours go in
+        self.post("/timesheet/save", {"u": "24", "w": "2026-11-02", "action": "Save draft", "h_1_4_1_0_2026-11-06": "3"})
+        self.assertEqual(self.hours_of(24, "2026-11-06"), [(1, 0, 3, "Draft")])
+        self.post("/timesheet/copy", {"u": "24", "w": "2026-11-02", "copy_hours": "x"})
+        self.assertEqual(self.hours_of(24, "2026-11-06"), [])
+        self.assertEqual(self.hours_of(24, "2026-11-04"), [(2, 0, 4, "Draft")])
+        self.assertEqual(self.one("select count(*) from time_entry_audit where action='DELETE' and changed_by=24")[0], 1)  # the clearing is audited
+        # once the week is submitted it cannot be replaced, and the button is no longer offered
+        self.post("/timesheet/save", {"u": "24", "w": "2026-11-02", "action": "Submit week"})
+        self.assertNotIn("Copy last week", self.get("/timesheet?u=24&w=2026-11-02"))
+        self.assertIn("cannot be replaced", self.post("/timesheet/copy", {"u": "24", "w": "2026-11-02", "copy_hours": "x"}))
+        self.assertEqual(self.hours_of(24, "2026-11-04"), [(2, 0, 4, "Submitted")])
 
     def test_copy_keeps_the_overtime_flag(self):
         # Neil Pennock (21) did 8 hours of overtime on Monday 2 Nov on BB0001 Execute: copy it onto the week of 9 Nov
         self.admin_post("/admin/period", {"action": "open", "week_start": "2026-11-09"})  # it may exist already, which is fine
         self.assertIn("1 entry copied", self.post("/timesheet/copy", {"u": "21", "w": "2026-11-09", "copy_hours": "x"}))
         self.assertEqual(self.hours_of(21, "2026-11-09"), [(1, 1, 8, "Draft")])
-
-    def test_copy_rows_only_adds_empty_rows_and_saves_nothing(self):
-        # Arlene Chalmers (23) booked BB0001 Define on Tuesday 27 Oct as a Document Controller (role 10)
-        page = self.post("/timesheet/copy", {"u": "23", "w": "2026-11-02", "copy_rows": "x"})
-        self.assertIn("1 row copied from the week commencing 26/10/2026", page)
-        self.assertIn('name="h_1_10_1_0_2026-11-03"', page)  # an empty box for that row
-        self.assertEqual(self.one("select count(*) from time_entry where user_id=23 and work_date >= '2026-11-02'")[0], 0)
-        # the row stays through Save draft, which keeps unsaved rows
-        page = self.post("/timesheet/save", {"u": "23", "w": "2026-11-02", "action": "Save draft", "reason": "",
-                                             "add": "1:10:1:0", "h_1_10_1_0_2026-11-03": "3"})
-        self.assertIn("1 entry saved", page)
-        self.assertEqual(self.hours_of(23, "2026-11-03"), [(1, 0, 3, "Draft")])
 
     def test_copy_says_what_it_could_not_copy(self):
         con = app.db()
@@ -647,7 +666,7 @@ class TestApp(unittest.TestCase):
     def test_other_weeks_with_sent_back_hours_are_pointed_out(self):
         page = self.get("/timesheet?u=10&w=2026-11-09")
         self.assertNotIn("Sent back for correction", page)  # nothing in this week
-        self.assertIn("You also have hours sent back in", page)
+        self.assertIn("You also have hours sent back or reopened in", page)
         self.assertIn('w=2026-11-02">week commencing 02/11/2026 (1)', page)
 
     def test_a_rejection_made_in_the_app_reaches_the_person(self):
@@ -678,6 +697,131 @@ class TestApp(unittest.TestCase):
         page = self.get("/timesheet?u=8&w=2026-11-02")
         self.assertIn("Not agreed with Spirit", page)
         self.assertIn("sent back by Stephanie Apedaile", page)
+
+    # ---------- reopen a timesheet (R32) ----------
+    def week_states(self, user, w0="2026-11-02", w6="2026-11-08"):
+        con = app.db()
+        try:
+            return sorted(r[0] for r in con.execute("select status from time_entry where user_id=? and work_date between ? and ?", (user, w0, w6)))
+        finally:
+            con.close()
+
+    def reopen(self, person, week="2026-11-02", reason="Wrong code booked", u="29", **extra):
+        data = {"u": u, "person": str(person), "w": week, "reason": reason}
+        data.update(extra)
+        return self.post("/reopen/act", data)
+
+    def test_only_cost_controllers_can_reopen_a_timesheet(self):
+        self.assertNotIn("not available to your role", self.get("/reopen?u=29"))
+        for u in (5, 7, 8, 30):  # a standard user, both approvers, the IT admin
+            self.assertIn("not available to your role", self.get("/reopen?u=%d" % u), u)
+        self.assertIn('href="/reopen?u=29"', self.get("/timesheet?u=29"))
+        for u in (5, 7, 30):
+            self.assertNotIn('href="/reopen?u=%d"' % u, self.get("/timesheet?u=%d" % u), u)
+        self.assertIn("not available to your role", self.reopen(5, u="7"))  # and the action refuses them too
+        self.assertIn("not available to your role", self.reopen(5, u="30"))
+        self.assertNotIn("Draft", self.week_states(5))
+
+    def test_reopening_a_week_sends_every_submitted_and_approved_entry_back_to_draft(self):
+        before = self.week_states(5)  # Ewan Shaw: approved and submitted hours in the week of 2 Nov
+        self.assertTrue(before and "Draft" not in before)
+        page = self.get("/reopen?u=29&person=5&w=2026-11-02")
+        self.assertIn("Ewan Shaw, week commencing 02/11/2026", page)
+        self.assertIn("Approved by", page)
+        page = self.reopen(5)
+        self.assertIn("%d entries reopened" % len(before), page)
+        self.assertEqual(self.week_states(5), ["Draft"] * len(before))
+        row = self.one("select approved_by, approved_at, reopen_reason, reject_reason from time_entry where user_id=5 and work_date='2026-11-03' limit 1")
+        self.assertEqual(tuple(row), (None, None, "Wrong code booked", None))  # the approval is gone, the reason is kept
+        # other weeks are not touched
+        self.assertIn("Approved", self.week_states(5, "2026-10-26", "2026-11-01"))
+
+    def test_the_person_is_told_why_and_by_whom_and_can_resubmit(self):
+        n = len(self.week_states(5))
+        self.reopen(5)
+        page = self.get("/timesheet?u=5&w=2026-11-02")
+        self.assertIn("Reopened by a cost controller", page)
+        self.assertIn("Wrong code booked", page)
+        self.assertIn("reopened by Stephanie Apedaile", page)
+        self.assertIn('title="Reopened: Wrong code booked"', page)
+        self.assertIn("My Timesheet (%d reopened)" % n, page)
+        self.assertNotIn("Sent back for correction", page)  # this is a reopen, not a rejection
+        self.assertIn("You also have hours sent back or reopened in", self.get("/timesheet?u=5&w=2026-11-09"))
+        # he corrects an hour and submits the week again: the notice goes
+        self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Submit week", "reason": "", "h_1_4_1_0_2026-11-02": "7"})
+        page = self.get("/timesheet?u=5&w=2026-11-02")
+        self.assertNotIn("Reopened by a cost controller", page)
+        self.assertIn(">My Timesheet</a>", page)
+        self.assertEqual(set(self.week_states(5)), {"Submitted"})
+
+    def test_a_reason_is_required_and_a_cost_controller_cannot_reopen_their_own_timesheet(self):
+        self.assertIn("Give a reason", self.reopen(5, reason="   "))
+        self.assertNotIn("Draft", self.week_states(5))
+        # Stephanie (29) books internal hours and submits: she cannot reopen them herself, another controller can
+        self.post("/timesheet/save", {"u": "29", "w": "2026-11-02", "action": "Save draft", "reason": "", "h_8_32_1_0_2026-11-04": "2"})
+        self.post("/timesheet/save", {"u": "29", "w": "2026-11-02", "action": "Submit week", "reason": ""})
+        self.assertIn("cannot reopen your own timesheet", self.reopen(29, u="29"))
+        self.assertEqual(self.week_states(29), ["Submitted"])
+        self.assertIn("1 entry reopened", self.reopen(29, u="1"))  # Emma Noble
+        self.assertEqual(self.week_states(29), ["Draft"])
+
+    def test_nothing_to_reopen_when_the_week_is_empty_or_already_drafts(self):
+        self.assertIn("has no hours in this week", self.get("/reopen?u=29&person=4&w=2026-11-02"))   # David Hart booked nothing
+        self.assertIn("Nothing to reopen", self.reopen(4))
+        self.reopen(5)
+        self.assertIn("already a draft", self.get("/reopen?u=29&person=5&w=2026-11-02"))  # every entry is a draft now
+        self.assertIn("Nothing to reopen", self.reopen(5))
+
+    def test_a_closed_week_can_be_reopened_with_the_timesheet(self):
+        # the week of 26 Oct is closed in the seed data. Without the box ticked it stays closed, so the person could not edit it
+        self.assertIn('name="reopen_period"', self.get("/reopen?u=29&person=5&w=2026-10-26"))
+        self.assertIn("reopened", self.reopen(5, "2026-10-26"))
+        self.assertEqual(self.one("select status from period where week_start='2026-10-26'")[0], "Closed")
+        self.assertNotIn('name="h_1_4_1_0_2026-10-26"', self.get("/timesheet?u=5&w=2026-10-26"))  # closed: no boxes
+        # a closed week is reopened from Admin, or by ticking the box
+        self.assertIn('value="Reopen week 2026-10-26"', self.get("/admin?u=29&t=periods"))
+        self.assertIn("Week 2026-10-26 reopened", self.admin_post("/admin/period", {"action": "reopen", "week_start": "2026-10-26"}))
+        self.assertEqual(self.one("select status from period where week_start='2026-10-26'")[0], "Open")
+        self.assertIn('name="h_1_4_1_0_2026-10-26"', self.get("/timesheet?u=5&w=2026-10-26"))
+        # with the box ticked it all happens together (Daniel Evans, week of 26 Oct)
+        self.admin_post("/admin/period", {"action": "close", "week_start": "2026-10-26"})
+        page = self.reopen(9, "2026-10-26", reopen_period="1")
+        self.assertIn("is open again", page)
+        self.assertEqual(self.one("select status from period where week_start='2026-10-26'")[0], "Open")
+
+    def test_reopened_hours_leave_the_approved_totals_until_approved_again(self):
+        def approved(user):
+            return self.one("select coalesce(sum(hours),0) from time_entry where user_id=? and status='Approved'", user)[0]
+        before = approved(5)
+        self.assertGreater(before, 0)
+        self.reopen(5)
+        self.assertLess(approved(5), before)  # this week's approved hours are drafts again
+        page = self.get("/reports?u=5&from=2026-01-01&to=2026-12-31")
+        self.assertIn("Actual booked hrs", page)  # and his report no longer counts them
+        self.assertEqual(self.week_states(5, "2026-10-26", "2026-11-01"), ["Approved", "Approved"])  # the earlier week is still approved
+
+    def test_who_has_been_reopened_shows_in_missing_timesheets_and_the_audit_trail(self):
+        # a controller's list links to Reopen for people who have submitted; an approver's does not
+        link = 'href="/reopen?u=29&amp;person=5&amp;w=2026-11-02"'
+        self.assertIn(link, self.get("/missing?u=29&w=2026-11-02&s=all"))
+        self.assertNotIn("/reopen?", self.get("/missing?u=7&w=2026-11-02&s=all"))
+        self.reopen(5)
+        row = self.missing(29, w="2026-11-02", s="all")[1]["Ewan Shaw"]
+        self.assertEqual(row[4], "Draft only")
+        self.assertEqual(row[7], str(len(self.week_states(5))))  # every entry counts as sent back
+        self.assertNotIn(link, self.get("/missing?u=29&w=2026-11-02&s=all"))  # nothing left to reopen for him
+        audit = self.get("/audit?u=29")
+        self.assertIn("Reopened: Wrong code booked", audit)
+
+    def test_a_later_rejection_replaces_the_reopen_note(self):
+        self.reopen(5)
+        self.post("/timesheet/save", {"u": "5", "w": "2026-11-02", "action": "Submit week", "reason": ""})
+        eid = self.one("select entry_id from time_entry where user_id=5 and work_date='2026-11-03' limit 1")[0]
+        self.post("/approvals/act", {"u": "7", "entry_id": str(eid), "action": "Reject selected", "reason": "Wrong hours"})
+        page = self.get("/timesheet?u=5&w=2026-11-02")
+        self.assertIn("Sent back for correction", page)
+        self.assertIn("Wrong hours", page)
+        self.assertNotIn("Reopened by a cost controller", page)  # the others were resubmitted, and this one is a rejection now
 
     # ---------- start and end dates, PAAF expiry (R07) ----------
     def test_no_input_boxes_outside_a_persons_start_and_end_dates(self):
@@ -1080,8 +1224,9 @@ class TestApp(unittest.TestCase):
         self.assertIn("<th>Project</th>", page)
         self.assertIn("<th>Phase</th>", page)
         self.assertIn("Apache &gt; Wellbay Decommissioning &gt; BB0001 Wellbay Clearance &gt; Execute", page)
-        # phase 2 = BB0001 Execute (Daniel Evans has an approved Execute entry on 3 Nov), role 3 = Project Engineer
-        self.assertIn("h_2_3_1_0_2026-11-03", page)
+        # phase 2 = BB0001 Execute (Daniel Evans has an approved Execute entry on 3 Nov, which is locked), role 3 = Project Engineer
+        self.assertNotIn('name="h_2_3_1_0_2026-11-03"', page)
+        self.assertIn('name="h_2_3_1_0_2026-11-02"', page)
         self.assertIn("1 entry saved", self.post("/timesheet/save", {"u": "9", "w": "2026-11-02", "action": "Save draft",
                                                                     "h_2_3_1_0_2026-11-06": "4", "reason": ""}))
         self.assertEqual(self.one("select phase_id from time_entry where user_id=9 and work_date='2026-11-06'")[0], 2)
