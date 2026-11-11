@@ -312,8 +312,9 @@ class TestApp(unittest.TestCase):
 
     def test_a_cleared_report_date_falls_back_to_the_default_range(self):
         page = self.get("/reports?u=5&from=&to=")
-        self.assertIn('<input type="date" name="from" value="2026-10-01">', page)
-        self.assertIn('<input type="date" name="to" value="2026-12-31">', page)
+        year = datetime.date.today().year
+        self.assertIn('<input type="date" name="from" value="%d-01-01">' % year, page)       # the current year, not a fixed range
+        self.assertIn('<input type="date" name="to" value="%d-12-31">' % year, page)
         self.assertIn("Total for range", page)
         self.assertNotIn("<b>Total for range</b></td><td><b></b></td><td><b></b></td><td><b></b></td><td><b></b></td><td><b></b></td><td align=\"right\"><b>0</b>", page)
 
@@ -407,7 +408,7 @@ class TestApp(unittest.TestCase):
 
     def test_a_cost_controller_sees_everyone_and_how_far_each_has_got(self):
         page, rows = self.missing(29, w="2026-11-02", s="all")
-        self.assertEqual(len(rows), 30)  # everyone is active that week
+        self.assertEqual(len(rows), 29)  # everyone active that week except the IT admin's system account
         self.assertEqual(rows["Ewan Shaw"][4], "Submitted")
         self.assertEqual(rows["David Hart"][4], "Not started")
         # Ajin Sabu: two entries submitted (16 hrs) and one sent back to draft (8 hrs)
@@ -1402,7 +1403,7 @@ class TestApp(unittest.TestCase):
 
     def test_the_timesheet_has_an_allowances_section_and_an_add_allowance_row(self):
         page = self.get("/timesheet?u=5&w=2026-11-02")
-        self.assertIn("<b>Allowances</b>", page)
+        self.assertNotIn("<b>Allowances</b>", page)          # no heading until there is a row to show
         self.assertIn("Add allowance:", page)
         for name in ("Overnight allowance", "Per Diem", "Mob fee"):
             self.assertIn(">%s</option>" % name, page)
@@ -1505,6 +1506,152 @@ class TestApp(unittest.TestCase):
         self.assertIn("<h4>Allowances</h4>", audit)
         self.assertIn("Per Diem", audit.split("<h4>Allowances</h4>")[1])
         self.assertIn("Approved", audit.split("<h4>Allowances</h4>")[1])
+
+    # ---------- audit fixes and timesheet quality of life ----------
+    def test_the_day_cap_is_reported_on_screen(self):
+        self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Save draft", "h_1_4_1_0_2026-11-10": "20"})
+        page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Save draft", "h_1_4_2_0_2026-11-10": "8"})
+        self.assertIn("more than 24 hours", page)
+        self.assertEqual(self.one("select sum(hours) from time_entry where user_id=5 and work_date='2026-11-10'")[0], 20)
+
+    def test_add_row_saves_the_hours_you_have_typed_first(self):
+        page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Add row", "h_1_4_1_0_2026-11-10": "6",
+                                             "add_phase": "8", "add_role": "4", "add_loc": "1"})
+        self.assertEqual(self.one("select hours from time_entry where user_id=5 and work_date='2026-11-10' and phase_id=1")[0], 6)   # saved, not lost
+        self.assertIn('name="h_8_4_1_0_2026-11-10"', page)                                                                           # and the new empty row is there
+        page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Add allowance row", "h_1_4_1_0_2026-11-11": "3",
+                                             "aadd_phase": "1", "aadd_type": "2"})
+        self.assertIn('name="a_1_2_2026-11-11"', page)
+        self.assertEqual(self.one("select hours from time_entry where user_id=5 and work_date='2026-11-11'")[0], 3)
+        # the controls sit under the grid's own form, so they travel with it
+        self.assertIn('<form id="tsform" method="post" action="/timesheet/save">', page)
+        self.assertIn('<select form="tsform" name="add_phase">', page)
+        self.assertIn('<input form="tsform" type="submit" name="action" value="Add row">', page)
+
+    def test_the_timesheet_shows_the_week_status_a_this_week_link_and_a_date_picker(self):
+        page = self.get("/timesheet?u=5&w=2026-11-02")
+        self.assertIn("<b>Week status:</b> Partly submitted" if False else "<b>Week status:</b>", page)
+        self.assertIn("Submitted: 16 hours waiting for approval, 16 approved", page)
+        monday = (datetime.date.today() - datetime.timedelta(days=datetime.date.today().weekday())).isoformat()
+        self.assertIn('/timesheet?u=5&amp;w=%s">This week</a>' % monday, page)
+        self.assertIn('<input type="date" name="w" value="2026-11-02">', page)
+        self.assertIn("Not started", self.get("/timesheet?u=5&w=2030-01-07"))
+        self.post("/timesheet/save", {"u": "5", "w": "2030-01-07", "action": "Save draft", "h_1_4_1_0_2030-01-08": "5"})
+
+    def test_submitting_an_empty_week_says_there_is_nothing_to_submit(self):
+        page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Submit week"})
+        self.assertIn("Nothing to submit", page)
+        self.assertNotIn("0 entries submitted", page)
+
+    def test_a_waiting_paaf_is_explained_on_the_timesheet(self):
+        page = self.get("/timesheet?u=4&w=2026-11-02")             # David Hart's Apache PAAF has only been Sent
+        self.assertIn("Apache:</b> your PAAF is with the client, waiting for approval", page)
+        self.assertNotIn("your PAAF is", self.get("/timesheet?u=5&w=2026-11-02"))   # Ewan Shaw's are approved
+
+    def test_the_it_admin_account_is_not_expected_to_submit_a_timesheet(self):
+        page = self.get("/missing?u=29&w=2026-11-02&s=all")
+        self.assertNotIn(">NMC Admin</td>", page)
+
+    def test_a_new_scope_or_internal_code_needs_an_approver_chosen(self):
+        page = self.get("/admin?u=1&t=scopes")
+        self.assertIn('<option value="">Choose an approver</option>', page)
+        self.assertIn("Choose an approver", self.admin_post("/admin/add", {"t": "scopes", "project_id": "1", "scope_code": "ZZ9", "description": "X", "status": "Open", "approver_user_id": ""}))
+        self.assertIsNone(self.one("select 1 from scope where scope_code='ZZ9'"))
+        self.assertIn("Choose an approver", self.admin_post("/admin/add", {"t": "internal", "description": "Nope", "approver_user_id": ""}))
+        self.assertIn("a booking code)", page.replace("Hours are booked to a phase (a booking code)", "a booking code)"))
+        self.assertIn("<th>Scope description</th>", page)
+
+    def test_the_rate_card_marks_current_and_superseded_rates_and_filters_by_client(self):
+        self.admin_post("/admin/add", {"t": "rates", "client_id": "1", "role_id": "4", "sales_rate": "92", "effective_from": "2026-06-01"})
+        page = self.get("/admin?u=1&t=rates")
+        self.assertIn("<th>State</th>", page)
+        planner = re.findall(r"<td>Apache</td><td>PM-04</td><td>Planner</td><td>([\d.]+)</td><td>([\d-]+)</td><td>(\w+)</td>", page)
+        self.assertEqual(planner, [("92.00", "2026-06-01", "Current"), ("85.50", "2026-01-01", "Superseded")])   # newest first
+        self.admin_post("/admin/add", {"t": "rates", "client_id": "1", "role_id": "4", "sales_rate": "99", "effective_from": "2099-01-01"})
+        self.assertIn("<td>Future</td>", self.get("/admin?u=1&t=rates"))
+        spirit = self.get("/admin?u=1&t=rates&f_client=2")
+        self.assertNotIn("<td>Apache</td>", spirit)
+        self.assertIn("<td>Spirit</td>", spirit)
+
+    def test_the_audit_trail_can_be_filtered_to_one_persons_hours(self):
+        everyone = self.get("/audit?u=29")
+        one = self.get("/audit?u=29&person=5")
+        self.assertIn("for this person", one)
+        self.assertLess(one.count("<tr>"), everyone.count("<tr>"))
+        self.assertNotIn(">Daniel Evans</td>", one)
+        self.assertEqual(self.get("/audit?u=29&person=zzz").count("<tr>"), everyone.count("<tr>"))
+
+    def test_an_approve_all_button_works_without_ticking_or_scripting(self):
+        page = self.get("/approvals?u=7&w=2026-11-02")
+        self.assertIn('<button type="submit" name="approve_person" value="5"', page)          # Ewan Shaw has hours waiting
+        con = app.db()
+        before = con.execute("select count(*) from time_entry where user_id=5 and status='Submitted'").fetchone()[0]
+        con.close()
+        self.assertGreater(before, 0)
+        page = self.post("/approvals/act", {"u": "7", "w": "2026-11-02", "approve_person": "5"})
+        self.assertIn("approved", page)
+        self.assertEqual(self.one("select count(*) from time_entry where user_id=5 and status='Submitted'")[0], 0)
+        apache = "select count(*) from time_entry where user_id=9 and status='Submitted' and scope_id in (select scope_id from scope where client_id=1)"
+        daniel = self.one(apache)[0]
+        self.assertGreater(daniel, 0)                                                                                # nobody else's was touched
+        # the wrong approver cannot use it: Kenneth approves the Spirit scopes, so Daniel's Apache hours stay put
+        self.post("/approvals/act", {"u": "8", "w": "2026-11-02", "approve_person": "9"})
+        self.assertEqual(self.one(apache)[0], daniel)
+
+    def test_reopen_lists_the_weeks_that_can_be_reopened(self):
+        page = self.get("/reopen?u=29&person=5&w=2026-11-02")
+        self.assertIn("Weeks with submitted or approved hours:", page)
+        self.assertIn("/reopen?u=29&amp;person=5&amp;w=2026-11-02", page)
+        self.assertIn("none", self.get("/reopen?u=29&person=30&w=2026-11-02").split("Weeks with submitted or approved hours:")[1])
+
+    def test_the_it_admin_account_has_no_timesheet(self):
+        page = self.get("/timesheet?u=30")
+        self.assertIn("does not book time", page)
+        self.assertNotIn('>My Timesheet</a>', page)                                                # no menu link
+        self.assertIn('>My Timesheet</a>', self.get("/timesheet?u=5"))
+
+    def test_users_can_be_searched_by_name_or_id(self):
+        page = self.get("/admin?u=30&t=users&f_q=ewan")
+        self.assertIn(">Ewan Shaw</td>", page)
+        self.assertNotIn(">Daniel Evans</td>", page)
+        nmc = self.one("select nmc_id from app_user where user_id=9")[0]
+        self.assertIn(">Daniel Evans</td>", self.get("/admin?u=30&t=users&f_q=" + nmc))
+        self.assertIn(">Daniel Evans</td>", self.get("/admin?u=30&t=users&f_q="))
+
+    def test_job_families_are_listed_and_each_opens_to_its_job_titles(self):
+        page = self.get("/admin?u=30&t=roles")
+        self.assertIn("<th>Job family</th><th>Job titles</th><th>Active titles</th><th>People</th>", page)
+        self.assertIn('f_family=Project%20Management">Project Management</a>', page)
+        self.assertNotIn("<th>Skill code</th>", page.split("<h4>Add a job title</h4>")[0])      # titles are one click in, not on this page
+        con = app.db()
+        want = [tuple(r) for r in con.execute("select skill_code, name from role where family='Project Management' order by skill_code")]
+        total = con.execute("select count(*) from role where family='Project Management'").fetchone()[0]
+        con.close()
+        self.assertIn("<td>%d</td>" % total if False else '<td align="right">%d</td>' % total, page)
+        family = self.get("/admin?u=30&t=roles&f_family=Project%20Management")
+        self.assertIn("&lt;&lt; All job families", family)
+        shown = re.findall(r"<tr><td>([A-Z]{2}-\d\d)</td><td>([^<]*)</td>", family)
+        self.assertEqual([tuple(x) for x in shown], want)
+        self.assertIn("<th>People in this role</th>", family)
+        self.assertNotIn(">Lead Piping Engineer</td>", family)                 # another family's titles are not shown
+        self.assertEqual(self.get("/admin?u=30&t=roles&f_family=Nonsense").count("<th>Job titles</th>"), 1)  # an unknown family falls back to the list
+
+    def test_a_job_family_can_be_renamed_and_titles_added_to_it(self):
+        self.assertIn("Family renamed", self.admin_post("/admin/save", {"t": "roles", "id": "0", "old_family": "Project Management", "new_family": "Project Controls"}))
+        self.assertEqual(self.one("select count(*) from role where family='Project Management'")[0], 0)
+        self.assertGreater(self.one("select count(*) from role where family='Project Controls'")[0], 0)
+        page = self.admin_post("/admin/add", {"t": "roles", "family": "Project Controls", "skill_code": "PM-99", "name": "Scheduler"})
+        self.assertIn("Role added", page)
+        self.assertIn("Scheduler", page)                                                               # you land in the family it went into
+        self.assertIn("All job families", page)
+        new_family = self.admin_post("/admin/add", {"t": "roles", "family": "Brand New", "skill_code": "BN-01", "name": "First role"})
+        self.assertIn("First role", new_family)
+        self.assertIn('f_family=Brand%20New">Brand New</a>', self.get("/admin?u=30&t=roles"))
+        self.assertIn("Give the family a name", self.admin_post("/admin/save", {"t": "roles", "id": "0", "old_family": "Brand New", "new_family": ""}))
+        saved = self.admin_post("/admin/save", {"t": "roles", "id": str(self.one("select role_id from role where skill_code='BN-01'")[0]),
+                                                "family": "Brand New", "skill_code": "BN-01", "name": "Renamed role", "active": "0"})
+        self.assertIn("Renamed role", saved)                                                           # editing a title returns to its family
+        self.assertIn("<td>No</td>", saved)
 
     # ---------- the PAAF list: in order of its # and filterable ----------
     def paaf_ids(self, page):

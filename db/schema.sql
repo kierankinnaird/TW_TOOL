@@ -2,7 +2,7 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 10;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+PRAGMA user_version = 11;  -- 2: a cost controller approves the hours a scope approver books to their own scope
                           -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
                           -- 4: every entry has a location (On site / Offshore / Standard) and an overtime flag
                           -- 5: a cost controller can reopen submitted or approved hours (reopen_reason)
@@ -12,6 +12,7 @@ PRAGMA user_version = 10;  -- 2: a cost controller approves the hours a scope ap
                           -- 8: the audit trail can only be added to, never changed or deleted
                           -- 9: rate rows can only be added: a rate is never edited or deleted, a new row with a later date takes over
                           -- 10: allowances (Overnight allowance, Per Diem, Mob fee) claimed per day, submitted and approved with the hours
+                          -- 11: a person cannot book more than 24 hours in one day across all rows
 
 -- Controlled list of job titles, grouped into job families. Editable by admin/superuser.
 CREATE TABLE role (
@@ -576,4 +577,18 @@ END;
 CREATE TRIGGER trg_allowance_audit_no_delete BEFORE DELETE ON allowance_audit
 BEGIN
     SELECT RAISE(ABORT, 'The audit trail cannot be deleted');
+END;
+
+-- One person cannot book more than 24 hours on one day, however many rows (codes, locations, overtime) the hours are spread over.
+CREATE TRIGGER trg_time_entry_day_cap_insert
+BEFORE INSERT ON time_entry
+BEGIN
+    SELECT RAISE(ABORT, 'A person cannot book more than 24 hours in one day')
+    WHERE COALESCE((SELECT SUM(hours) FROM time_entry WHERE user_id = NEW.user_id AND work_date = NEW.work_date), 0) + NEW.hours > 24;
+END;
+CREATE TRIGGER trg_time_entry_day_cap_update
+BEFORE UPDATE OF hours, work_date ON time_entry
+BEGIN
+    SELECT RAISE(ABORT, 'A person cannot book more than 24 hours in one day')
+    WHERE COALESCE((SELECT SUM(hours) FROM time_entry WHERE user_id = NEW.user_id AND work_date = NEW.work_date AND entry_id <> NEW.entry_id), 0) + NEW.hours > 24;
 END;

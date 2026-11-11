@@ -371,6 +371,27 @@ class TestActiveDatesAndPaafExpiry(Base):
         self.assertEqual(bad, 0)
 
 
+class TestDailyHourCap(Base):
+    """A person cannot book more than 24 hours in one day, however the hours are spread over rows."""
+    INS = ("INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) "
+           "VALUES (5,1,1,1,4,4,'2026-11-06',?,5,?,?)")
+
+    def test_the_day_total_is_capped_across_locations_and_overtime(self):
+        self.con.execute(self.INS, (20, 1, 0))
+        self.blocked(self.INS, (5, 2, 0), "more than 24 hours")      # offshore, same day
+        self.blocked(self.INS, (5, 1, 1), "more than 24 hours")      # overtime, same day
+        self.con.execute(self.INS, (4, 2, 0))                        # exactly 24 in all is allowed
+        self.assertEqual(self.scalar("select sum(hours) from time_entry where user_id=5 and work_date='2026-11-06'"), 24)
+
+    def test_editing_hours_up_is_capped_too_and_other_people_and_days_are_separate(self):
+        self.con.execute(self.INS, (10, 1, 0))
+        self.con.execute(self.INS, (10, 2, 0))
+        eid = self.scalar("select max(entry_id) from time_entry where user_id=5")
+        self.blocked("UPDATE time_entry SET hours=15, last_edited_by=5, last_edited_at='x' WHERE entry_id=?", (eid,), "more than 24 hours")
+        self.con.execute("UPDATE time_entry SET hours=14, last_edited_by=5, last_edited_at='x' WHERE entry_id=?", (eid,))
+        self.con.execute("INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by) VALUES (5,1,1,1,4,4,'2026-11-07',24,5)")
+
+
 class TestAllowances(Base):
     """Overnight allowance, Per Diem and Mob fee: claimed per day against a booking code, submitted and approved with the hours."""
     INS = "INSERT INTO allowance_entry (user_id, scope_id, phase_id, allowance_id, work_date, created_by) VALUES (?,?,?,?,?,?)"
