@@ -183,23 +183,28 @@ INSERT INTO paaf (paaf_id, user_id, client_id, rate_id, status, sent_date, decid
  (36,8,2,60,'Approved','2026-02-02','2026-02-11','paaf/spirit/A008.pdf'),
  (37,7,1,2, 'Approved','2026-02-02','2026-02-10','paaf/apache/A007.pdf');
 
+-- Approvers: each client has a main approver. Secondary approvers on a scope (scope_approver) are added in Admin when a scope needs more
+-- than one person. Alisdair Woodhead is the Apache and Internal main approver and Kenneth Nicolson the Spirit one (both standard users).
+UPDATE client SET approver_user_id = 7 WHERE client_id IN (1, 3);
+UPDATE client SET approver_user_id = 8 WHERE client_id = 2;
+
 INSERT INTO project (project_id, project_code, name, client_id) VALUES
  (1,'APJ-01','Wellbay Decommissioning',1),
  (2,'APJ-02','Platform Decommissioning',1),
  (3,'SPJ-01','Morecambe Hub',2),
  (4,'INT','Internal',3);
 
-INSERT INTO scope (scope_id, scope_code, client_id, project_id, description, status, approver_user_id) VALUES
- (1,'BB0001',1,1,'Wellbay Clearance','Open',    7),
- (2,'BB0002',1,2,'Platform Study',   'Open',    7),
- (3,'FB0001',1,2,'EDC Engineering',  'Closed',  7),
- (4,'A1400', 2,3,'Rivers and Calder','Pipeline',8),
- (5,'A1500', 2,3,'PGC & NRU',        'Open',    8),
- (6,'A1600', 2,3,'Pipeline Removal', 'Open',    8),
+INSERT INTO scope (scope_id, scope_code, client_id, project_id, description, status) VALUES
+ (1,'BB0001',1,1,'Wellbay Clearance','Open'),
+ (2,'BB0002',1,2,'Platform Study',   'Open'),
+ (3,'FB0001',1,2,'EDC Engineering',  'Closed'),
+ (4,'A1400', 2,3,'Rivers and Calder','Pipeline'),
+ (5,'A1500', 2,3,'PGC & NRU',        'Open'),
+ (6,'A1600', 2,3,'Pipeline Removal', 'Open'),
  -- Internal codes (no PAAF, no rate)
- (7,'INT01',3,4,'Business Services',   'Open', 7),
- (8,'INT02',3,4,'Training',            'Open', 7),
- (9,'INT03',3,4,'Business Development','Open', 7);
+ (7,'INT01',3,4,'Business Services',   'Open'),
+ (8,'INT02',3,4,'Training',            'Open'),
+ (9,'INT03',3,4,'Business Development','Open');
 
 -- Phases. Hours are booked to a phase. Every scope has at least one.
 INSERT INTO phase (phase_id, scope_id, name) VALUES
@@ -323,3 +328,9 @@ UPDATE time_entry SET status='Draft', reject_reason='Project Controls Manager co
 
 -- Allowances people can claim per day (one of each per person per day).
 INSERT INTO allowance_type (allowance_id, name) VALUES (1,'Overnight allowance'),(2,'Per Diem'),(3,'Mob fee');
+
+-- The standard allowance is GBP 100 a day (staff only), whatever the location, normal or overtime. Cost controllers change it on
+-- the Admin, Allowance rates tab by adding rows with a later effective date.
+INSERT INTO allowance_rate (allowance_id, location_id, overtime, amount, effective_from)
+SELECT a.allowance_id, l.location_id, o.ot, 100, '2026-01-01' FROM allowance_type a, location l, (SELECT 0 AS ot UNION SELECT 1) o;
+
