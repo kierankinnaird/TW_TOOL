@@ -1,15 +1,19 @@
-"""Front end for the v1 mock database. Plain HTML with one inline stylesheet, standard library only.
+"""Front end for the v1 mock database. Plain HTML with one inline stylesheet, served by Flask (the pages themselves are built as plain strings).
 
+Needs Flask:   pip install -r requirements.txt
 Run from the repo root:   python app/app.py        then open  http://localhost:8000
 Uses build/timewriting.db (create it first with: python scripts/build.py).
 There is no login: pick who you are from the "Signed in as" box (mock).
 """
 import datetime
+import functools
 import html
+import logging
 import os
 import sqlite3
 import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from flask import Flask, Response, request
+from werkzeug.serving import make_server as make_wsgi_server
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2724,152 +2728,160 @@ def view_audit(con, u, q=None):
 
 
 # ---------- server ----------
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a):
-        pass
+# ---------- The web layer (Flask) ----------
+# Every page is a function above that takes the database connection and returns HTML. The routes below only read the request,
+# open the database, call the right function and send the result. Query strings and forms are read with parse_qs exactly as before
+# (dicts of lists), so the page functions did not change.
+flask_app = Flask(__name__, static_folder=None)
+flask_app.url_map.strict_slashes = False
+logging.getLogger("werkzeug").setLevel(logging.ERROR)  # no request log lines on the console
 
-    def security_headers(self):
-        """Browser protections on every page: no content sniffing, no framing (clickjacking), no referrer leaks, and a policy that only
-        lets the page load its own resources (the page's own inline style and script are the only inline code it has)."""
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-                         "img-src 'self' data:; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
-        self.send_header("Cache-Control", "no-store")
 
-    def send_html(self, text, code=200):
-        data = text.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.security_headers()
-        self.end_headers()
-        self.wfile.write(data)
+def html_response(text, code=200):
+    return Response(text, status=code, mimetype="text/html")
 
-    def send_download(self, data, filename):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        self.send_header("Content-Disposition", 'attachment; filename="%s"' % filename)
-        self.send_header("Content-Length", str(len(data)))
-        self.security_headers()
-        self.end_headers()
-        self.wfile.write(data)
 
-    def send_asset(self, path):
+def query():
+    return parse_qs(request.query_string.decode("utf-8"))
+
+
+def posted():
+    return parse_qs(request.get_data(as_text=True), keep_blank_values=True)
+
+
+def user_id(con, q):
+    try:
+        return int(q["u"][0])
+    except (KeyError, ValueError):
+        return con.execute("select user_id from app_user order by user_id limit 1").fetchone()[0]
+
+
+def with_db(fn):
+    """Open the database for one request, make sure the current week exists, and close it afterwards."""
+    @functools.wraps(fn)
+    def wrapper():
+        con = db()
+        try:
+            ensure_current_period(con)
+            return fn(con)
+        finally:
+            con.close()
+    return wrapper
+
+
+def page(rule, *, methods=("GET",)):
+    """Register a route whose function receives (con, u, q) for a page, or (con, form) for a posted form."""
+    def deco(fn):
+        @with_db
+        def view(con):
+            if request.method == "POST":
+                return html_response(fn(con, posted()))
+            q = query()
+            return html_response(fn(con, user_id(con, q), q))
+        view.__name__ = "view_" + fn.__name__
+        flask_app.add_url_rule(rule, endpoint=rule, view_func=view, methods=list(methods))
+        return fn
+    return deco
+
+
+@flask_app.after_request
+def security_headers(resp):
+    """Browser protections on every response: no content sniffing, no framing (clickjacking), no referrer leaks, and a policy that only
+    lets the page load its own resources (the page's own inline style and script are the only inline code it has)."""
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                            "img-src 'self' data:; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+    resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
+
+@flask_app.errorhandler(404)
+@flask_app.errorhandler(405)
+def not_found(_):
+    return html_response("<p>Not found</p>", 404)
+
+
+def _serve_asset(path):
+    def view():
         try:
             with open(ASSETS[path][0], "rb") as f:
                 data = f.read()
         except OSError:
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", ASSETS[path][1])
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "public, max-age=86400")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def user_id(self, con, q):
-        try:
-            return int(q["u"][0])
-        except (KeyError, ValueError):
-            return con.execute("select user_id from app_user order by user_id limit 1").fetchone()[0]
-
-    def do_GET(self):
-        url = urlparse(self.path)
-        if url.path in ASSETS:
-            return self.send_asset(url.path)
-        q = parse_qs(url.query)
-        con = db()
-        try:
-            ensure_current_period(con)
-            u = self.user_id(con, q)
-            if url.path in ("/", "/timesheet"):
-                try:
-                    w = monday(datetime.date.fromisoformat(q["w"][0])) if "w" in q else monday(datetime.date.today())
-                except ValueError:
-                    w = monday(datetime.date.today())
-                adds = parse_adds(q.get("add", []))
-                if "add_phase" in q and "add_role" in q:
-                    adds += parse_adds(["%s:%s:%s:%s" % (q["add_phase"][0], q["add_role"][0], q.get("add_loc", ["1"])[0], "1" if "add_ot" in q else "0")])
-                aadds = parse_pairs(q.get("aadd", []))
-                if "aadd_phase" in q and "aadd_type" in q:
-                    aadds += parse_pairs(["%s:%s" % (q["aadd_phase"][0], q["aadd_type"][0])])
-                self.send_html(view_timesheet(con, u, w, adds=adds, aadds=list(dict.fromkeys(aadds))))
-            elif url.path == "/approvals":
-                self.send_html(view_approvals(con, u, q=q))
-            elif url.path == "/missing":
-                self.send_html(view_missing(con, u, q))
-            elif url.path == "/reopen":
-                self.send_html(view_reopen(con, u, q))
-            elif url.path == "/reports":
-                self.send_html(view_reports(con, u, q))
-            elif url.path == "/reports/grid":
-                self.send_html(view_grid(con, u, q))
-            elif url.path in ("/reports/grid.xlsx", "/reports/period.xlsx"):
-                if permission_of(con, u) == "admin":
-                    self.send_html(no_access(con, u, "Reports"), 403)
-                else:
-                    rv = report_view(con, u)
-                    if url.path == "/reports/grid.xlsx":
-                        rows, sheet = grid_sheet(grid_data(con, u, q, rv)), "Timesheet grid"
-                        n_bold = (1, len(rows)) if len(rows) > 1 else (1,)
-                    else:
-                        rows, sheet = period_sheet(con, u, q, rv)
-                        n_bold = (1, len(rows)) if len(rows) > 1 else (1,)
-                    self.send_download(xlsx_bytes(sheet, rows, n_bold), "timewriting-%s.xlsx" % ("grid" if "grid" in url.path else "period"))
-            elif url.path == "/ctr":
-                self.send_html(view_ctr(con, u, q))
-            elif url.path == "/admin":
-                self.send_html(view_admin(con, u, q.get("t", [""])[0], q=q))
-            elif url.path == "/admin/edit":
-                self.send_html(view_admin_edit(con, u, q.get("t", [""])[0], int(q.get("id", ["0"])[0])))
-            elif url.path == "/audit":
-                self.send_html(view_audit(con, u, q))
-            else:
-                self.send_html("<p>Not found</p>", 404)
-        finally:
-            con.close()
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        form = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-        con = db()
-        try:
-            ensure_current_period(con)
-            if self.path == "/timesheet/save":
-                self.send_html(save_timesheet(con, form))
-            elif self.path == "/timesheet/copy":
-                self.send_html(copy_week(con, form))
-            elif self.path == "/reopen/act":
-                self.send_html(reopen_week(con, form))
-            elif self.path == "/approvals/act":
-                self.send_html(act_approval(con, form))
-            elif self.path == "/admin/period":
-                self.send_html(act_period(con, form))
-            elif self.path == "/admin/add":
-                self.send_html(admin_add(con, form))
-            elif self.path == "/admin/save":
-                self.send_html(admin_save(con, form))
-            elif self.path == "/admin/paaf":
-                self.send_html(act_paaf(con, form))
-            elif self.path == "/admin/allowance_rates":
-                self.send_html(act_allowance_rates(con, form))
-            else:
-                self.send_html("<p>Not found</p>", 404)
-        finally:
-            con.close()
+            return html_response("<p>Not found</p>", 404)
+        return Response(data, mimetype=ASSETS[path][1], headers={"Cache-Control": "public, max-age=86400"})
+    view.__name__ = "asset_" + path.strip("/").replace("/", "_").replace(".", "_")
+    return view
 
 
-class Server(ThreadingHTTPServer):
-    # Threaded so Chrome's idle pre-opened connections can't block real requests.
-    daemon_threads = True
+for _path in ASSETS:
+    flask_app.add_url_rule(_path, endpoint=_path, view_func=_serve_asset(_path))
+
+
+@flask_app.route("/")
+@flask_app.route("/timesheet")
+@with_db
+def timesheet_page(con):
+    q = query()
+    u = user_id(con, q)
+    try:
+        w = monday(datetime.date.fromisoformat(q["w"][0])) if "w" in q else monday(datetime.date.today())
+    except ValueError:
+        w = monday(datetime.date.today())
+    adds = parse_adds(q.get("add", []))
+    if "add_phase" in q and "add_role" in q:
+        adds += parse_adds(["%s:%s:%s:%s" % (q["add_phase"][0], q["add_role"][0], q.get("add_loc", ["1"])[0], "1" if "add_ot" in q else "0")])
+    aadds = parse_pairs(q.get("aadd", []))
+    if "aadd_phase" in q and "aadd_type" in q:
+        aadds += parse_pairs(["%s:%s" % (q["aadd_phase"][0], q["aadd_type"][0])])
+    return html_response(view_timesheet(con, u, w, adds=adds, aadds=list(dict.fromkeys(aadds))))
+
+
+page("/approvals")(lambda con, u, q: view_approvals(con, u, q=q))
+page("/missing")(lambda con, u, q: view_missing(con, u, q))
+page("/reopen")(lambda con, u, q: view_reopen(con, u, q))
+page("/reports")(lambda con, u, q: view_reports(con, u, q))
+page("/reports/grid")(lambda con, u, q: view_grid(con, u, q))
+page("/ctr")(lambda con, u, q: view_ctr(con, u, q))
+page("/admin")(lambda con, u, q: view_admin(con, u, q.get("t", [""])[0], q=q))
+page("/admin/edit")(lambda con, u, q: view_admin_edit(con, u, q.get("t", [""])[0], int(q.get("id", ["0"])[0])))
+page("/audit")(lambda con, u, q: view_audit(con, u, q))
+
+
+@flask_app.route("/reports/grid.xlsx")
+@flask_app.route("/reports/period.xlsx")
+@with_db
+def excel_download(con):
+    q = query()
+    u = user_id(con, q)
+    if permission_of(con, u) == "admin":
+        return html_response(no_access(con, u, "Reports"), 403)
+    rv = report_view(con, u)
+    grid = request.path.endswith("grid.xlsx")
+    if grid:
+        rows, sheet = grid_sheet(grid_data(con, u, q, rv)), "Timesheet grid"
+    else:
+        rows, sheet = period_sheet(con, u, q, rv)
+    bold = (1, len(rows)) if len(rows) > 1 else (1,)
+    return Response(xlsx_bytes(sheet, rows, bold), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="timewriting-%s.xlsx"' % ("grid" if grid else "period")})
+
+
+page("/timesheet/save", methods=("POST",))(lambda con, form: save_timesheet(con, form))
+page("/timesheet/copy", methods=("POST",))(lambda con, form: copy_week(con, form))
+page("/reopen/act", methods=("POST",))(lambda con, form: reopen_week(con, form))
+page("/approvals/act", methods=("POST",))(lambda con, form: act_approval(con, form))
+page("/admin/period", methods=("POST",))(lambda con, form: act_period(con, form))
+page("/admin/add", methods=("POST",))(lambda con, form: admin_add(con, form))
+page("/admin/save", methods=("POST",))(lambda con, form: admin_save(con, form))
+page("/admin/paaf", methods=("POST",))(lambda con, form: act_paaf(con, form))
+page("/admin/allowance_rates", methods=("POST",))(lambda con, form: act_allowance_rates(con, form))
 
 
 def make_server(port=8000):
-    return Server(("127.0.0.1", port), Handler)
+    """A threaded development server on this machine (Werkzeug's, the one Flask itself uses). It has serve_forever, shutdown and server_address."""
+    return make_wsgi_server("127.0.0.1", port, flask_app, threaded=True)
 
 
 def schema_problem(path):

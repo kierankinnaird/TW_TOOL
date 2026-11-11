@@ -9,7 +9,7 @@ db/
   schema.sql      tables, triggers (business rules), views
   seed.sql        demo data (4 locations, 2 clients plus the Internal client with 3 internal codes, 32 job titles in job families (3 with no rate card), 30 users, 4 projects, 9 scopes, 10 CTRs, 52 entries over 2 weeks)
 app/
-  app.py          front end (plain HTML and one inline stylesheet, standard library only, no framework)
+  app.py          front end: Flask routes serving plain HTML pages with one inline stylesheet (the page functions are ordinary Python that return HTML strings)
   static/         the TASA Orbiter font file, the only static file the app serves
 scripts/
   build.py        builds build/timewriting.db from schema + seed
@@ -20,6 +20,8 @@ tests/
 docs/             source documents such as the SOR (git-ignored, kept on the local machine only)
 build/            generated .db files (git-ignored)
 ```
+
+The web layer is Flask. `python app/app.py` runs Werkzeug's development server, which is fine for the mock; a real deployment would run `flask_app` under a production WSGI server (for example waitress or gunicorn). Every page is a function that takes the database connection and returns HTML; the routes at the bottom of `app.py` only read the request and call it.
 
 ## Look and feel
 
@@ -36,6 +38,7 @@ Front end (no login: pick who you are in the "Signed in as" box):
 
 ```
 python scripts/build.py
+pip install -r requirements.txt           # once: Flask
 python app/app.py                            # then open http://localhost:8000
 ```
 
