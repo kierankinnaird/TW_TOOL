@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
 # Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
-REQUIRED_SCHEMA = 14
+REQUIRED_SCHEMA = 15
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
 ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "TASAOrbiterVF.woff2"), "font/woff2")}
 
@@ -352,7 +352,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
 
     week_inactive = start > d6 or (end is not None and end < d0)
     entries = con.execute(
-        "select t.*, s.scope_code, s.description, c.name as client, pr.name as project, ph.name as phase, ro.skill_code, lo.name as location_name "
+        "select t.*, s.scope_code, s.description, c.name as client, pr.name as project, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, ro.skill_code, lo.name as location_name "
         "from time_entry t join phase ph on ph.phase_id=t.phase_id join scope s on s.scope_id=ph.scope_id "
         "join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
         "join role ro on ro.role_id=t.worked_role_id join location lo on lo.location_id=t.location_id "
@@ -368,7 +368,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     for (pid, rid, lid, ot) in adds:
         if (pid, rid, lid, ot) in rows:
             continue
-        s = con.execute("select s.*, c.name as client, pr.name as project, ph.name as phase from phase ph "
+        s = con.execute("select s.*, c.name as client, pr.name as project, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase from phase ph "
                         "join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
                         "join client c on c.client_id=s.client_id where ph.phase_id=?", (pid,)).fetchone()
         r = con.execute("select * from role where role_id=?", (rid,)).fetchone()
@@ -509,7 +509,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     # allowances: a row per booking code and allowance, a tick box per day
     arows = {}
     for a in con.execute(
-            "select a.*, at.name as allowance, s.scope_code, s.description, c.name as client, pr.name as project, ph.name as phase "
+            "select a.*, at.name as allowance, s.scope_code, s.description, c.name as client, pr.name as project, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase "
             "from allowance_entry a join allowance_type at on at.allowance_id=a.allowance_id join phase ph on ph.phase_id=a.phase_id "
             "join scope s on s.scope_id=a.scope_id join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
             "where a.user_id=? and a.work_date between ? and ? order by c.name, pr.name, s.scope_code, ph.name, a.allowance_id", (u, d0, d6)):
@@ -518,7 +518,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     for (pid, aid) in aadds:
         if (pid, aid) in arows:
             continue
-        i = con.execute("select s.scope_code, s.description, c.name as client, pr.name as project, ph.name as phase, at.name as allowance "
+        i = con.execute("select s.scope_code, s.description, c.name as client, pr.name as project, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, at.name as allowance "
                         "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
                         "join client c on c.client_id=s.client_id, allowance_type at where ph.phase_id=? and at.allowance_id=? and at.active=1", (pid, aid)).fetchone()
         if i:
@@ -557,7 +557,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
 
     # add a row
     scopes = con.execute(
-        "select ph.phase_id, ph.name as phase, s.scope_code, s.description, pr.name as project, c.name as client, c.is_internal "
+        "select ph.phase_id, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, ph.name as phase_name, s.scope_code, s.description, pr.name as project, c.name as client, c.is_internal "
         "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
         "join client c on c.client_id=s.client_id left join paaf p on p.client_id=s.client_id and p.user_id=? "
         "and p.status='Approved' and (p.expiry_date is null or p.expiry_date >= ?) "
@@ -577,7 +577,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     elif scopes:
         def label(s):
             if s["is_internal"]:  # e.g. "Internal - Business Services"
-                return "%s - %s%s" % (esc(s["client"]), esc(s["description"]), "" if s["phase"] == "General" else " &gt; %s" % esc(s["phase"]))
+                return "%s - %s%s" % (esc(s["client"]), esc(s["description"]), "" if s["phase_name"] == "General" else " &gt; %s" % esc(s["phase"]))
             return "%s &gt; %s &gt; %s %s &gt; %s" % (esc(s["client"]), esc(s["project"]), esc(s["scope_code"]), esc(s["description"]), esc(s["phase"]))
         so = "".join('<option value="%d">%s</option>' % (s["phase_id"], label(s)) for s in scopes)
         ro = "".join('<option value="%d"%s>%s %s</option>' % (r["role_id"], " selected" if r["role_id"] == me["role_id"] else "", esc(r["skill_code"]), esc(r["name"])) for r in roles)
@@ -647,7 +647,7 @@ def save_timesheet(con, form):
         except ValueError:
             continue
         raw = vals[0].strip()
-        info = con.execute("select s.scope_id, s.scope_code, ph.name as phase from phase ph join scope s on s.scope_id=ph.scope_id "
+        info = con.execute("select s.scope_id, s.scope_code, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase from phase ph join scope s on s.scope_id=ph.scope_id "
                            "where ph.phase_id=?", (pid,)).fetchone()
         if not info:
             continue
@@ -705,7 +705,7 @@ def save_timesheet(con, form):
         if not d0 <= date <= d6:
             continue
         checked = "a_%d_%d_%s" % (pid, aid, date) in form
-        info = con.execute("select s.scope_id, s.scope_code, ph.name as phase, at.name as allowance from phase ph join scope s on s.scope_id=ph.scope_id, "
+        info = con.execute("select s.scope_id, s.scope_code, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, at.name as allowance from phase ph join scope s on s.scope_id=ph.scope_id, "
                            "allowance_type at where ph.phase_id=? and at.allowance_id=?", (pid, aid)).fetchone()
         if not info:
             continue
@@ -833,7 +833,7 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
     d0 = w.isoformat()
     days = [w + datetime.timedelta(days=i) for i in range(7)]
     entries = con.execute(
-        "select t.entry_id, t.user_id, bu.name as booked_by, c.name as client, pr.name as project, s.scope_code, ph.name as phase, ro.skill_code, "
+        "select t.entry_id, t.user_id, bu.name as booked_by, c.name as client, pr.name as project, s.scope_code, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, ro.skill_code, "
         "lo.name as location, t.overtime, t.work_date, t.hours, t.status, t.last_change_reason, "
         "(select old_hours from time_entry_audit a where a.entry_id=t.entry_id and a.new_status='Edited' order by a.audit_id desc limit 1) as was "
         "from time_entry t join scope s on s.scope_id=t.scope_id join phase ph on ph.phase_id=t.phase_id "
@@ -845,7 +845,7 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
     for e in entries:
         people.setdefault(e["user_id"], []).append(e)
     allowances = con.execute(
-        "select a.allowance_entry_id, a.user_id, bu.name as booked_by, at.name as allowance, a.work_date, a.status, c.name as client, s.scope_code, ph.name as phase "
+        "select a.allowance_entry_id, a.user_id, bu.name as booked_by, at.name as allowance, a.work_date, a.status, c.name as client, s.scope_code, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase "
         "from allowance_entry a join scope s on s.scope_id=a.scope_id join phase ph on ph.phase_id=a.phase_id join client c on c.client_id=s.client_id "
         "join allowance_type at on at.allowance_id=a.allowance_id join app_user bu on bu.user_id=a.user_id "
         "where a.status<>'Draft' and a.work_date between ? and ?" + aq[0] + " order by bu.name, a.work_date, a.allowance_id",
@@ -912,7 +912,7 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
         "".join('<td align="center"><b>%s</b></td>' % (fmt(day_tot[d.isoformat()]) if day_tot[d.isoformat()] else "&ndash;") for d in days), fmt(sum(day_tot.values()))))
     allow_html = ""
     if allowances:
-        allow_html = ('<p><b>Allowances</b> <small>Claims for Overnight allowance, Per Diem and Mob fee, approved or sent back in the same way as hours.</small></p>'
+        allow_html = ('<p><b>Allowances</b> <small>Claims for the offshore allowance, approved or sent back in the same way as hours.</small></p>'
                       '<table border="1" cellpadding="3" cellspacing="0"><tr><th></th><th>Person</th><th>Allowance</th><th>Date</th><th>Client</th><th>Scope</th><th>CTR</th><th>Status</th></tr>%s</table>' % "".join(
                           '<tr><td align="center">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
                               '<input type="checkbox" name="allowance_entry_id" value="%d">' % a["allowance_entry_id"] if a["status"] == "Submitted" else "",
@@ -1135,7 +1135,7 @@ def view_reopen(con, u, q, msgs=None, ok=False):
     b.append("<p><small>Weeks with submitted or approved hours: %s.</small></p>" % (
         ", ".join('<a href="/reopen?u=%d&amp;person=%d&amp;w=%s">%s</a>' % (u, person, wk, datetime.date.fromisoformat(wk).strftime("%d/%m/%Y")) for wk in wks) or "none"))
     ents = con.execute(
-        "select t.*, s.scope_code, ph.name as phase, ro.skill_code, lo.name as location_name, ap.name as approved_name "
+        "select t.*, s.scope_code, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, ro.skill_code, lo.name as location_name, ap.name as approved_name "
         "from time_entry t join scope s on s.scope_id=t.scope_id join phase ph on ph.phase_id=t.phase_id "
         "join role ro on ro.role_id=t.worked_role_id join location lo on lo.location_id=t.location_id "
         "left join app_user ap on ap.user_id=t.approved_by where t.user_id=? and t.work_date between ? and ? "
@@ -1267,7 +1267,7 @@ def ctr_tree_rows(con, u=None, rv=ALL_REPORTS):
     money = rv["money"]
     vis, vargs = visible_to(rv, u)
     ents = con.execute(
-        "select c.name as client, pr.project_code, pr.name as project, s.scope_code, s.description, ph.phase_id, ph.name as phase, "
+        "select c.name as client, pr.project_code, pr.name as project, s.scope_code, s.description, ph.phase_id, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, "
         "ro.skill_code, ro.name as role, rt.rate_id, rt.sales_rate, u.name as person, t.entry_id, t.work_date, t.hours, t.status "
         "from time_entry t join phase ph on ph.phase_id=t.phase_id join scope s on s.scope_id=ph.scope_id "
         "join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
@@ -1276,7 +1276,7 @@ def ctr_tree_rows(con, u=None, rv=ALL_REPORTS):
     # also list phases that have no booked hours yet, so the structure is visible: all of them for cost controllers,
     # only the scopes they approve for everyone else
     empty = con.execute(
-        "select c.name as client, pr.name as project, s.scope_code, s.description, ph.phase_id, ph.name as phase "
+        "select c.name as client, pr.name as project, s.scope_code, s.description, ph.phase_id, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase "
         "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
         "join client c on c.client_id=s.client_id where s.status='Open' and c.is_internal=0 and ph.phase_id not in "
         "(select phase_id from time_entry where status<>'Draft')" + ("" if rv["all"] else " and exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=?)"),
@@ -1390,8 +1390,8 @@ def period_filters(con, q, u=None, rv=ALL_REPORTS):
         "where c.is_internal=0 and (? is null or s.client_id=?) and (? is null or s.project_id=?)" + in_scopes
         + " order by s.scope_code", (client, client, project, project) + vargs)]
     scope = pick("scope", scopes)
-    phases = [(r["phase_id"], r["name"] if scope else "%s - %s" % (r["scope_code"], r["name"])) for r in con.execute(
-        "select ph.phase_id, ph.name, s.scope_code from phase ph join scope s on s.scope_id=ph.scope_id "
+    phases = [(r["phase_id"], r["ctr_no"]) for r in con.execute(
+        "select ph.phase_id, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as ctr_no, s.scope_code from phase ph join scope s on s.scope_id=ph.scope_id "
         "join client c on c.client_id=s.client_id "
         "where c.is_internal=0 and (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?)" + in_scopes
         + " order by s.scope_code, ph.name", (client, client, project, project, scope, scope) + vargs)]
@@ -1411,7 +1411,7 @@ def period_data(con, u, q, rv):
     if money:
         per = con.execute("select week_start, client, project, scope_code, phase, skill_code, role, hours, total from v_period_report "
                           "where week_start between ? and ? and (scope_code, phase) in "
-                          "(select s.scope_code, ph.name from phase ph join scope s on s.scope_id=ph.scope_id "
+                          "(select s.scope_code, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) from phase ph join scope s on s.scope_id=ph.scope_id "
                           "where (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?) "
                           "and (? is null or ph.phase_id=?)) "
                           "order by week_start, client, project, scope_code, phase, skill_code",
@@ -1420,7 +1420,7 @@ def period_data(con, u, q, rv):
         # the view above adds everyone's hours together, so for everyone else the same figures are built from their own entries only
         per = con.execute(
             "select date(t.work_date,'weekday 0','-6 days') as week_start, c.name as client, p.name as project, s.scope_code, "
-            "ph.name as phase, r.skill_code, r.name as role, sum(t.hours) as hours, 0 as total "
+            "(s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, r.skill_code, r.name as role, sum(t.hours) as hours, 0 as total "
             "from time_entry t join phase ph on ph.phase_id=t.phase_id join scope s on s.scope_id=ph.scope_id "
             "join project p on p.project_id=s.project_id join client c on c.client_id=s.client_id "
             "join rate rt on rt.rate_id=t.rate_id join role r on r.role_id=rt.role_id "
@@ -1533,7 +1533,7 @@ def view_reports(con, u, q):
         "from allowance_entry a join scope s on s.scope_id=a.scope_id join app_user bu on bu.user_id=a.user_id join allowance_type at on at.allowance_id=a.allowance_id "
         "where a.status<>'Draft' and date(a.work_date,'weekday 0','-6 days') between ? and ?" + avis +
         " group by a.user_id, a.allowance_id order by bu.name, a.allowance_id", (d_from, d_to) + aargs).fetchall()
-    b.append("<h4>Allowances (Overnight allowance, Per Diem, Mob fee)</h4>")
+    b.append("<h4>Allowances (offshore allowance)</h4>")
     b.append("<p><small>Days claimed in the date range above, by person and allowance. Approved days are signed off; waiting days are submitted and not yet approved. "
              "No amounts are held yet.</small></p>")
     if allow_rows:
@@ -1569,7 +1569,7 @@ def view_reports(con, u, q):
 
 # ---------- Timesheet grid report, layouts and Excel downloads (R27, R29, R30) ----------
 GRID_COLS = [("person", "Person", "u.name"), ("client", "Client", "c.name"), ("project", "Project", "pr.name"),
-             ("scope", "Scope", "s.scope_code || ' ' || s.description"), ("phase", "CTR", "ph.name"),
+             ("scope", "Scope", "s.scope_code || ' ' || s.description"), ("phase", "CTR", "(s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name)))"),
              ("skill", "Skill code", "ro.skill_code"), ("loc", "Location", "lo.name"),
              ("type", "Type", "case when t.overtime=1 then 'Overtime' else 'Normal' end")]
 # ready-made layouts: name, the columns that group the hours, and how the time is split across the page (day, week or one total)
@@ -1833,7 +1833,7 @@ def view_ctr(con, u, q):
         pid = int(q.get("phase", ["0"])[0])
     except ValueError:
         pid = 0
-    ph = con.execute("select ph.*, ph.name as phase, ph.status as phase_status, ph.description as phase_desc, s.scope_code, s.description as scope_desc, s.status as scope_status, c.framework_ref, "
+    ph = con.execute("select ph.*, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, ph.name as phase_name, ph.status as phase_status, ph.description as phase_desc, s.scope_code, s.description as scope_desc, s.status as scope_status, c.framework_ref, "
                      "pr.project_code, pr.name as project, c.name as client, "
                      "(select group_concat(x.name, ', ') from (select au.name from v_scope_approver va join app_user au on au.user_id=va.user_id "
                      "where va.scope_id=s.scope_id order by au.name) x) as approver "
@@ -1881,10 +1881,10 @@ def view_ctr(con, u, q):
                    if (ph["wbs"] or ph["cbs"] or ph["abs_code"]) else "")))
     avis, aargs = ("", ()) if rv["all"] else (" and (a.user_id=? or exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=?))", (u, u))
     arows = con.execute(
-        "select bu.name as person, at.name as allowance, lo.name as location, a.overtime, a.status, count(*) as days, sum(a.amount) as value "
+        "select bu.name as person, at.name as allowance, a.status, count(*) as days, sum(a.amount) as value "
         "from v_allowance_value a join scope s on s.scope_id=a.scope_id join app_user bu on bu.user_id=a.user_id "
-        "join allowance_type at on at.allowance_id=a.allowance_id join location lo on lo.location_id=a.location_id "
-        "where a.phase_id=? and a.status<>'Draft'" + avis + " group by a.user_id, a.allowance_id, a.location_id, a.overtime, a.status "
+        "join allowance_type at on at.allowance_id=a.allowance_id "
+        "where a.phase_id=? and a.status<>'Draft'" + avis + " group by a.user_id, a.allowance_id, a.status "
         "order by bu.name, a.allowance_id", (pid,) + aargs).fetchall()
     a_value = sum(r["value"] for r in arows if r["status"] == "Approved")
     tabs.append(("<b>[Allowances]</b>" if fam == "Allowances" else '<a href="%s&amp;family=Allowances">Allowances</a>' % base) if arows else "")
@@ -1897,16 +1897,15 @@ def view_ctr(con, u, q):
         return layout(con, u, "CTR", "".join(b))
     allow_table = ""
     if arows:
-        allow_table = ('<p><b>Allowances</b> <small>(Overnight allowance, Per Diem, Mob fee: staff only, valued by location and overtime; only Approved days count)%s</small></p>'
-                       '<table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>Allowance</th><th>Location</th><th>Type</th><th>Days</th>%s<th>Status</th></tr>%s%s</table>' % (
+        allow_table = ('<p><b>Allowances</b> <small>(offshore allowance: staff only; only Approved days count)%s</small></p>'
+                       '<table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>Allowance</th><th>Days</th>%s<th>Status</th></tr>%s%s</table>' % (
                            "" if rv["money"] else "",
                            "<th>Value</th>" if rv["money"] else "",
                            "".join("<tr>%s</tr>" % "".join((
-                               "<td>%s</td>" % esc(r["person"]), "<td>%s</td>" % esc(r["allowance"]), "<td>%s</td>" % esc(r["location"]),
-                               "<td>%s</td>" % ("<b>Overtime</b>" if r["overtime"] else "Normal"), '<td align="right">%d</td>' % r["days"],
+                               "<td>%s</td>" % esc(r["person"]), "<td>%s</td>" % esc(r["allowance"]), '<td align="right">%d</td>' % r["days"],
                                ('<td align="right">%.2f</td>' % (r["value"] if r["status"] == "Approved" else 0)) if rv["money"] else "",
                                "<td>%s</td>" % esc(r["status"]))) for r in arows),
-                           sub_row(["Total", "", "", "", str(sum(r["days"] for r in arows if r["status"] == "Approved"))] + (["%.2f" % a_value] if rv["money"] else []) + [""], right_from=4)))
+                           sub_row(["Total", "", str(sum(r["days"] for r in arows if r["status"] == "Approved"))] + (["%.2f" % a_value] if rv["money"] else []) + [""], right_from=4)))
 
     tcol = "<th>Total</th>" if money else ""
     if fam == "Allowances":
@@ -1918,17 +1917,17 @@ def view_ctr(con, u, q):
 
         def label(x):
             return "<td><b>%s</b></td>" % x
-        ctr_no = "%s-%s" % (ph["scope_code"], ph["ctr_code"] or ph["phase"].upper())
+        ctr_no = ph["phase"]
         b.append("<h4>CTR %s</h4>" % esc(ctr_no))
         b.append('<table border="1" cellpadding="3" cellspacing="0">'
                  "<tr>%s<td colspan=\"3\">%s</td></tr><tr>%s<td colspan=\"3\">%s</td></tr><tr>%s<td colspan=\"3\">%s</td></tr>"
                  "<tr>%s<td colspan=\"3\">%s</td></tr><tr>%s<td colspan=\"3\">%s</td></tr>"
                  "<tr>%s<td>%s</td>%s<td>%s</td></tr>"
                  "<tr>%s<td>%s</td>%s<td>%s</td>%s<td>%s</td></tr></table>" % (
-                     label("Project Name"), esc(ph["project"]), label("Project Title"), esc("%s - %s" % (ph["scope_desc"], ph["phase"])),
+                     label("Project Name"), esc(ph["project"]), label("Project Title"), esc("%s - %s" % (ph["scope_desc"], ph["phase_name"])),
                      label("Client"), esc(ph["client"]), label("Date"), datetime.date.today().strftime("%d/%m/%Y"),
                      label("Framework Agreement Ref"), esc(ph["framework_ref"] or "-"),
-                     label("CTR Title"), esc(ph["phase_desc"] or ph["phase"]), label("CTR No"), esc(ctr_no),
+                     label("CTR Title"), esc(ph["phase_desc"] or ph["phase_name"]), label("CTR No"), esc(ctr_no),
                      label("Prepared by"), esc(ph["prepared_by"] or "-"), label("Checked by"), esc(ph["checked_by"] or "-"),
                      label("Approved by"), esc(ph["approver"] or "-")))
         for title, key in (("Objectives", "objectives"), ("Input Requirements", "inputs"), ("Scope of Work", "scope_of_work"),
@@ -1961,13 +1960,13 @@ def view_ctr(con, u, q):
             "<th>Cost &pound; / Hour</th>" if money else "", "<th>Total</th>" if money else "", res_rows, res_total))
         # additions: the allowances, at the allowance rate table
         adds = con.execute(
-            "select at.name as allowance, lo.name as location, a.overtime, a.amount, count(*) as units "
+            "select at.name as allowance, a.amount, count(*) as units "
             "from v_allowance_value a join scope s on s.scope_id=a.scope_id join allowance_type at on at.allowance_id=a.allowance_id "
-            "join location lo on lo.location_id=a.location_id where a.phase_id=? and a.status='Approved'" + avis +
-            " group by a.allowance_id, a.location_id, a.overtime, a.amount order by a.allowance_id, a.location_id, a.overtime, a.amount", (pid,) + aargs).fetchall()
+            "where a.phase_id=? and a.status='Approved'" + avis +
+            " group by a.allowance_id, a.amount order by a.allowance_id, a.amount", (pid,) + aargs).fetchall()
         add_total = sum(r["amount"] * r["units"] for r in adds)
         add_rows = "".join("<tr><td>%s</td>%s<td align=\"right\">%d</td>%s</tr>" % (
-            esc("%s - %s%s" % (r["allowance"], r["location"], ", overtime" if r["overtime"] else "")),
+            esc(r["allowance"]),
             ('<td align="right">%.2f</td>' % r["amount"]) if money else "", r["units"],
             ('<td align="right">%.2f</td>' % (r["amount"] * r["units"])) if money else "") for r in adds)
         b.append('<table border="1" cellpadding="3" cellspacing="0" style="margin-top:.4rem"><tr><th>Addition</th>%s<th>Unit (days)</th>%s</tr>%s</table>' % (
@@ -2316,28 +2315,18 @@ def admin_body(con, u, t, q=None):
                     sel("rate_id", rate_options(con), None, True, "Default: the person's own role")))
     elif t == "allowance_rates":
         today = datetime.date.today().isoformat()
-
-        def current(aid, lid, ot):
-            r = con.execute("select amount from allowance_rate where allowance_id=? and location_id=? and overtime=? and effective_from<=? "
-                            "order by effective_from desc limit 1", (aid, lid, ot, today)).fetchone()
-            return r[0] if r else 0
-        locs = [(r[0], r[1]) for r in con.execute("select location_id, name from location order by location_id")]
         grid = []
         for al in con.execute("select allowance_id, name from allowance_type where active=1 order by allowance_id"):
-            for lid, lname in locs:
-                grid.append("<tr><td>%s</td><td>%s</td>%s</tr>" % (esc(al["name"]), esc(lname), "".join(
-                    '<td><input type="text" size="8" name="r_%d_%d_%d" value="%s"></td>' % (al["allowance_id"], lid, ot, fmt(current(al["allowance_id"], lid, ot))) for ot in (0, 1))))
-        b.append("<p><small>What one day of each allowance is worth, by where the hours were worked and whether they were overtime. Allowances are for staff only (contractors "
-                 "cannot claim them). A claim is valued from the location and overtime of that day's hours. Rates are never edited: change a figure here and it is saved as a "
-                 "new rate from the date you give, so earlier claims keep the value they had. Only the boxes you change are saved.</small></p>")
-        b.append('<form method="post" action="/admin/allowance_rates">%s<table border="1" cellpadding="3" cellspacing="0"><tr><th>Allowance</th><th>Location</th>'
-                 '<th>Normal (&pound; per day)</th><th>Overtime (&pound; per day)</th></tr>%s</table>'
-                 '<p>New rates apply from %s <input type="submit" value="Save rate changes"></p></form>' % (hidden(u=u), "".join(grid), date_input("effective_from", today)))
-        hist = [[r["name"], r["location"], "Overtime" if r["overtime"] else "Normal", "%.2f" % r["amount"], r["effective_from"]]
-                for r in con.execute("select at.name, lo.name as location, ar.overtime, ar.amount, ar.effective_from from allowance_rate ar "
-                                     "join allowance_type at on at.allowance_id=ar.allowance_id join location lo on lo.location_id=ar.location_id "
-                                     "order by at.allowance_id, lo.location_id, ar.overtime, ar.effective_from desc")]
-        b.append("<h4>Every rate, newest first</h4>" + table(["Allowance", "Location", "Type", "Per day", "From"], hist))
+            cur = con.execute("select amount from allowance_rate where allowance_id=? and effective_from<=? order by effective_from desc limit 1", (al["allowance_id"], today)).fetchone()
+            grid.append('<tr><td>%s</td><td><input type="text" size="8" name="r_%d" value="%s"></td></tr>' % (esc(al["name"]), al["allowance_id"], fmt(cur[0] if cur else 0)))
+        b.append("<p><small>What one day of each allowance is worth. Allowances are for staff only (contractors cannot claim them). Rates are never edited: change the figure "
+                 "here and it is saved as a new rate from the date you give, so earlier claims keep the value they had.</small></p>")
+        b.append('<form method="post" action="/admin/allowance_rates">%s<table border="1" cellpadding="3" cellspacing="0"><tr><th>Allowance</th><th>&pound; per day</th></tr>%s</table>'
+                 '<p>New rate applies from %s <input type="submit" value="Save rate"></p></form>' % (hidden(u=u), "".join(grid), date_input("effective_from", today)))
+        hist = [[r["name"], "%.2f" % r["amount"], r["effective_from"]]
+                for r in con.execute("select at.name, ar.amount, ar.effective_from from allowance_rate ar join allowance_type at on at.allowance_id=ar.allowance_id "
+                                     "order by at.allowance_id, ar.effective_from desc")]
+        b.append("<h4>Every rate, newest first</h4>" + table(["Allowance", "Per day", "From"], hist))
     elif t == "locations":
         b.append("<p><small>Where hours are worked. People pick one on each timesheet row (and tick Overtime for overtime). "
                  "Rename a location or switch it off to stop new bookings to it; hours already booked keep it. At least one must stay active.</small></p>")
@@ -2679,13 +2668,11 @@ def act_allowance_rates(con, form):
         return view_admin(con, u, "allowance_rates")
     try:
         start = need_date(form.get("effective_from", [""])[0], "Effective from")
-        today = datetime.date.today().isoformat()
         changed = 0
         for key, vals in form.items():
             if not key.startswith("r_"):
                 continue
-            _, aid, lid, ot = key.split("_")
-            aid, lid, ot = int(aid), int(lid), int(ot)
+            aid = int(key.split("_")[1])
             raw = vals[0].strip()
             try:
                 amount = float(raw)
@@ -2693,13 +2680,10 @@ def act_allowance_rates(con, form):
                     raise ValueError
             except ValueError:
                 raise ValueError("'%s' is not a rate: use a number of pounds, 0 or more." % raw)
-            cur = con.execute("select amount from allowance_rate where allowance_id=? and location_id=? and overtime=? and effective_from<=? "
-                              "order by effective_from desc limit 1", (aid, lid, ot, start)).fetchone()
-            if cur is not None and abs(cur[0] - amount) < 1e-9:
+            cur = con.execute("select amount from allowance_rate where allowance_id=? and effective_from<=? order by effective_from desc limit 1", (aid, start)).fetchone()
+            if (cur is not None and abs(cur[0] - amount) < 1e-9) or (cur is None and amount == 0):
                 continue
-            if cur is None and amount == 0:
-                continue
-            con.execute("insert into allowance_rate (allowance_id, location_id, overtime, amount, effective_from) values (?,?,?,?,?)", (aid, lid, ot, amount, start))
+            con.execute("insert into allowance_rate (allowance_id, amount, effective_from) values (?,?,?)", (aid, amount, start))
             changed += 1
         con.commit()
         return view_admin(con, u, "allowance_rates", ["%d rate%s saved, from %s." % (changed, "" if changed == 1 else "s", start) if changed else "Nothing changed."], ok=True)

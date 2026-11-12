@@ -205,7 +205,7 @@ class TestApp(unittest.TestCase):
         one_scope = self.period_part(base + "&client=%d&project=%d&scope=%d" % (spirit, sp["project_id"], sp["scope_id"]))
         self.assertNotIn(">%s</td>" % ap_code, one_scope)
         one_phase = self.period_part(base + "&client=%d&scope=%d&phase=%d" % (spirit, sp["scope_id"], ph["phase_id"]))
-        self.assertIn(">%s</td>" % ph["name"], one_phase)
+        self.assertIn(">%s-%s</td>" % (sp["scope_code"], "PM-D-001"), one_phase)
 
     def test_period_report_has_a_reset_button_back_to_the_unfiltered_page(self):
         page = self.get("/reports?u=5&client=2")
@@ -524,26 +524,26 @@ class TestApp(unittest.TestCase):
         self.assertIn('class="go"><b>2</b>', page)
         self.assertIn('class="gt"><b>12</b>', page)
 
-    def test_standard_is_one_choice_for_office_and_working_from_home(self):
+    def test_the_default_locations_are_on_shore_offshore_and_site_visit(self):
         page = self.get("/timesheet?u=4&w=2026-11-02")
-        for name in ("On site", "Offshore", "Standard"):
+        for name in ("On Shore", "Offshore", "Site visit"):
             self.assertIn('>%s</option>' % name, page, name)  # all three are in the Add row dropdown
         for gone in ("Office", "WFH"):
             self.assertNotIn('>%s</option>' % gone, page, gone)
-        # David Hart (4) books INT01 as Standard on Monday and Tuesday
+        # David Hart (4) books INT01 as a Site visit on Monday and Tuesday
         self.assertIn("2 entries saved", self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "reason": "",
                                                                       "h_8_4_3_0_2026-11-02": "7.5", "h_8_4_3_0_2026-11-03": "7.5"}))
         self.assertEqual(self.hours_of(4, "2026-11-02"), [(3, 0, 7.5, "Draft")])
         self.assertEqual(self.hours_of(4, "2026-11-03"), [(3, 0, 7.5, "Draft")])
-        page = self.get("/timesheet?u=4&w=2026-11-02&add_phase=8&add_role=4&add_loc=3")  # a Standard row from the dropdown
+        page = self.get("/timesheet?u=4&w=2026-11-02&add_phase=8&add_role=4&add_loc=3")  # a Site visit row from the dropdown
         self.assertIn("h_8_4_3_0_2026-11-05", page)
-        self.assertIn(">Standard</td>", page)
+        self.assertIn(">Site visit</td>", page)
         # they show up in the report by location once approved
         eid = self.one("select entry_id from time_entry where user_id=4 and work_date='2026-11-03'")[0]
         self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Submit week", "reason": ""})
         self.post("/approvals/act", {"u": "7", "entry_id": str(eid), "action": "Approve selected"})
         section = self.get("/reports?u=29&from=2026-01-01&to=2026-12-31").split("Hours by location and overtime")[1]
-        self.assertIn('<td>Standard</td><td align="right">7.5</td><td align="right">0</td><td align="right">7.5</td>', section)
+        self.assertIn('<td>Site visit</td><td align="right">7.5</td><td align="right">0</td><td align="right">7.5</td>', section)
 
     def test_the_same_cell_is_updated_not_duplicated(self):
         post = {"u": "4", "w": "2026-11-02", "action": "Save draft", "reason": ""}
@@ -586,7 +586,7 @@ class TestApp(unittest.TestCase):
         # Rob Millman (24) worked 4 hours offshore and nothing else, so that is all he sees; and no mention of values
         own = self.get("/reports?u=24&from=2026-01-01&to=2026-12-31").split("Hours by location and overtime")[1]
         self.assertIn('<td>Offshore</td><td align="right">4</td><td align="right">0</td><td align="right">4</td>', own)
-        self.assertNotIn("On site", own)
+        self.assertNotIn("On Shore", own)
         self.assertNotIn("no separate rate yet", own)
 
     def test_the_it_admin_manages_the_locations(self):
@@ -606,9 +606,9 @@ class TestApp(unittest.TestCase):
                                                                     "h_8_4_%d_0_2026-11-05" % rid: "2"}))
         self.assertEqual(self.hours_of(5, "2026-11-06"), [(rid, 0, 2, "Draft")])
         # at least one location must stay switched on
-        for lid, name in ((2, "Offshore"), (3, "Standard")):
+        for lid, name in ((2, "Offshore"), (3, "Site visit")):
             self.assertIn("Saved", self.admin_post("/admin/save", {"t": "locations", "id": str(lid), "name": name, "active": "0"}))
-        self.assertIn("At least one location must stay active", self.admin_post("/admin/save", {"t": "locations", "id": "1", "name": "On site", "active": "0"}))
+        self.assertIn("At least one location must stay active", self.admin_post("/admin/save", {"t": "locations", "id": "1", "name": "On Shore", "active": "0"}))
 
     def test_the_timesheet_script_totals_normal_time_overtime_and_the_total(self):
         page = self.get("/timesheet?u=5&w=2026-11-02")
@@ -673,7 +673,7 @@ class TestApp(unittest.TestCase):
         # Ajin Sabu (10): A1600 on Wed 4 Nov was sent back by Kenneth Nicolson with a reason
         page = self.get("/timesheet?u=10&w=2026-11-02")
         self.assertIn("Sent back for correction", page)
-        self.assertIn("A1600 Define, Wed 04/11", page)
+        self.assertIn("A1600-PM-D-001, Wed 04/11", page)
         self.assertIn("Project Controls Manager cover not agreed with client, please confirm", page)
         self.assertIn("sent back by Kenneth Nicolson on 06/11/2026 10:00", page)
         self.assertIn('title="Sent back: Project Controls Manager cover', page)  # a hover note on the box itself
@@ -699,7 +699,7 @@ class TestApp(unittest.TestCase):
         self.post("/approvals/act", {"u": "7", "entry_id": str(eid), "action": "Reject selected", "reason": "Wrong <b>code</b>, use training"})
         page = self.get("/timesheet?u=4&w=2026-11-02")
         self.assertIn("Sent back for correction", page)
-        self.assertIn("INT01 General, Wed 04/11", page)
+        self.assertIn("INT01-PM-G-001, Wed 04/11", page)
         self.assertIn("Alisdair Woodhead", page)
         self.assertIn("Wrong &lt;b&gt;code&lt;/b&gt;, use training", page)  # the reason is shown as text, never as HTML
         self.assertNotIn("Wrong <b>code</b>", page)
@@ -1240,7 +1240,7 @@ class TestApp(unittest.TestCase):
         page = self.get("/reports?u=29")
         for kind in ["Client", "Project", "Scope", "CTR", "Skill code", "Person", "Entry"]:
             self.assertIn("<td>%s</td>" % kind, page)
-        for name in ["Wellbay Decommissioning", "BB0001 Wellbay Clearance", "Execute", "Ewan Shaw", "2026-11-03", "Morecambe Hub"]:
+        for name in ["Wellbay Decommissioning", "BB0001 Wellbay Clearance", "BB0001-PM-E-001", "Ewan Shaw", "2026-11-03", "Morecambe Hub"]:
             self.assertIn(name, page)
         self.assertIn("Show to entries", page)
 
@@ -1258,7 +1258,7 @@ class TestApp(unittest.TestCase):
         page = self.get("/timesheet?u=9&w=2026-11-02")
         self.assertIn("<th>Project</th>", page)
         self.assertIn("<th>CTR</th>", page)
-        self.assertIn("Apache &gt; Wellbay Decommissioning &gt; BB0001 Wellbay Clearance &gt; Execute", page)
+        self.assertIn("Apache &gt; Wellbay Decommissioning &gt; BB0001 Wellbay Clearance &gt; BB0001-PM-E-001", page)
         # phase 2 = BB0001 Execute (Daniel Evans has an approved Execute entry on 3 Nov, which is locked), role 3 = Project Engineer
         self.assertNotIn('name="h_2_3_1_0_2026-11-03"', page)
         self.assertIn('name="h_2_3_1_0_2026-11-02"', page)
@@ -1394,6 +1394,8 @@ class TestApp(unittest.TestCase):
         """Allowances are for staff, and some of the seed's people are contractors: make these people staff for the test."""
         con = app.db()
         con.executemany("update app_user set employment_type='Staff' where user_id=?", [(x,) for x in users])
+        # the demo has one allowance; these tests also need a few more kinds, which the system supports (they have no rate, so they are worth nothing)
+        con.execute("insert or ignore into allowance_type (allowance_id, name) values (2, 'Per Diem'), (3, 'Mob fee')")
         con.commit()
         con.close()
 
@@ -1432,8 +1434,7 @@ class TestApp(unittest.TestCase):
         page = self.get("/timesheet?u=5&w=2026-11-02")
         self.assertNotIn("<b>Allowances</b>", page)          # no heading until there is a row to show
         self.assertIn("Add allowance:", page)
-        for name in ("Overnight allowance", "Per Diem", "Mob fee"):
-            self.assertIn(">%s</option>" % name, page)
+        self.assertIn(">Offshore allowance</option>", page)
         page = self.get("/timesheet?u=5&w=2026-11-02&aadd_phase=1&aadd_type=2")
         self.assertIn('name="a_1_2_2026-11-04"', page)               # a Per Diem row against BB0001 Define, a box per day
         self.assertIn('<th>Allowance</th>', page)
@@ -1504,7 +1505,7 @@ class TestApp(unittest.TestCase):
         self.claim(5, [(1, 2, "2026-11-05")], action="Submit week")
         before = int(re.search(r"Approvals \((\d+)\)", self.get("/approvals?u=7&w=2026-11-02")).group(1))
         con = app.db()
-        con.execute("update allowance_entry set status='Approved', approved_by=7, approved_at='x', last_edited_by=7, last_edited_at='x'")
+        con.execute("update allowance_entry set status='Approved', approved_by=7, approved_at='x', last_edited_by=7, last_edited_at='x' where user_id=5")
         con.commit()
         con.close()
         after = int(re.search(r"Approvals \((\d+)\)", self.get("/approvals?u=7&w=2026-11-02")).group(1))
@@ -1523,11 +1524,11 @@ class TestApp(unittest.TestCase):
         self.claim(5, [(1, 2, "2026-11-05"), (1, 2, "2026-11-04")], action="Submit week")
         ids = [r[0] for r in self.q_all("select allowance_entry_id from allowance_entry where user_id=5 order by work_date")]
         self.post("/approvals/act", {"u": "7", "w": "2026-11-02", "allowance_entry_id": str(ids[0]), "action": "Approve selected"})
-        section = self.get("/reports?u=29&from=2026-10-01&to=2026-12-31").split("Allowances (Overnight allowance")[1]
+        section = self.get("/reports?u=29&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]
         self.assertIn("<td>Ewan Shaw</td><td>Per Diem</td><td align=\"right\">1</td><td align=\"right\">1</td>", section)
-        own = self.get("/reports?u=5&from=2026-10-01&to=2026-12-31").split("Allowances (Overnight allowance")[1]
+        own = self.get("/reports?u=5&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]
         self.assertIn("Ewan Shaw", own)
-        other = self.get("/reports?u=9&from=2026-10-01&to=2026-12-31").split("Allowances (Overnight allowance")[1]       # Daniel Evans sees none of Ewan's
+        other = self.get("/reports?u=9&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]       # Daniel Evans sees none of Ewan's
         self.assertNotIn("Ewan Shaw", other.split("<h4>")[0])
         audit = self.get("/audit?u=29")
         self.assertIn("<h4>Allowances</h4>", audit)
@@ -1542,6 +1543,7 @@ class TestApp(unittest.TestCase):
         self.assertEqual(self.one("select sum(hours) from time_entry where user_id=5 and work_date='2026-11-10'")[0], 20)
 
     def test_add_row_saves_the_hours_you_have_typed_first(self):
+        self.staff(5)
         page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Add row", "h_1_4_1_0_2026-11-10": "6",
                                              "add_phase": "8", "add_role": "4", "add_loc": "1"})
         self.assertEqual(self.one("select hours from time_entry where user_id=5 and work_date='2026-11-10' and phase_id=1")[0], 6)   # saved, not lost
@@ -1590,6 +1592,7 @@ class TestApp(unittest.TestCase):
     # ---------- booking code controls, approver per code, description and references (R06, R19, R04a, R04f) ----------
     def save_phase(self, phase, **kw):
         data = {"t": "phases", "id": str(phase), "name": self.one("select name from phase where phase_id=?", phase)[0], "status": "Open",
+                "ctr_code": self.one("select ctr_code from phase where phase_id=?", phase)[0],
                 "approver_user_id": "", "restricted": "0", "description": "", "wbs": "", "cbs": "", "abs_code": "", "book_from": "", "book_to": ""}
         data.update(kw)
         return self.admin_post("/admin/save", data, u="1")
@@ -1618,10 +1621,10 @@ class TestApp(unittest.TestCase):
 
     def test_a_restricted_code_is_only_offered_to_and_bookable_by_the_people_listed(self):
         both = self.get("/timesheet?u=9&w=2026-11-02")
-        self.assertIn("Apache &gt; Wellbay Decommissioning &gt; BB0001 Wellbay Clearance &gt; Execute", self.get("/timesheet?u=5&w=2026-11-02"))
+        self.assertIn("Apache &gt; Wellbay Decommissioning &gt; BB0001 Wellbay Clearance &gt; BB0001-PM-E-001", self.get("/timesheet?u=5&w=2026-11-02"))
         self.save_phase(1, restricted="1", person=["5"])               # BB0001 Define: Ewan Shaw only
         self.assertEqual(self.one("select count(*) from phase_person where phase_id=1")[0], 1)
-        define = "Apache &gt; Wellbay Decommissioning &gt; BB0001 Wellbay Clearance &gt; Define</option>"
+        define = "Apache &gt; Wellbay Decommissioning &gt; BB0001 Wellbay Clearance &gt; BB0001-PM-D-001</option>"
         self.assertIn(define, self.get("/timesheet?u=5&w=2026-11-02"))
         self.assertNotIn(define, self.get("/timesheet?u=9&w=2026-11-02"))
         self.assertIn("not on its list", self.post("/timesheet/save", {"u": "9", "w": "2026-11-02", "action": "Save draft", "reason": "",
@@ -1636,7 +1639,7 @@ class TestApp(unittest.TestCase):
         self.assertIn(define, self.get("/timesheet?u=9&w=2026-11-02"))
 
     def test_a_booking_window_hides_the_code_and_refuses_dates_outside_it(self):
-        define = "Apache &gt; Wellbay Decommissioning &gt; BB0001 Wellbay Clearance &gt; Define</option>"
+        define = "Apache &gt; Wellbay Decommissioning &gt; BB0001 Wellbay Clearance &gt; BB0001-PM-D-001</option>"
         self.save_phase(1, book_from="2026-11-03", book_to="2026-11-05")
         self.assertIn(define, self.get("/timesheet?u=5&w=2026-11-02"))                  # the week overlaps the window
         self.assertNotIn(define, self.get("/timesheet?u=5&w=2026-11-16"))               # a later week is outside it
@@ -1706,19 +1709,40 @@ class TestApp(unittest.TestCase):
         self.assertIn("Saved", self.admin_post("/admin/save", {"t": "clients", "id": "1", "approver_user_id": "7", "framework_ref": "APA-77 Master Agreement"}, u="1"))
         self.assertIn("APA-77 Master Agreement", self.get("/ctr?u=29&phase=2"))
 
-    def test_the_sheets_additions_are_the_approved_allowances_at_the_allowance_rates(self):
-        self.claim(9, [(1, 2, "2026-11-04"), (1, 2, "2026-11-05")], action="Submit week")          # two Per Diem days for a staff member on BB0001 Define
-        ids = [r[0] for r in self.q_all("select allowance_entry_id from allowance_entry order by work_date")]
+    def test_the_sheets_additions_are_the_approved_offshore_allowance_at_its_rate(self):
+        self.claim(9, [(1, 1, "2026-11-04"), (1, 1, "2026-11-05")], action="Submit week")          # two offshore allowance days for a staff member on BB0001 Define
+        ids = [r[0] for r in self.q_all("select allowance_entry_id from allowance_entry where user_id=9 order by work_date")]
         self.post("/approvals/act", {"u": "7", "w": "2026-11-02", "allowance_entry_id": [str(i) for i in ids], "action": "Approve selected"})
         page = self.get("/ctr?u=29&phase=1")
         row = page.split("<th>Addition</th>")[1].split("</table>")[0]
-        self.assertIn("Per Diem - On site", row)
+        self.assertIn("Offshore allowance", row)
         self.assertIn('<td align="right">100.00</td><td align="right">2</td><td align="right">200.00</td>', row)    # 100 a day x 2 days
         self.assertIn("additions 200.00", page)
+        self.assertIn('family=Allowances">Allowances</a>', page)                                                    # and the people behind it
+        self.assertIn("Daniel Evans", self.get("/ctr?u=29&phase=1&family=Allowances"))
         seen = self.get("/ctr?u=7&phase=1")                                                                         # an approver sees days, no money
-        self.assertIn("Per Diem - On site", seen)
+        self.assertIn("Offshore allowance", seen)
         self.assertNotIn("Cost &pound; / Unit", seen)
         self.assertNotIn("200.00", seen.split("<th>Addition</th>")[1])
+        # a new rate from a date moves the value
+        self.admin_post("/admin/allowance_rates", {"u": "1", "effective_from": "2026-11-01", "r_1": "120"})
+        self.assertIn("additions 240.00", self.get("/ctr?u=29&phase=1"))
+
+    def test_the_allowance_rate_is_one_figure_changed_by_adding_a_row(self):
+        page = self.get("/admin?u=1&t=allowance_rates")
+        self.assertIn("&pound; per day", page)
+        self.assertIn('name="r_1" value="100"', page)                                                   # one allowance, one rate
+        self.assertNotIn("Overtime", page)
+        self.assertIn("not available to your role", self.get("/admin?u=30&t=allowance_rates"))          # the IT admin does not manage it
+        self.assertIn("1 rate saved, from 2026-11-01", self.admin_post("/admin/allowance_rates", {"u": "1", "effective_from": "2026-11-01", "r_1": "150"}))
+        self.assertEqual(self.one("select count(*) from allowance_rate")[0], 2)                         # appended, not edited
+        self.assertIn('name="r_1" value="150"', self.get("/admin?u=1&t=allowance_rates"))
+        self.assertIn("Nothing changed", self.admin_post("/admin/allowance_rates", {"u": "1", "effective_from": "2026-11-01", "r_1": "150"}))
+        self.assertIn("is not a rate", self.admin_post("/admin/allowance_rates", {"u": "1", "effective_from": "2026-11-01", "r_1": "lots"}))
+        self.assertIn("is not a rate", self.admin_post("/admin/allowance_rates", {"u": "1", "effective_from": "2026-11-01", "r_1": "-5"}))
+        self.assertIn("is required", self.admin_post("/admin/allowance_rates", {"u": "1", "effective_from": "", "r_1": "99"}))
+        self.admin_post("/admin/allowance_rates", {"u": "5", "effective_from": "2026-11-01", "r_1": "999"})   # nobody else can change it
+        self.assertEqual(self.one("select count(*) from allowance_rate where amount=999")[0], 0)
 
     # ---------- the approver's week: a line per person, detail, other weeks (R20-R22) ----------
     def week_people(self, approver, monday_iso):

@@ -33,7 +33,7 @@ class Base(unittest.TestCase):
 class TestSeed(Base):
     def test_counts(self):
         self.assertEqual(self.scalar("select count(*) from app_user"), 30)
-        self.assertEqual(self.scalar("select count(*) from time_entry"), 52)
+        self.assertEqual(self.scalar("select count(*) from time_entry"), 64)
         self.assertEqual(self.scalar("select count(*) from rate"), 60)
 
     def test_rates_rise_with_seniority_for_each_client(self):
@@ -73,7 +73,7 @@ class TestBookingRules(Base):
     # Seed ids: Ewan Shaw=5 (paaf 1, Apache), David Hart=4 (paaf 4 'Sent'), Emma Noble=1 (paaf 3 Apache, 5 Spirit)
     def test_valid_booking_is_accepted_and_audited(self):
         self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 8, 5))
-        self.assertEqual(self.scalar("select count(*) from time_entry_audit where action='CREATE'"), 53)
+        self.assertEqual(self.scalar("select count(*) from time_entry_audit where action='CREATE'"), 65)
 
     def test_unapproved_paaf_blocks_booking(self):
         self.blocked(NEW_ENTRY, (4, 1, 1, 4, 4, 4, "2026-11-06", 8, 4), "No approved PAAF")
@@ -138,7 +138,7 @@ class TestHierarchy(Base):
 
     def test_ctr_view_has_one_line_per_phase_and_skill_code(self):
         rows = self.con.execute("select phase, skill_code, hours from v_ctr where scope_code='BB0001' and skill_code='PE-01'").fetchall()
-        self.assertEqual([(r[0], r[1], r[2]) for r in rows], [("Execute", "PE-01", 8), ("Define", "PE-01", 8)] if rows[0][0] == "Execute" else [("Define", "PE-01", 8), ("Execute", "PE-01", 8)])
+        self.assertEqual([(r[0], r[1], r[2]) for r in rows], [("BB0001-PM-E-001", "PE-01", 8), ("BB0001-PM-D-001", "PE-01", 8)] if rows[0][0].endswith("E-001") else [("BB0001-PM-D-001", "PE-01", 8), ("BB0001-PM-E-001", "PE-01", 8)])
         self.assertEqual(self.scalar("select sum(total) from v_ctr"), self.scalar("select sum(total) from v_period_report"))
 
 
@@ -233,7 +233,7 @@ class TestLifecycle(Base):
         eid = self.scalar("select entry_id from time_entry where status='Draft' limit 1")  # Ajin Sabu's rejected entry
         self.con.execute("UPDATE time_entry SET last_edited_by=10, last_edited_at='t9' WHERE entry_id=?", (eid,))
         self.con.execute("DELETE FROM time_entry WHERE entry_id=?", (eid,))
-        self.assertEqual(self.scalar("select count(*) from time_entry"), 51)
+        self.assertEqual(self.scalar("select count(*) from time_entry"), 63)
 
     def test_every_status_change_is_audited(self):
         n_status = self.scalar("select count(*) from time_entry_audit where action='STATUS'")
@@ -425,6 +425,7 @@ class TestAllowances(Base):
     def setUp(self):
         super().setUp()
         self.con.execute("UPDATE app_user SET employment_type='Staff' WHERE user_id=5")   # Ewan Shaw is a contractor in the seed; allowances are for staff
+        self.con.execute("INSERT INTO allowance_type (allowance_id, name) VALUES (2, 'Per Diem'), (3, 'Mob fee')")   # the demo has one; the schema supports more
 
     def test_contractors_cannot_claim_allowances(self):
         self.con.execute("UPDATE app_user SET employment_type='Contract' WHERE user_id=5")
@@ -448,8 +449,9 @@ class TestAllowances(Base):
         sql, args = self.update(eid, status, by, reason, approved_by)
         self.con.execute(sql, args)
 
-    def test_the_three_allowances_are_seeded(self):
-        self.assertEqual([r[0] for r in self.con.execute("select name from allowance_type order by allowance_id")], ["Overnight allowance", "Per Diem", "Mob fee"])
+    def test_the_demo_has_one_allowance_the_offshore_allowance(self):
+        self.con.execute("DELETE FROM allowance_type WHERE allowance_id IN (2, 3)")
+        self.assertEqual([r[0] for r in self.con.execute("select name from allowance_type order by allowance_id")], ["Offshore allowance"])
 
     def test_a_person_claims_one_of_each_allowance_per_day(self):
         self.claim(allowance=1)
@@ -526,7 +528,7 @@ class TestAllowances(Base):
 
 
 class TestAllowanceRates(Base):
-    """Allowance rates: GBP 100 a day by default, by location and overtime, append-only, and used to value approved claims."""
+    """The offshore allowance: one rate, GBP 100 a day, append-only, used to value approved claims."""
     def setUp(self):
         super().setUp()
         self.con.execute("UPDATE app_user SET employment_type='Staff' WHERE user_id=5")
@@ -538,43 +540,31 @@ class TestAllowanceRates(Base):
     def value(self, eid):
         return self.scalar("select amount from v_allowance_value where allowance_entry_id=?", eid)
 
-    def test_the_standard_rate_is_100_a_day_for_every_location_and_overtime(self):
-        self.assertEqual(self.scalar("select count(*) from allowance_rate"), 3 * 3 * 2)
-        self.assertEqual(self.scalar("select count(distinct amount) from allowance_rate"), 1)
-        self.assertEqual(self.scalar("select min(amount) from allowance_rate"), 100)
+    def test_the_standard_rate_is_100_a_day(self):
+        self.assertEqual([tuple(r) for r in self.con.execute("select allowance_id, amount, effective_from from allowance_rate")], [(1, 100, "2026-01-01")])
+        self.assertEqual(self.value(self.claim()), 100)
 
     def test_rates_are_never_edited_or_deleted(self):
         self.blocked("UPDATE allowance_rate SET amount=1", msg="never edited")
         self.blocked("DELETE FROM allowance_rate", msg="never deleted")
-        self.blocked("INSERT INTO allowance_rate (allowance_id, location_id, overtime, amount, effective_from) VALUES (1,1,0,150,'2026-01-01')", msg="UNIQUE")
-        self.blocked("INSERT INTO allowance_rate (allowance_id, location_id, overtime, amount, effective_from) VALUES (1,1,0,-5,'2026-06-01')", msg="CHECK")
-
-    def test_a_claim_is_valued_from_where_the_hours_were_worked_and_whether_they_were_overtime(self):
-        eid = self.claim("2026-11-04")          # Ewan has 8 normal on-site hours that day in the seed
-        self.assertEqual(self.value(eid), 100)
-        self.con.execute("INSERT INTO allowance_rate (allowance_id, location_id, overtime, amount, effective_from) VALUES (1,2,0,175,'2026-11-01')")   # offshore, normal
-        self.assertEqual(self.value(eid), 100)  # still on site
-        # twelve offshore hours that day make it an offshore day
-        self.con.execute("INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by, location_id) "
-                         "VALUES (5,1,1,1,4,4,'2026-11-04',12,5,2)")
-        self.assertEqual(self.value(eid), 175)
-        # overtime that day moves it to the overtime rate
-        self.con.execute("INSERT INTO allowance_rate (allowance_id, location_id, overtime, amount, effective_from) VALUES (1,2,1,250,'2026-11-01')")
-        self.con.execute("INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) "
-                         "VALUES (5,1,1,1,4,4,'2026-11-04',2,5,2,1)")
-        self.assertEqual(self.value(eid), 250)
+        self.blocked("INSERT INTO allowance_rate (allowance_id, amount, effective_from) VALUES (1,150,'2026-01-01')", msg="UNIQUE")
+        self.blocked("INSERT INTO allowance_rate (allowance_id, amount, effective_from) VALUES (1,-5,'2026-06-01')", msg="CHECK")
 
     def test_a_new_rate_applies_from_its_date_and_earlier_days_keep_the_old_value(self):
         before, after = self.claim("2026-11-04"), self.claim("2026-11-06")
-        self.con.execute("INSERT INTO allowance_rate (allowance_id, location_id, overtime, amount, effective_from) VALUES (1,1,0,120,'2026-11-05')")
+        self.con.execute("INSERT INTO allowance_rate (allowance_id, amount, effective_from) VALUES (1,120,'2026-11-05')")
         self.assertEqual((self.value(before), self.value(after)), (100, 120))
 
-    def test_a_day_with_no_hours_uses_on_site_normal_and_a_missing_rate_is_worth_nothing(self):
-        self.assertEqual(self.value(self.claim("2026-11-07")), 100)            # a Saturday with no hours
+    def test_the_value_does_not_depend_on_where_or_how_the_hours_were_worked(self):
+        eid = self.claim("2026-11-04")
+        self.con.execute("INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) "
+                         "VALUES (5,1,1,1,4,4,'2026-11-04',12,5,2,1)")                # twelve offshore overtime hours that day
+        self.assertEqual(self.value(eid), 100)
+
+    def test_an_allowance_with_no_rate_is_worth_nothing(self):
         self.con.execute("INSERT INTO allowance_type (name) VALUES ('Test')")
         new_type = self.scalar("select max(allowance_id) from allowance_type")
-        self.con.execute("INSERT INTO allowance_entry (user_id, scope_id, phase_id, allowance_id, work_date, created_by) VALUES (5,1,1,?,'2026-11-05',5)", (new_type,))
-        self.assertEqual(self.value(self.scalar("select max(allowance_entry_id) from allowance_entry")), 0)
+        self.assertEqual(self.value(self.claim("2026-11-05", allowance=new_type)), 0)
 
 
 class TestRatesAreAppendOnly(Base):
@@ -727,16 +717,25 @@ class TestReopen(Base):
 
 
 class TestHourTypes(Base):
-    """Every entry has a location (On site / Offshore / Standard) and an overtime flag. Overtime has no separate rate yet."""
+    """Every entry has a location (On Shore / Offshore / Site visit) and an overtime flag. Overtime has no separate rate yet."""
     def test_the_locations_are_seeded_and_new_entries_default_to_on_site_normal_time(self):
         self.assertEqual([tuple(r) for r in self.con.execute("select location_id, name, active from location order by location_id")],
-                         [(1, "On site", 1), (2, "Offshore", 1), (3, "Standard", 1)])
+                         [(1, "On Shore", 1), (2, "Offshore", 1), (3, "Site visit", 1)])
         eid = self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 8, 5)).lastrowid
         self.assertEqual(tuple(self.con.execute("select location_id, overtime from time_entry where entry_id=?", (eid,)).fetchone()), (1, 0))
 
-    def test_the_seed_has_an_offshore_day_and_an_overtime_day(self):
-        self.assertEqual(self.scalar("select count(*) from time_entry where location_id=2"), 1)
-        self.assertEqual(self.scalar("select count(*) from time_entry where overtime=1"), 1)
+    def test_the_seed_has_offshore_weeks_and_overtime_days(self):
+        self.assertEqual(self.scalar("select count(*) from time_entry where location_id=2"), 12)               # Rob's day, Louis's week, Lloyd's four days
+        self.assertEqual(self.scalar("select count(distinct user_id) from time_entry where location_id=2"), 3)
+        self.assertEqual(self.scalar("select count(*) from time_entry where overtime=1"), 3)                  # Neil's day and two of Louis's
+
+    def test_the_seed_has_allowances_in_every_state_for_two_staff_offshore(self):
+        self.assertEqual({r[0]: r[1] for r in self.con.execute("select status, count(*) from allowance_entry group by 1")}, {"Approved": 3, "Submitted": 6})
+        self.assertEqual({r[0] for r in self.con.execute("select u.employment_type from allowance_entry a join app_user u using(user_id)")}, {"Staff"})
+        # the 300 approved is three days at 100, each on a day the person worked offshore
+        self.assertEqual(self.scalar("select sum(amount) from v_allowance_value where status='Approved'"), 300)
+        self.assertEqual(self.scalar("select count(*) from allowance_entry a where status='Approved' and exists (select 1 from time_entry t where t.user_id=a.user_id "
+                                     "and t.work_date=a.work_date and t.location_id=2)"), 3)
 
     def test_location_and_overtime_must_be_valid(self):
         sql = ("INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) "

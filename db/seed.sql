@@ -211,9 +211,9 @@ INSERT INTO phase (phase_id, scope_id, name) VALUES
  (1,1,'Define'),(2,1,'Execute'),(3,2,'Define'),(4,3,'Define'),(5,4,'Define'),(6,5,'Define'),(7,6,'Define'),
  (8,7,'General'),(9,8,'General'),(10,9,'General');
 
--- Hour types: where hours are worked. Entries default to location 1 (On site) and normal time; overtime is a flag on the entry.
--- The choices are On site, Offshore and Standard (office or working from home); the IT admin can add more on the Locations tab.
-INSERT INTO location (location_id, name) VALUES (1,'On site'),(2,'Offshore'),(3,'Standard');
+-- Hour types: where hours are worked. Entries default to location 1 (On Shore) and normal time; overtime is a flag on the entry.
+-- The choices are On Shore, Offshore and Site visit; the IT admin can add more on the Locations tab.
+INSERT INTO location (location_id, name) VALUES (1,'On Shore'),(2,'Offshore'),(3,'Site visit');
 
 -- Weekly periods: week of 26 Oct (to be closed later) and week of 2 Nov.
 INSERT INTO period (week_start) VALUES ('2026-10-26'),('2026-11-02');
@@ -326,13 +326,10 @@ UPDATE time_entry SET status='Draft', reject_reason='Project Controls Manager co
        last_edited_by=8, last_edited_at='2026-11-06 10:00'
  WHERE user_id=10 AND work_date='2026-11-04';
 
--- Allowances people can claim per day (one of each per person per day).
-INSERT INTO allowance_type (allowance_id, name) VALUES (1,'Overnight allowance'),(2,'Per Diem'),(3,'Mob fee');
-
--- The standard allowance is GBP 100 a day (staff only), whatever the location, normal or overtime. Cost controllers change it on
--- the Admin, Allowance rates tab by adding rows with a later effective date.
-INSERT INTO allowance_rate (allowance_id, location_id, overtime, amount, effective_from)
-SELECT a.allowance_id, l.location_id, o.ot, 100, '2026-01-01' FROM allowance_type a, location l, (SELECT 0 AS ot UNION SELECT 1) o;
+-- The offshore allowance: one allowance, claimed per day, staff only. It is worth GBP 100 a day, whatever the hours; cost controllers
+-- change it on the Admin, Allowance rate tab by adding a row with a later effective date.
+INSERT INTO allowance_type (allowance_id, name) VALUES (1,'Offshore allowance');
+INSERT INTO allowance_rate (allowance_id, amount, effective_from) VALUES (1, 100, '2026-01-01');
 
 -- CTR sheet details. Every CTR has a code (discipline - phase letter - sequence); the number shown is the scope code in front of it,
 -- for example A1500-PM-D-001. One CTR has the sheet fields filled in as an example.
@@ -346,3 +343,34 @@ UPDATE phase SET description = 'Wellbay Clearance - Define', prepared_by = 'AB',
   exclusions = '- Offshore surveys, which are covered by their own CTR',
   basis = '1. Based on the MDR and programme for the Wellbay Clearance define phase.'
 WHERE phase_id = 1;
+
+-- ---------------------------------------------------------------------------------------------------------------------
+-- An offshore week, with the offshore allowance. Both are staff, so they can claim allowances; the rates are on the allowance rate table.
+--   Louis Ducharme (Operations Superintendent): week of 2 Nov offshore on BB0002 Mon-Fri (8 normal hours a day, plus 4 hours overtime
+--     on Wed and Thu). Hours and allowances are approved Mon-Wed and submitted Thu-Fri.
+--   Lloyd Quinn (Lead Construction Engineer): Mon on site, Tue-Fri offshore on BB0001 Define, all submitted, allowances submitted.
+-- ---------------------------------------------------------------------------------------------------------------------
+INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) VALUES
+ (11,2,3,11,7,13,'2026-11-02',8,11,2,0),
+ (11,2,3,11,7,13,'2026-11-03',8,11,2,0),
+ (11,2,3,11,7,13,'2026-11-04',8,11,2,0),
+ (11,2,3,11,7,13,'2026-11-05',8,11,2,0),
+ (11,2,3,11,7,13,'2026-11-06',8,11,2,0),
+ (11,2,3,11,7,13,'2026-11-04',4,11,2,1),
+ (11,2,3,11,7,13,'2026-11-05',4,11,2,1),
+ (18,1,1,18,21,27,'2026-11-02',8,18,1,0),
+ (18,1,1,18,21,27,'2026-11-03',8,18,2,0),
+ (18,1,1,18,21,27,'2026-11-04',8,18,2,0),
+ (18,1,1,18,21,27,'2026-11-05',8,18,2,0),
+ (18,1,1,18,21,27,'2026-11-06',8,18,2,0);
+UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-05 10:00', last_edited_by=7, last_edited_at='2026-11-05 10:00'
+ WHERE user_id=11 AND scope_id=2 AND status='Submitted' AND work_date BETWEEN '2026-11-02' AND '2026-11-04';
+
+INSERT INTO allowance_entry (user_id, scope_id, phase_id, allowance_id, work_date, created_by, last_edited_by, last_edited_at) VALUES
+ (11,2,3,1,'2026-11-02',11,11,'2026-11-06 07:00'), (11,2,3,1,'2026-11-03',11,11,'2026-11-06 07:00'), (11,2,3,1,'2026-11-04',11,11,'2026-11-06 07:00'),
+ (11,2,3,1,'2026-11-05',11,11,'2026-11-06 07:00'), (11,2,3,1,'2026-11-06',11,11,'2026-11-06 07:00'),
+ (18,1,1,1,'2026-11-03',18,18,'2026-11-06 07:00'), (18,1,1,1,'2026-11-04',18,18,'2026-11-06 07:00'), (18,1,1,1,'2026-11-05',18,18,'2026-11-06 07:00'),
+ (18,1,1,1,'2026-11-06',18,18,'2026-11-06 07:00');
+UPDATE allowance_entry SET status='Submitted', last_edited_by=user_id, last_edited_at='2026-11-06 08:00' WHERE user_id IN (11, 18);
+UPDATE allowance_entry SET status='Approved', approved_by=7, approved_at='2026-11-06 09:30', last_edited_by=7, last_edited_at='2026-11-06 09:30'
+ WHERE user_id=11 AND work_date BETWEEN '2026-11-02' AND '2026-11-04';

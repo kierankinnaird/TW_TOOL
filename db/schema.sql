@@ -2,7 +2,7 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 14;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+PRAGMA user_version = 15;  -- 2: a cost controller approves the hours a scope approver books to their own scope
                           -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
                           -- 4: every entry has a location (On site / Offshore / Standard) and an overtime flag
                           -- 5: a cost controller can reopen submitted or approved hours (reopen_reason)
@@ -15,6 +15,7 @@ PRAGMA user_version = 14;  -- 2: a cost controller approves the hours a scope ap
                           -- 11: a person cannot book more than 24 hours in one day across all rows
                           -- 12: allowances are for staff only, and are valued from an append-only rate table (by allowance, location and overtime)
                           -- 13: approvers are a main approver per client plus secondary approvers per scope; the phase is the CTR (booking code)
+                          -- 15: one offshore allowance at one rate (no location or overtime matrix); default locations On Shore / Offshore / Site visit
                           -- 14: a CTR carries the fields of the CTR sheet (CTR code, objectives, inputs, scope, assumptions, payment terms ...) and a client a framework reference
 
 -- Controlled list of job titles, grouped into job families. Editable by admin/superuser.
@@ -430,7 +431,7 @@ END;
 -- Totals count Approved entries only; pending_hours = Submitted + Edited awaiting approval.
 CREATE VIEW v_ctr AS
 SELECT c.name AS client, p.project_code, p.name AS project, s.scope_code, s.description AS scope,
-       ph.phase_id, ph.name AS phase, r.skill_code, r.name AS role,
+       ph.phase_id, s.scope_code || '-' || COALESCE(ph.ctr_code, UPPER(ph.name)) AS phase, r.skill_code, r.name AS role,
        SUM(CASE WHEN t.status = 'Approved' THEN t.hours ELSE 0 END) AS hours,
        rt.sales_rate,
        SUM(CASE WHEN t.status = 'Approved' THEN t.hours * rt.sales_rate ELSE 0 END) AS total,
@@ -448,7 +449,7 @@ GROUP BY ph.phase_id, rt.rate_id;
 -- Weekly period report (approved hours). Filter by week_start BETWEEN two dates for a date range.
 CREATE VIEW v_period_report AS
 SELECT date(t.work_date, 'weekday 0', '-6 days') AS week_start,
-       c.name AS client, p.name AS project, s.scope_code, ph.name AS phase, r.skill_code, r.name AS role,
+       c.name AS client, p.name AS project, s.scope_code, s.scope_code || '-' || COALESCE(ph.ctr_code, UPPER(ph.name)) AS phase, r.skill_code, r.name AS role,
        SUM(t.hours) AS hours, SUM(t.hours * rt.sales_rate) AS total
 FROM time_entry t
 JOIN phase ph ON ph.phase_id = t.phase_id
@@ -468,7 +469,7 @@ JOIN app_user u ON u.user_id = t.user_id
 WHERE t.status IN ('Submitted','Edited');
 
 -- ---------------------------------------------------------------------------------------------------------------------------
--- Allowances: Overnight allowance, Per Diem, Mob fee. A person claims one of each per day, against a booking code (so it is
+-- Allowances: the offshore allowance. A person claims one of each allowance per day, against a booking code (so it is
 -- approved by that code's approver and follows the same rules as hours). Flat claims: no amount is stored yet.
 -- ---------------------------------------------------------------------------------------------------------------------------
 CREATE TABLE allowance_type (
@@ -619,16 +620,14 @@ BEGIN
     WHERE COALESCE((SELECT SUM(hours) FROM time_entry WHERE user_id = NEW.user_id AND work_date = NEW.work_date AND entry_id <> NEW.entry_id), 0) + NEW.hours > 24;
 END;
 
--- Allowance rates: what one day of an allowance is worth, by where the hours were worked and whether they were overtime.
--- Append-only like the client rate cards: a change is a new row with a later effective date, so past claims keep their value.
+-- Allowance rates: what one day of an allowance is worth. Append-only like the client rate cards: a change is a new row with a later
+-- effective date, so past claims keep their value.
 CREATE TABLE allowance_rate (
     allowance_rate_id INTEGER PRIMARY KEY,
     allowance_id   INTEGER NOT NULL REFERENCES allowance_type(allowance_id),
-    location_id    INTEGER NOT NULL REFERENCES location(location_id),
-    overtime       INTEGER NOT NULL CHECK (overtime IN (0,1)),
     amount         NUMERIC NOT NULL CHECK (amount >= 0),
     effective_from TEXT NOT NULL,
-    UNIQUE (allowance_id, location_id, overtime, effective_from)
+    UNIQUE (allowance_id, effective_from)
 );
 CREATE TRIGGER trg_allowance_rate_no_update BEFORE UPDATE ON allowance_rate
 BEGIN
@@ -639,15 +638,9 @@ BEGIN
     SELECT RAISE(ABORT, 'Allowance rates are never deleted: add a new row with a later effective date');
 END;
 
--- Each allowance claim with the value of that day: the location is where the person worked most hours that day (the later location
--- on a tie), overtime if any of that day's hours were overtime, and the rate is the one in force on the day. No rate means 0.
+-- Each allowance claim with the value of that day: the rate in force on the day. No rate means 0.
 CREATE VIEW v_allowance_value AS
-SELECT x.*,
-       COALESCE((SELECT r.amount FROM allowance_rate r
-                 WHERE r.allowance_id = x.allowance_id AND r.location_id = x.location_id AND r.overtime = x.overtime AND r.effective_from <= x.work_date
+SELECT a.allowance_entry_id, a.user_id, a.scope_id, a.phase_id, a.allowance_id, a.work_date, a.status,
+       COALESCE((SELECT r.amount FROM allowance_rate r WHERE r.allowance_id = a.allowance_id AND r.effective_from <= a.work_date
                  ORDER BY r.effective_from DESC LIMIT 1), 0) AS amount
-FROM (SELECT a.allowance_entry_id, a.user_id, a.scope_id, a.phase_id, a.allowance_id, a.work_date, a.status,
-             COALESCE((SELECT t.location_id FROM time_entry t WHERE t.user_id = a.user_id AND t.work_date = a.work_date
-                       ORDER BY t.hours DESC, t.location_id DESC LIMIT 1), 1) AS location_id,
-             COALESCE((SELECT MAX(t.overtime) FROM time_entry t WHERE t.user_id = a.user_id AND t.work_date = a.work_date), 0) AS overtime
-      FROM allowance_entry a) x;
+FROM allowance_entry a;
