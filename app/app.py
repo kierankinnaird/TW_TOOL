@@ -2042,7 +2042,7 @@ DASH_CSS = """<style>
 .chart .val{fill:var(--black)}
 .chart .grid{stroke:var(--line);stroke-width:1}
 .chart rect.hit:hover{fill:rgba(254,103,0,.08)}
-.chart a{cursor:pointer}.chart a:hover text{fill:var(--orange)}
+.chart a{cursor:pointer;text-decoration:none}.chart a:hover text{fill:var(--orange)}
 .key{display:flex;flex-wrap:wrap;gap:1.2rem;font-size:.8rem;color:var(--grey-dark);margin:.4rem 0 .8rem}
 .key i{display:inline-block;width:12px;height:12px;margin-right:.35rem;vertical-align:-1px}
 </style>"""
@@ -2120,9 +2120,38 @@ def view_dashboard(con, u, q):
     """The cost controllers' dashboard: budget hours (from P6) against the approved hours booked here, in hours only, and the weekly flow of hours."""
     if permission_of(con, u) != "controller":
         return no_access(con, u, "Dashboard")
-    rows = con.execute("select * from v_ctr_budget where budget_hours is not null order by actual_hours * 1.0 / nullif(budget_hours, 0) desc, phase").fetchall()
+    (f_client, f_project, f_scope, f_phase), (f_clients, f_projects, f_scopes, f_phases) = period_filters(con, q, u, ALL_REPORTS)
+    chosen = (f_client, f_client, f_project, f_project, f_scope, f_scope, f_phase, f_phase)
+    show = q.get("show", [""])[0]
+    show = show if show in ("over", "near", "under") else ""
+
+    def a_date(name):
+        try:
+            return datetime.date.fromisoformat(q.get(name, [""])[0]).isoformat()
+        except ValueError:
+            return ""
+    d_from, d_to = a_date("from"), a_date("to")
+    rows = con.execute("select b.* from v_ctr_budget b join phase ph on ph.phase_id=b.phase_id join scope s on s.scope_id=ph.scope_id "
+                       "where b.budget_hours is not null and (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?) "
+                       "and (? is null or ph.phase_id=?) order by b.actual_hours * 1.0 / nullif(b.budget_hours, 0) desc, b.phase", chosen).fetchall()
+    n_budgeted = len(rows)
+    if show == "over":
+        rows = [r for r in rows if r["actual_hours"] > r["budget_hours"]]
+    elif show == "near":
+        rows = [r for r in rows if r["actual_hours"] >= 0.9 * r["budget_hours"]]
+    elif show == "under":
+        rows = [r for r in rows if r["actual_hours"] < 0.9 * r["budget_hours"]]
+    auto = ' onchange="this.form.submit()"'
     b = [DASH_CSS, "<p><small>Hours only, as P6 holds hours only. Actual is approved hours; pending is submitted hours waiting for approval. Client work only: "
-         "internal hours are not budgeted. Click a CTR to open it. The tables are on the <a href=\"/reports?u=%d\">Reports</a> page.</small></p>" % u]
+         "internal hours are not budgeted. Click a CTR to open it. The tables are on the <a href=\"/reports?u=%d\">Reports</a> page.</small></p>" % u,
+         '<form method="get" action="/dashboard">%s<p>Client %s Project %s Scope %s CTR %s Show %s</p>'
+         '<p>Weeks from %s to %s <small>(the weekly chart only: budgets are always compared with all approved hours to date)</small> '
+         '<input type="submit" value="Filter"> <input type="button" value="Reset" onclick="location.href=\'/dashboard?u=%d\'"></p></form>' % (
+             hidden(u=u),
+             sel("client", f_clients, f_client, True, "All clients", auto), sel("project", f_projects, f_project, True, "All projects", auto),
+             sel("scope", f_scopes, f_scope, True, "All scopes", auto), sel("phase", f_phases, f_phase, True, "All CTRs", auto),
+             sel("show", [("over", "Over budget"), ("near", "At 90% or more"), ("under", "Under 90%")], show, True, "All budgeted CTRs", auto),
+             date_input("from", d_from), date_input("to", d_to), u)]
     if rows:
         tb = sum(r["budget_hours"] for r in rows)
         ta = sum(r["actual_hours"] for r in rows)
@@ -2140,12 +2169,18 @@ def view_dashboard(con, u, q):
                  '<span><i style="background:repeating-linear-gradient(135deg,#fe6700 0 2px,#fff 2px 5px)"></i>Pending</span>'
                  '<span><i style="background:#b3261e"></i>Over budget</span><span><i style="background:#0f0f12;width:2px;height:12px"></i>Budget line</span></div>')
         b.append(dash_budget_chart(rows, u))
+    elif n_budgeted:
+        b.append("<p>No CTRs match these filters (%d budgeted CTR%s before the Show filter).</p>" % (n_budgeted, "" if n_budgeted == 1 else "s"))
+    elif f_client or f_project or f_scope or f_phase:
+        b.append("<p>No budgets are held for the CTRs these filters select. Load them from P6 on Admin, Budgets.</p>")
     else:
         b.append("<p>No budgets have been loaded yet. Load them from P6 on Admin, Budgets and the charts will fill in.</p>")
     # approved hours by week and client
     per = con.execute("select date(t.work_date,'weekday 0','-6 days') as wk, c.name as client, sum(t.hours) as hrs "
                       "from time_entry t join scope s on s.scope_id=t.scope_id join client c on c.client_id=s.client_id "
-                      "where t.status='Approved' and c.is_internal=0 group by wk, c.client_id order by wk").fetchall()
+                      "where t.status='Approved' and c.is_internal=0 and (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?) "
+                      "and (? is null or t.phase_id=?) and date(t.work_date,'weekday 0','-6 days') between ? and ? group by wk, c.client_id order by wk",
+                      chosen + (d_from or "0000-01-01", d_to or "9999-12-31")).fetchall()
     b.append("<h4>Approved hours by week and client</h4>")
     if per:
         clients = list(dict.fromkeys(r["client"] for r in sorted(per, key=lambda r: r["client"])))
@@ -2154,11 +2189,11 @@ def view_dashboard(con, u, q):
         weeks = []
         for wk in dict.fromkeys(r["wk"] for r in per):
             weeks.append((wk, {r["client"]: r["hrs"] for r in per if r["wk"] == wk}))
-        weeks = weeks[-12:]
+        weeks = weeks[-26:] if (d_from or d_to) else weeks[-12:]   # the last 12 weeks, or up to 26 of the range asked for
         b.append('<div class="key">%s</div>' % "".join('<span><i style="background:%s"></i>%s</span>' % (colours[c], esc(c)) for c in clients))
         b.append(dash_week_chart(weeks, clients, colours))
     else:
-        b.append("<p>No approved client hours yet.</p>")
+        b.append("<p>No approved client hours for these filters.</p>")
     return layout(con, u, "Dashboard", "".join(b))
 
 

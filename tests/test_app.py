@@ -2034,6 +2034,39 @@ class TestApp(unittest.TestCase):
         self.admin_post("/admin/budgets", {"u": "29", "as_of": "2026-11-13", "data": "A1500-PM-D-001,200"}, u="29")
         self.assertIn("A1500-PM-D-001: budget 200 hrs, approved 100 hrs, pending 0 hrs, 100 hrs remaining", self.get("/dashboard?u=29"))
 
+    def test_the_dashboard_can_be_filtered(self):
+        base = "/dashboard?u=29"
+        everything = self.get(base)
+        for ctr in ("A1500-PM-D-001", "BB0002-PM-D-001", "FB0001-PM-D-001"):
+            self.assertIn("%s: budget" % ctr, everything)
+        self.assertIn("Client <select", everything)
+        # by client: Spirit's CTRs only, and only Spirit in the weekly chart
+        spirit = self.get(base + "&client=2")
+        self.assertIn("A1500-PM-D-001: budget", spirit)
+        self.assertNotIn("BB0002-PM-D-001: budget", spirit)
+        weekly = spirit.split("Approved hours by week and client")[1]
+        self.assertNotIn("; Apache", weekly)
+        # by CTR, and by how much of the budget is used
+        self.assertEqual(self.get(base + "&phase=6").count("budget 95 hrs"), 1)
+        over = self.get(base + "&show=over")
+        self.assertIn("A1500-PM-D-001: budget 95", over)
+        self.assertNotIn("BB0002-PM-D-001: budget", over)
+        near = self.get(base + "&show=near")
+        self.assertIn("BB0002-PM-D-001: budget 120", near)
+        self.assertIn("A1500-PM-D-001: budget 95", near)                  # over budget is also 90% or more
+        self.assertNotIn("FB0001-PM-D-001: budget", near)
+        under = self.get(base + "&show=under")
+        self.assertIn("FB0001-PM-D-001: budget", under)
+        self.assertNotIn("A1500-PM-D-001: budget", under)
+        self.assertIn("No CTRs match these filters", self.get(base + "&client=2&phase=6&show=under"))
+        # the weeks of the weekly chart
+        only_nov = self.get(base + "&from=2026-11-02&to=2026-11-08")
+        self.assertIn("Week commencing 02/11/2026", only_nov)
+        self.assertNotIn("Week commencing 26/10/2026", only_nov)
+        self.assertIn("No approved client hours for these filters", self.get(base + "&from=2030-01-01"))
+        # a nonsense value is ignored, not an error
+        self.assertIn("A1500-PM-D-001: budget", self.get(base + "&client=abc&show=zzz&from=nope"))
+
     def test_ctr_page(self):
         con = sqlite3.connect(app.DB_PATH)
         con.row_factory = sqlite3.Row
