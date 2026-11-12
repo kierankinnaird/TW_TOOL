@@ -5,7 +5,9 @@ Run from the repo root:   python app/app.py        then open  http://localhost:8
 Uses build/timewriting.db (create it first with: python scripts/build.py).
 There is no login: pick who you are from the "Signed in as" box (mock).
 """
+import csv
 import datetime
+import io
 import functools
 import html
 import logging
@@ -19,7 +21,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
 # Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
-REQUIRED_SCHEMA = 16
+REQUIRED_SCHEMA = 17
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
 ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "TASAOrbiterVF.woff2"), "font/woff2")}
 
@@ -203,7 +205,7 @@ input[type=checkbox]{accent-color:var(--orange);width:1rem;height:1rem}
 """
 
 NAV_KEY = {"My": "timesheet", "Approvals": "approvals", "Missing": "missing", "Reopen": "reopen", "Reports": "reports", "CTR": "reports",
-           "Admin": "admin", "Edit": "admin", "Audit": "audit"}
+           "Admin": "admin", "Edit": "admin", "Audit": "audit", "Dashboard": "dashboard"}
 
 
 def layout(con, u, title, body):
@@ -224,6 +226,8 @@ def layout(con, u, title, body):
         items.append(("missing", "Missing timesheets", "/missing?u=%d" % u))
     if perm == "controller":  # reopening a person's submitted or approved timesheet
         items.append(("reopen", "Reopen timesheet", "/reopen?u=%d" % u))
+    if perm == "controller":  # budget against actual hours, charts
+        items.append(("dashboard", "Dashboard", "/dashboard?u=%d" % u))
     if perm != "admin":  # Admin (IT) manages users and job roles only: no reports
         items.append(("reports", "Reports", "/reports?u=%d" % u))
     if perm in ("controller", "admin"):
@@ -1562,6 +1566,25 @@ def view_reports(con, u, q):
         b.append('<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(t4))
     else:
         b.append("<p>No approved hours in this date range.</p>")
+    if permission_of(con, u) == "controller":
+        brows = con.execute("select * from v_ctr_budget where budget_hours is not null or actual_hours>0 or pending_hours>0 order by client, phase").fetchall()
+        b.append("<h4>Budget against actual hours (from P6)</h4>")
+        b.append("<p><small>Budget hours are the latest load from P6 (Admin, Budgets). Actual is approved hours to date, all weeks; pending is submitted hours waiting for approval. "
+                 "Remaining is budget less actual; used is actual as a percentage of budget. A CTR with hours but no budget is shown as not budgeted.</small></p>")
+        if brows:
+            t4 = ["<tr><th>Client</th><th>CTR No</th><th>Budget hrs</th><th>As of</th><th>Actual hrs</th><th>Pending hrs</th><th>Remaining hrs</th><th>Used</th></tr>"]
+            for r in brows:
+                bh = r["budget_hours"]
+                t4.append('<tr><td>%s</td><td>%s</td><td align="right">%s</td><td>%s</td><td align="right">%s</td><td align="right">%s</td><td align="right">%s</td><td align="right">%s</td></tr>' % (
+                    esc(r["client"]), esc(r["phase"]), fmt(bh) if bh is not None else "not budgeted", esc(r["as_of"] or ""), fmt(r["actual_hours"]), fmt(r["pending_hours"]),
+                    fmt(bh - r["actual_hours"]) if bh is not None else "", ("%.0f%%" % (100 * r["actual_hours"] / bh)) if bh else ""))
+            tb = sum(r["budget_hours"] or 0 for r in brows)
+            ta = sum(r["actual_hours"] for r in brows if r["budget_hours"] is not None)
+            t4.append(sub_row(["", "Total (budgeted CTRs)", fmt(tb), "", fmt(ta), "", fmt(tb - ta), ("%.0f%%" % (100 * ta / tb)) if tb else ""], right_from=2))
+            b.append('<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(t4))
+        else:
+            b.append("<p>No budgets loaded and no client hours yet.</p>")
+
     return layout(con, u, "Reports", "".join(b))
 
 
@@ -1819,6 +1842,146 @@ def period_sheet(con, u, q, rv):
     return rows, ("Period %s to %s" % (d_from, d_to))
 
 
+def nice_max(v):
+    """A round top for a chart axis, and a step that divides it into four."""
+    if v <= 0:
+        return 4, 1
+    mag = 10 ** (len(str(int(v))) - 1)
+    for m in (1, 2, 2.5, 4, 5, 8, 10):
+        if m * mag >= v:
+            return m * mag, m * mag / 4
+    return 10 * mag, 2.5 * mag
+
+
+DASH_CSS = """<style>
+.tiles{display:flex;flex-wrap:wrap;gap:.8rem;margin:0 0 1rem}
+.tile{flex:1 1 125px;background:var(--white);border:1px solid var(--line);border-top:3px solid var(--orange);padding:.7rem 1rem}
+.tile .v{font-size:1.7rem;font-weight:500;letter-spacing:-.03em;line-height:1.1}
+.tile .l{font-size:.8rem;color:var(--grey-dark)}
+.tile.warn{border-top-color:#b3261e}.tile.warn .v{color:#b3261e}
+.chart{width:100%;height:auto;display:block}
+.chart text{font-family:inherit;fill:var(--grey-dark);font-size:12px}
+.chart .val{fill:var(--black)}
+.chart .grid{stroke:var(--line);stroke-width:1}
+.chart rect.hit:hover{fill:rgba(15,15,18,.05)}
+.key{display:flex;flex-wrap:wrap;gap:1.2rem;font-size:.8rem;color:var(--grey-dark);margin:.4rem 0 .8rem}
+.key i{display:inline-block;width:12px;height:12px;margin-right:.35rem;vertical-align:-1px}
+</style>"""
+
+
+def dash_budget_chart(rows):
+    """Horizontal bars, one per budgeted CTR: the budget as a track with an end tick, approved hours filled, pending hours hatched.
+    A CTR over its budget is dark red and says so in words."""
+    w, left, right, row_h, top = 900, 170, 210, 30, 8
+    scale_max = max(max(r["budget_hours"], r["actual_hours"] + r["pending_hours"]) for r in rows)
+    top_v, step = nice_max(scale_max)
+    plot = w - left - right
+    x = lambda v: left + plot * v / top_v
+    h = top + row_h * len(rows) + 26
+    o = ['<svg class="chart" viewBox="0 0 %d %d" role="img" aria-label="Budget hours against approved hours for each CTR">' % (w, h),
+         '<defs><pattern id="pend" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">'
+         '<rect width="2.5" height="6" fill="#fe6700"/></pattern></defs>']
+    for k in range(5):
+        gx = x(step * k)
+        o.append('<line class="grid" x1="%.1f" x2="%.1f" y1="%d" y2="%d"/><text x="%.1f" y="%d" text-anchor="middle">%s</text>' % (gx, gx, top, h - 22, gx, h - 6, fmt(step * k)))
+    for i, r in enumerate(rows):
+        y = top + i * row_h
+        bud, act, pend = r["budget_hours"], r["actual_hours"], r["pending_hours"]
+        over = bud > 0 and act > bud
+        pct = ("%.0f%%" % (100 * act / bud)) if bud else "no budget"
+        tip = "%s: budget %s hrs, approved %s hrs, pending %s hrs, %s hrs %s" % (
+            r["phase"], fmt(bud), fmt(act), fmt(pend), fmt(abs(bud - act)), "over budget" if over else "remaining")
+        fill = "#b3261e" if over else "#fe6700"
+        o.append('<g><title>%s</title><rect class="hit" x="0" y="%d" width="%d" height="%d" fill="transparent"/>' % (esc(tip), y, w, row_h))
+        o.append('<text x="%d" y="%d" text-anchor="end" class="val">%s</text>' % (left - 10, y + 19, esc(r["phase"])))
+        o.append('<rect x="%.1f" y="%d" width="%.1f" height="14" fill="#e5e5e6"/>' % (left, y + 7, x(bud) - left))                 # the budget
+        o.append('<rect x="%.1f" y="%d" width="%.1f" height="14" fill="%s"/>' % (left, y + 7, max(x(act) - left, 0), fill))      # approved
+        if pend:
+            o.append('<rect x="%.1f" y="%d" width="%.1f" height="14" fill="url(#pend)"/>' % (x(act), y + 7, x(act + pend) - x(act)))
+        o.append('<rect x="%.1f" y="%d" width="2" height="22" fill="#0f0f12"/>' % (x(bud) - 1, y + 3))                          # the budget line
+        o.append('<text x="%d" y="%d" class="val">%s / %s hrs &#183; %s%s</text></g>' % (
+            w - right + 12, y + 19, fmt(act), fmt(bud), pct, " &#9650; over" if over else ""))
+    o.append("</svg>")
+    return "".join(o)
+
+
+def dash_week_chart(weeks, clients, colours):
+    """Columns of approved hours by week, stacked by client, with a two pixel gap between the segments."""
+    w, h, left, bottom, top = 900, 280, 50, 34, 10
+    totals = [sum(wk[1].values()) for wk in weeks]
+    top_v, step = nice_max(max(totals))
+    plot_h, band = h - bottom - top, (w - left - 10) / len(weeks)
+    bar = min(band * 0.6, 56)
+    y = lambda v: top + plot_h * (1 - v / top_v)
+    o = ['<svg class="chart" viewBox="0 0 %d %d" role="img" aria-label="Approved hours by week and client">' % (w, h)]
+    for k in range(5):
+        gy = y(step * k)
+        o.append('<line class="grid" x1="%d" x2="%d" y1="%.1f" y2="%.1f"/><text x="%d" y="%.1f" text-anchor="end">%s</text>' % (left, w - 10, gy, gy, left - 8, gy + 4, fmt(step * k)))
+    for i, (wk, by) in enumerate(weeks):
+        cx = left + band * i + band / 2
+        base = 0.0
+        tip = "Week commencing %s/%s/%s: %s hrs approved" % (wk[8:], wk[5:7], wk[:4], fmt(sum(by.values())))
+        o.append("<g><title>%s</title>" % esc(tip + "".join("; %s %s" % (c, fmt(by[c])) for c in clients if by.get(c))))
+        o.append('<rect class="hit" x="%.1f" y="%d" width="%.1f" height="%d" fill="transparent"/>' % (cx - band / 2, top, band, plot_h))
+        for c in clients:
+            v = by.get(c, 0)
+            if not v:
+                continue
+            y0, y1 = y(base), y(base + v)
+            o.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="%s" stroke="#fff" stroke-width="1"/>' % (cx - bar / 2, y1, bar, max(y0 - y1, 0), colours[c]))
+            base += v
+        o.append('<text x="%.1f" y="%.1f" text-anchor="middle" class="val">%s</text>' % (cx, y(base) - 5, fmt(base)))
+        o.append('<text x="%.1f" y="%d" text-anchor="middle">%s/%s</text></g>' % (cx, h - 14, wk[8:], wk[5:7]))
+    o.append('<text x="%d" y="%d" text-anchor="middle">Week commencing (dd/mm)</text></svg>' % (left + (w - left) / 2, h - 1))
+    return "".join(o)
+
+
+def view_dashboard(con, u, q):
+    """The cost controllers' dashboard: budget hours (from P6) against the approved hours booked here, in hours only, and the weekly flow of hours."""
+    if permission_of(con, u) != "controller":
+        return no_access(con, u, "Dashboard")
+    rows = con.execute("select * from v_ctr_budget where budget_hours is not null order by actual_hours * 1.0 / nullif(budget_hours, 0) desc, phase").fetchall()
+    b = [DASH_CSS, "<p><small>Hours only, as P6 holds hours only. Actual is approved hours; pending is submitted hours waiting for approval. Client work only: "
+         "internal hours are not budgeted. The tables and the CTR detail are on the <a href=\"/reports?u=%d\">Reports</a> page.</small></p>" % u]
+    if rows:
+        tb = sum(r["budget_hours"] for r in rows)
+        ta = sum(r["actual_hours"] for r in rows)
+        tp = sum(r["pending_hours"] for r in rows)
+        over = [r for r in rows if r["budget_hours"] and r["actual_hours"] > r["budget_hours"]]
+        near = [r for r in rows if r["budget_hours"] and 0.9 * r["budget_hours"] <= r["actual_hours"] <= r["budget_hours"]]
+        tile = lambda v, label, cls="": '<div class="tile %s"><div class="v">%s</div><div class="l">%s</div></div>' % (cls, v, esc(label))
+        b.append('<div class="tiles">%s</div>' % "".join([
+            tile(fmt(tb), "Budget hours (%d CTRs)" % len(rows)), tile(fmt(ta), "Approved hours"), tile(fmt(tp), "Pending approval"),
+            tile(fmt(tb - ta), "Remaining hours"), tile(("%.0f%%" % (100 * ta / tb)) if tb else "", "Of budget used"),
+            tile(str(len(over)), "Over budget" + (": " + ", ".join(r["phase"] for r in over) if over else ""), "warn" if over else ""),
+            tile(str(len(near)), "At 90% or more of budget")]))
+        b.append("<h4>Budget against approved hours, by CTR</h4>")
+        b.append('<div class="key"><span><i style="background:#e5e5e6"></i>Budget</span><span><i style="background:#fe6700"></i>Approved</span>'
+                 '<span><i style="background:repeating-linear-gradient(135deg,#fe6700 0 2px,#fff 2px 5px)"></i>Pending</span>'
+                 '<span><i style="background:#b3261e"></i>Over budget</span><span><i style="background:#0f0f12;width:2px;height:12px"></i>Budget line</span></div>')
+        b.append(dash_budget_chart(rows))
+    else:
+        b.append("<p>No budgets have been loaded yet. Load them from P6 on Admin, Budgets and the charts will fill in.</p>")
+    # approved hours by week and client
+    per = con.execute("select date(t.work_date,'weekday 0','-6 days') as wk, c.name as client, sum(t.hours) as hrs "
+                      "from time_entry t join scope s on s.scope_id=t.scope_id join client c on c.client_id=s.client_id "
+                      "where t.status='Approved' and c.is_internal=0 group by wk, c.client_id order by wk").fetchall()
+    b.append("<h4>Approved hours by week and client</h4>")
+    if per:
+        clients = list(dict.fromkeys(r["client"] for r in sorted(per, key=lambda r: r["client"])))
+        palette = ["#fe6700", "#4b4b50", "#8f8f92", "#0f0f12"]
+        colours = {c: palette[i % len(palette)] for i, c in enumerate(clients)}
+        weeks = []
+        for wk in dict.fromkeys(r["wk"] for r in per):
+            weeks.append((wk, {r["client"]: r["hrs"] for r in per if r["wk"] == wk}))
+        weeks = weeks[-12:]
+        b.append('<div class="key">%s</div>' % "".join('<span><i style="background:%s"></i>%s</span>' % (colours[c], esc(c)) for c in clients))
+        b.append(dash_week_chart(weeks, clients, colours))
+    else:
+        b.append("<p>No approved client hours yet.</p>")
+    return layout(con, u, "Dashboard", "".join(b))
+
+
 def view_ctr(con, u, q):
     """One CTR (a phase): a Summary tab plus one tab per job family, like the tabs in the CTR workbook.
     Sales rates and values are only shown to cost controllers; everyone else sees hours, limited to what they may see."""
@@ -1976,6 +2139,13 @@ def view_ctr(con, u, q):
         terms = " &nbsp; ".join("%s [%s]" % (x, "X" if ph["payment_terms"] == x else "&nbsp;") for x in ("Reimbursable", "Budget", "Lump Sum"))
         b.append('<table border="1" cellpadding="3" cellspacing="0" style="margin-top:.4rem"><tr>%s<td>%s</td></tr></table>' % (label("Payment Terms"), terms))
         b.append('<table border="1" cellpadding="3" cellspacing="0" style="width:100%%;margin-top:.4rem"><tr><th align="left">Basis of Proposal</th></tr><tr><td>%s</td></tr></table>' % para(ph["basis"]))
+        bud = con.execute("select * from v_ctr_budget where phase_id=?", (pid,)).fetchone() if money else None
+        if bud and bud["budget_hours"] is not None:
+            b.append("<p><b>Budget %s hrs</b> (P6, as of %s) &nbsp; actual %s hrs &nbsp; remaining %s hrs &nbsp; used %.0f%%</p>" % (
+                fmt(bud["budget_hours"]), esc(bud["as_of"]), fmt(bud["actual_hours"]), fmt(bud["budget_hours"] - bud["actual_hours"]),
+                100 * bud["actual_hours"] / bud["budget_hours"] if bud["budget_hours"] else 0))
+        elif bud:
+            b.append("<p><small>No budget has been loaded for this CTR (Admin, Budgets).</small></p>")
         b.append("<p><small>Hours are those booked and approved against this CTR, priced at the client's rate card for each skill code; additions are approved allowances "
                  "at the allowance rate table. Pending hrs are submitted and waiting for approval. The job family tabs above list the people and each timesheet entry.</small></p>")
     else:
@@ -2022,14 +2192,15 @@ def view_ctr(con, u, q):
 # ---------- Admin ----------
 ADMIN_TABS = [("periods", "Weekly periods"), ("users", "Users"), ("roles", "Job families / titles"),
               ("clients", "Clients"), ("rates", "Client rate cards"), ("paafs", "PAAFs"), ("scopes", "Projects / scopes / CTRs"),
-              ("internal", "Internal codes"), ("locations", "Locations (hour types)"), ("allowance_rates", "Allowance rates")]
+              ("internal", "Internal codes"), ("locations", "Locations (hour types)"), ("allowance_rates", "Allowance rates"),
+              ("budgets", "Budgets (from P6)")]
 
 
 # Who may use each Admin tab. IT manages users and job roles; cost controllers manage clients, rate cards, PAAFs, scopes and internal codes.
 # Weekly periods is open to both controllers and admins until the cost team confirms who owns it (the audit trail is handled the same way).
 TAB_ACCESS = {"periods": ("controller", "admin"), "users": ("admin",), "roles": ("admin",), "clients": ("controller",),
               "rates": ("controller",), "paafs": ("controller",), "scopes": ("controller",), "internal": ("controller",),
-              "locations": ("admin",), "allowance_rates": ("controller",)}
+              "locations": ("admin",), "allowance_rates": ("controller",), "budgets": ("controller",)}
 PERMISSION_OPTIONS = [("user", "user"), ("controller", "controller (cost controller)"), ("admin", "admin (IT)")]
 
 
@@ -2324,6 +2495,15 @@ def admin_body(con, u, t, q=None):
                 for r in con.execute("select at.name, ar.amount, ar.effective_from from allowance_rate ar join allowance_type at on at.allowance_id=ar.allowance_id "
                                      "order by at.allowance_id, ar.effective_from desc")]
         b.append("<h4>Every rate, newest first</h4>" + table(["Allowance", "Per day", "From"], hist))
+    elif t == "budgets":
+        b.append("<p><small>Budget hours per CTR come from P6, which holds hours only. Paste the export below: one CTR per line, the CTR No then the budget hours "
+                 "(comma or tab separated; a heading line is ignored). Each load is saved as a snapshot with its as-of date and never edited, so earlier budgets are kept; "
+                 "the latest is compared with the approved hours booked here on the Reports page and each CTR's page. A CTR whose budget has not changed is left alone.</small></p>")
+        b.append('<form method="post" action="/admin/budgets">%s<p>As of %s</p><p><textarea name="data" rows="8" cols="60" placeholder="BB0001-PM-D-001,160"></textarea></p>'
+                 '<input type="submit" value="Load budgets"></form>' % (hidden(u=u), date_input("as_of", datetime.date.today().isoformat())))
+        rows = [[r["phase"], r["client"], fmt(r["budget_hours"]), r["as_of"], fmt(r["actual_hours"])]
+                for r in con.execute("select * from v_ctr_budget where budget_hours is not null order by phase")]
+        b.append("<h4>Budgets now held</h4>" + (table(["CTR No", "Client", "Budget hrs", "As of", "Actual hrs (approved)"], rows) if rows else "<p>None loaded yet.</p>"))
     elif t == "locations":
         b.append("<p><small>Where hours are worked. People pick one on each timesheet row (and tick Overtime for overtime). "
                  "Rename a location or switch it off to stop new bookings to it; hours already booked keep it. At least one must stay active.</small></p>")
@@ -2728,6 +2908,56 @@ def act_paaf(con, form):
         return view_admin(con, u, "paafs", [str(e)], q=q)
 
 
+def act_budgets(con, form):
+    u = int(form["u"][0])
+    if not can_use_tab(con, u, "budgets"):
+        return view_admin(con, u, "budgets")
+    try:
+        as_of = need_date(form.get("as_of", [""])[0], "As of")
+        data = form.get("data", [""])[0]
+        lines = [x for x in data.replace("\r", "").split("\n") if x.strip()]
+        if not lines:
+            raise ValueError("Paste at least one line: CTR No, budget hours.")
+        ctrs = {r["no"].upper(): r["phase_id"] for r in con.execute(
+            "select ph.phase_id, s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name)) as no from phase ph join scope s on s.scope_id=ph.scope_id "
+            "join client c on c.client_id=s.client_id where c.is_internal=0")}
+        loaded, same, unknown, bad = 0, 0, [], []
+        for n, line in enumerate(lines, 1):
+            cells = next(csv.reader([line], delimiter="\t" if "\t" in line else ","))
+            cells = [c.strip() for c in cells]
+            try:
+                hours = float(cells[1])
+                if hours < 0:
+                    raise ValueError
+            except (IndexError, ValueError):
+                if n == 1:
+                    continue  # a heading line
+                bad.append("line %d" % n)
+                continue
+            pid = ctrs.get(cells[0].upper())
+            if pid is None:
+                unknown.append(cells[0])
+                continue
+            cur = con.execute("select hours, as_of from ctr_budget where phase_id=? order by as_of desc limit 1", (pid,)).fetchone()
+            if cur and abs(cur["hours"] - hours) < 1e-9:
+                same += 1
+            elif cur and cur["as_of"] >= as_of:
+                bad.append("%s (a budget as of %s is already held: use a later date)" % (cells[0], cur["as_of"]))
+            else:
+                con.execute("insert into ctr_budget (phase_id, hours, as_of, loaded_by) values (?,?,?,?)", (pid, hours, as_of, u))
+                loaded += 1
+        con.commit()
+        msgs = ["%d budget%s loaded, as of %s. %d unchanged." % (loaded, "" if loaded == 1 else "s", as_of, same)]
+        if unknown:
+            msgs.append("Not recognised as a CTR No (nothing loaded for): %s." % ", ".join(unknown))
+        if bad:
+            msgs.append("Skipped: %s." % "; ".join(bad))
+        return view_admin(con, u, "budgets", msgs, ok=not (unknown or bad))
+    except ValueError as e:
+        con.rollback()
+        return view_admin(con, u, "budgets", [str(e)])
+
+
 def act_period(con, form):
     u, ws, action = int(form["u"][0]), form["week_start"][0].strip(), form["action"][0]
     if not can_use_tab(con, u, "periods"):
@@ -2890,6 +3120,7 @@ def timesheet_page(con):
 page("/approvals")(lambda con, u, q: view_approvals(con, u, q=q))
 page("/missing")(lambda con, u, q: view_missing(con, u, q))
 page("/reopen")(lambda con, u, q: view_reopen(con, u, q))
+page("/dashboard")(lambda con, u, q: view_dashboard(con, u, q))
 page("/reports")(lambda con, u, q: view_reports(con, u, q))
 page("/reports/grid")(lambda con, u, q: view_grid(con, u, q))
 page("/ctr")(lambda con, u, q: view_ctr(con, u, q))
@@ -2926,6 +3157,7 @@ page("/admin/add", methods=("POST",))(lambda con, form: admin_add(con, form))
 page("/admin/save", methods=("POST",))(lambda con, form: admin_save(con, form))
 page("/admin/paaf", methods=("POST",))(lambda con, form: act_paaf(con, form))
 page("/admin/allowance_rates", methods=("POST",))(lambda con, form: act_allowance_rates(con, form))
+page("/admin/budgets", methods=("POST",))(lambda con, form: act_budgets(con, form))
 
 
 def make_server(port=8000):

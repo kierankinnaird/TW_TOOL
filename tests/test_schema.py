@@ -567,6 +567,24 @@ class TestAllowanceRates(Base):
         self.assertEqual(self.value(self.claim("2026-11-05", allowance=new_type)), 0)
 
 
+class TestCtrBudgets(Base):
+    """Budget hours per CTR from P6: snapshots that are never edited, compared with approved hours."""
+    def test_budgets_are_append_only_and_unique_per_date(self):
+        self.blocked("UPDATE ctr_budget SET hours=1", msg="never edited")
+        self.blocked("DELETE FROM ctr_budget", msg="never deleted")
+        self.blocked("INSERT INTO ctr_budget (phase_id, hours, as_of) VALUES (1, 5, '2026-11-06')", msg="UNIQUE")
+        self.blocked("INSERT INTO ctr_budget (phase_id, hours, as_of) VALUES (1, -5, '2026-12-01')", msg="CHECK")
+
+    def test_the_view_compares_the_latest_budget_with_approved_hours_only(self):
+        row = self.con.execute("select budget_hours, actual_hours, pending_hours from v_ctr_budget where phase_id=1").fetchone()
+        self.assertEqual(tuple(row), (160, 71.5, 71))
+        self.con.execute("INSERT INTO ctr_budget (phase_id, hours, as_of) VALUES (1, 180, '2026-11-20')")
+        self.assertEqual(self.scalar("select budget_hours from v_ctr_budget where phase_id=1"), 180)      # the later snapshot wins
+        self.assertEqual(self.scalar("select count(*) from ctr_budget where phase_id=1"), 2)
+        self.assertIsNone(self.scalar("select budget_hours from v_ctr_budget where phase_id=5"))           # no budget: NULL, still listed
+        self.assertEqual(self.scalar("select count(*) from v_ctr_budget where client='Internal'"), 0)    # internal codes have no budgets
+
+
 class TestRatesAreAppendOnly(Base):
     """FR-12: a rate is never edited; a new row with a later effective date takes over."""
     def test_a_rate_cannot_be_edited_or_deleted(self):

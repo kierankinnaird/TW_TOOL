@@ -383,3 +383,8 @@ UPDATE allowance_entry SET status='Approved', approved_by=7, approved_at='2026-1
 UPDATE app_user SET line_manager_id = 31 WHERE user_id IN (1, 2, 6, 7, 8, 29);
 UPDATE app_user SET line_manager_id = 7 WHERE user_id IN (3, 4, 5, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
 UPDATE app_user SET line_manager_id = 8 WHERE user_id = 10;
+
+-- Budget hours per CTR, as loaded from P6 on 6 Nov 2026 (hours only). BB0002 Define is at 90% of its budget and A1500 is over.
+INSERT INTO ctr_budget (phase_id, hours, as_of, loaded_by) VALUES
+ (1, 160, '2026-11-06', 29), (2, 40, '2026-11-06', 29), (3, 120, '2026-11-06', 29), (4, 60, '2026-11-06', 29),
+ (6, 95, '2026-11-06', 29), (7, 120, '2026-11-06', 29);

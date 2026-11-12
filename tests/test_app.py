@@ -179,7 +179,7 @@ class TestApp(unittest.TestCase):
         self.assertNotIn("2026-11-02</td>", page.split("Period reports")[1])
 
     def period_part(self, path):
-        return self.get(path).split("Period reports")[1]
+        return self.get(path).split("Period reports")[1].split("Budget against actual hours")[0]   # not the budget section, which lists every client
 
     def test_period_report_filters_by_client_project_scope_and_phase(self):
         con = app.db()
@@ -1874,6 +1874,57 @@ class TestApp(unittest.TestCase):
         self.assertIn('value="%d"' % eid, self.get("/approvals?u=6&w=2026-11-02"))
         self.assertIn("1 entry approved", self.post("/approvals/act", {"u": "6", "w": "2026-11-02", "entry_id": str(eid), "action": "Approve selected"}))
         self.assertEqual(self.one("select approved_by from time_entry where entry_id=?", eid)[0], 6)
+
+    def test_budget_hours_from_p6_are_loaded_and_compared_with_the_approved_hours(self):
+        self.assertIn("not available to your role", self.get("/admin?u=5&t=budgets"))
+        page = self.get("/admin?u=29&t=budgets")
+        self.assertIn("P6, which holds hours only", page)
+        self.assertIn("BB0001-PM-D-001", page)                                     # the seeded budgets are listed
+        # the CTR page and the report compare budget with approved hours (BB0001-PM-D-001: 160 budget, 71.5 approved)
+        ctr = self.get("/ctr?u=29&phase=1")
+        self.assertIn("Budget 160 hrs", ctr)
+        self.assertIn("remaining 88.5 hrs", ctr)
+        self.assertIn("used 45%", ctr)
+        report = self.get("/reports?u=29&from=2026-01-01&to=2026-12-31").split("Budget against actual hours")[1].split("<h4>")[0]
+        self.assertIn("<td>BB0001-PM-D-001</td><td align=\"right\">160</td>", report)
+        self.assertNotIn("Budget against actual hours", self.get("/reports?u=5&from=2026-01-01&to=2026-12-31"))   # cost controllers only
+        # load a new snapshot: a changed budget, an unchanged one, a heading line, an unknown CTR and a bad figure
+        data = "CTR No,Budget hrs\nBB0001-PM-D-001,200\nBB0001-PM-E-001,40\nZZ-NOPE,10\nA1500-PM-D-001,lots\n"
+        out = self.admin_post("/admin/budgets", {"u": "29", "as_of": "2026-11-13", "data": data}, u="29")
+        self.assertIn("1 budget loaded, as of 2026-11-13. 1 unchanged.", out)
+        self.assertIn("ZZ-NOPE", out)
+        self.assertIn("line 5", out)
+        self.assertIn("Budget 200 hrs", self.get("/ctr?u=29&phase=1"))
+        self.assertEqual(self.one("select count(*) from ctr_budget where phase_id=1")[0], 2)           # the old snapshot is kept
+        # the same or an earlier as-of date cannot be loaded with a different figure
+        out = self.admin_post("/admin/budgets", {"u": "29", "as_of": "2026-11-13", "data": "BB0001-PM-D-001,300"}, u="29")
+        self.assertIn("use a later date", out)
+        self.assertEqual(self.one("select hours from ctr_budget where phase_id=1 order by as_of desc limit 1")[0], 200)
+        # nobody else can load budgets
+        self.admin_post("/admin/budgets", {"u": "5", "as_of": "2026-11-14", "data": "BB0001-PM-D-001,999"}, u="5")
+        self.assertEqual(self.one("select count(*) from ctr_budget where hours=999")[0], 0)
+        # a CTR with hours but no budget says so
+        self.assertIn("not budgeted", self.get("/reports?u=29&from=2026-01-01&to=2026-12-31"))
+
+    def test_the_cost_dashboard_charts_budget_against_actual_hours(self):
+        page = self.get("/dashboard?u=29")
+        self.assertIn('href="/dashboard?u=29"', self.get("/timesheet?u=29"))                        # in the cost controller's menu
+        for who in (5, 7, 30):                                                                       # nobody else has it
+            self.assertIn("not available to your role", self.get("/dashboard?u=%d" % who), who)
+            self.assertNotIn('href="/dashboard?u=%d"' % who, self.get("/timesheet?u=%d" % who) if who != 30 else "")
+        self.assertIn("Budget against approved hours, by CTR", page)
+        self.assertIn("<svg", page)
+        self.assertIn("Approved hours by week and client", page)
+        self.assertIn("A1500-PM-D-001: budget 95 hrs, approved 100 hrs, pending 0 hrs, 5 hrs over budget", page)    # the tooltip text of an overrun
+        self.assertIn("BB0002-PM-D-001: budget 120 hrs, approved 108 hrs", page)
+        self.assertIn("&#9650; over", page)                                                          # words as well as the colour
+        self.assertIn("Over budget: A1500-PM-D-001", page)
+        self.assertIn("At 90% or more of budget", page)
+        self.assertNotIn("&pound;", page)                                                            # hours only
+        self.assertIn("Week commencing 26/10/2026", page)
+        # budgets that are later loaded show up on it
+        self.admin_post("/admin/budgets", {"u": "29", "as_of": "2026-11-13", "data": "A1500-PM-D-001,200"}, u="29")
+        self.assertIn("A1500-PM-D-001: budget 200 hrs, approved 100 hrs, pending 0 hrs, 100 hrs remaining", self.get("/dashboard?u=29"))
 
     def test_ctr_page(self):
         con = sqlite3.connect(app.DB_PATH)

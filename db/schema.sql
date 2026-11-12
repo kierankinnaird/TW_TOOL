@@ -2,7 +2,7 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 16;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+PRAGMA user_version = 17;  -- 2: a cost controller approves the hours a scope approver books to their own scope
                           -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
                           -- 4: every entry has a location (On site / Offshore / Standard) and an overtime flag
                           -- 5: a cost controller can reopen submitted or approved hours (reopen_reason)
@@ -15,6 +15,7 @@ PRAGMA user_version = 16;  -- 2: a cost controller approves the hours a scope ap
                           -- 11: a person cannot book more than 24 hours in one day across all rows
                           -- 12: allowances are for staff only, and are valued from an append-only rate table (by allowance, location and overtime)
                           -- 13: approvers are a main approver per client plus secondary approvers per scope; the phase is the CTR (booking code)
+                          -- 17: budget hours per CTR (from P6), compared with the approved hours booked here
                           -- 16: a line manager on each user; a PAAF is simply the client's list of people (active as soon as it is added, no sign-off)
                           -- 15: one offshore allowance at one rate (no location or overtime matrix); default locations On Shore / Offshore / Site visit
                           -- 14: a CTR carries the fields of the CTR sheet (CTR code, objectives, inputs, scope, assumptions, payment terms ...) and a client a framework reference
@@ -648,3 +649,37 @@ SELECT a.allowance_entry_id, a.user_id, a.scope_id, a.phase_id, a.allowance_id, 
        COALESCE((SELECT r.amount FROM allowance_rate r WHERE r.allowance_id = a.allowance_id AND r.effective_from <= a.work_date
                  ORDER BY r.effective_from DESC LIMIT 1), 0) AS amount
 FROM allowance_entry a;
+
+-- Budget hours per CTR, as held in P6 (P6 holds hours only, no money). Cost controllers load them from a P6 export; each load is a snapshot
+-- with an as-of date and is never edited or deleted, so you can see how a budget moved. The latest snapshot is the one compared.
+CREATE TABLE ctr_budget (
+    budget_id INTEGER PRIMARY KEY,
+    phase_id  INTEGER NOT NULL REFERENCES phase(phase_id),
+    hours     NUMERIC NOT NULL CHECK (hours >= 0),
+    as_of     TEXT NOT NULL,
+    loaded_by INTEGER REFERENCES app_user(user_id),
+    loaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (phase_id, as_of)
+);
+CREATE TRIGGER trg_ctr_budget_no_update BEFORE UPDATE ON ctr_budget
+BEGIN
+    SELECT RAISE(ABORT, 'Budgets are never edited: load a new snapshot with a later as-of date');
+END;
+CREATE TRIGGER trg_ctr_budget_no_delete BEFORE DELETE ON ctr_budget
+BEGIN
+    SELECT RAISE(ABORT, 'Budgets are never deleted: load a new snapshot with a later as-of date');
+END;
+
+-- Budget against actual, hours only, for every CTR of a client (not Internal). Actual = Approved hours; pending = Submitted or Edited.
+-- budget_hours is NULL when no budget has been loaded for the CTR.
+CREATE VIEW v_ctr_budget AS
+SELECT ph.phase_id, c.name AS client, p.project_code, s.scope_code, s.scope_code || '-' || COALESCE(ph.ctr_code, UPPER(ph.name)) AS phase,
+       b.hours AS budget_hours, b.as_of,
+       COALESCE((SELECT SUM(t.hours) FROM time_entry t WHERE t.phase_id = ph.phase_id AND t.status = 'Approved'), 0) AS actual_hours,
+       COALESCE((SELECT SUM(t.hours) FROM time_entry t WHERE t.phase_id = ph.phase_id AND t.status IN ('Submitted','Edited')), 0) AS pending_hours
+FROM phase ph
+JOIN scope s   ON s.scope_id = ph.scope_id
+JOIN project p ON p.project_id = s.project_id
+JOIN client c  ON c.client_id = s.client_id AND c.is_internal = 0
+LEFT JOIN ctr_budget b ON b.phase_id = ph.phase_id
+     AND b.as_of = (SELECT MAX(x.as_of) FROM ctr_budget x WHERE x.phase_id = ph.phase_id);
