@@ -12,6 +12,7 @@ import functools
 import html
 import logging
 import os
+import re
 import sqlite3
 import sys
 from flask import Flask, Response, request
@@ -173,6 +174,33 @@ h4{font-size:1.05rem;font-weight:500;letter-spacing:-.01em;margin:1.8rem 0 .4rem
 h4:first-child,.card>h4:first-child{margin-top:0}
 p{margin:.55rem 0}
 small{color:var(--grey-dark);font-size:.8rem}
+.wk{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1.2rem;margin:0 0 .6rem}
+.wk .cur-week{font-size:1.05rem;font-weight:500}
+.wk form{margin:0 0 0 auto;display:flex;align-items:center;gap:.4rem}
+.wk .nav a{display:inline-block;padding:.3rem .7rem;background:var(--white);border:1px solid var(--line)}
+.wk .nav a:hover{border-color:var(--orange)}
+.stat{display:inline-block;margin:0 0 .8rem;padding:.35rem .8rem;background:var(--white);border:1px solid var(--line);border-left:3px solid var(--orange)}
+table.ts{width:100%}
+table.ts th{text-align:center}
+table.ts th.bkh{text-align:left}
+table.ts td.bk{min-width:17rem}
+table.ts td.bk b{font-weight:500}
+table.ts .sub{color:var(--grey-dark);font-size:.8rem}
+table.ts .chips{font-size:.8rem;color:var(--grey-dark)}
+table.ts .chips b{color:var(--orange);font-weight:500}
+table.ts .we{background:#f1f1f2}
+table.ts th.we{background:var(--ink)}
+table.ts td.c{width:4.2rem}
+table.ts input[type=text]{width:3.4rem}
+table.ts tr.sum td{background:#fafafa;border-bottom:1px solid var(--line)}
+table.ts tr.tot td{background:var(--white);border-top:2px solid var(--black);font-size:1rem}
+.actions{position:sticky;bottom:0;display:flex;align-items:center;gap:.8rem;margin:1rem -1.4rem -1.2rem;padding:.7rem 1.4rem;background:var(--white);border-top:1px solid var(--line)}
+.actions p{margin:0}
+.addbox{margin-top:1.4rem;padding:.9rem 1.1rem;background:var(--bg);border:1px solid var(--line)}
+.addbox p{margin:.3rem 0}
+.addbox details{margin:.5rem 0 0}
+.addbox summary{cursor:pointer;color:var(--grey-dark);font-size:.9rem}
+.addbox summary:hover{color:var(--orange)}
 .card a{text-decoration:underline;text-decoration-color:var(--grey-light);text-underline-offset:3px}
 .card a:hover{text-decoration-color:var(--orange)}
 table[border]{border:0;border-collapse:collapse;font-size:.85rem;margin:.4rem 0}
@@ -333,6 +361,18 @@ document.addEventListener('input',function(e){if(e.target.name&&e.target.name.in
 </script>"""
 
 
+def sheet_locked(con, u, d0, d6):
+    """A week's sheet is locked once it has been submitted: it has hours or allowances past Draft and nothing left in Draft. Sent-back or
+    reopened entries go back to Draft, which opens the sheet again."""
+    non_draft, draft = con.execute(
+        "select coalesce(sum(status<>'Draft'),0), coalesce(sum(status='Draft'),0) from (select status from time_entry where user_id=? and work_date between ? and ? "
+        "union all select status from allowance_entry where user_id=? and work_date between ? and ?)", (u, d0, d6, u, d0, d6)).fetchone()
+    return non_draft > 0 and draft == 0
+
+
+LOCKED_MSG = "This timesheet has been submitted and is locked. Ask a cost controller to reopen it if something needs changing."
+
+
 def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     adds = adds or []
     aadds = aadds or []
@@ -346,6 +386,8 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     d0, d6 = days[0].isoformat(), days[6].isoformat()
     period = con.execute("select * from period where week_start=?", (d0,)).fetchone()
     open_week = bool(period and period["status"] == "Open")
+    locked = sheet_locked(con, u, d0, d6)
+    can_edit = open_week and not locked  # a submitted sheet is locked as a whole: no new hours, rows or allowances either
     start, end = me["start_date"], me["end_date"]  # hours can only be booked on dates from the start date to the end date
 
     def active(iso):
@@ -384,12 +426,11 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     b = []
     b.append(msgs_html(msgs, ok))
     prev_w, next_w = (w - datetime.timedelta(days=7)).isoformat(), (w + datetime.timedelta(days=7)).isoformat()
-    b.append('<p><a href="/timesheet?u=%d&amp;w=%s">&lt;&lt; Previous week</a> &nbsp; '
-             "<b>Week commencing %s</b> &nbsp; "
-             '<a href="/timesheet?u=%d&amp;w=%s">Next week &gt;&gt;</a> &nbsp; <a href="/timesheet?u=%d&amp;w=%s">This week</a></p>' % (
-                 u, prev_w, w.strftime("%d/%m/%Y"), u, next_w, u, monday(datetime.date.today()).isoformat()))
-    b.append('<form method="get" action="/timesheet"><input type="hidden" name="u" value="%d"><p>Go to the week containing %s <input type="submit" value="Go"></p></form>' % (
-        u, date_input("w", d0)))
+    b.append('<div class="wk"><span class="nav"><a href="/timesheet?u=%d&amp;w=%s">&lt;&lt; Previous week</a> '
+             '<a href="/timesheet?u=%d&amp;w=%s">Next week &gt;&gt;</a> <a href="/timesheet?u=%d&amp;w=%s">This week</a></span>'
+             '<span class="cur-week">Week commencing %s</span>'
+             '<form method="get" action="/timesheet"><input type="hidden" name="u" value="%d">Go to the week containing %s <input type="submit" value="Go"></form></div>' % (
+                 u, prev_w, u, next_w, u, monday(datetime.date.today()).isoformat(), w.strftime("%d/%m/%Y"), u, date_input("w", d0)))
     st = {"Draft": 0.0, "Submitted": 0.0, "Approved": 0.0}
     for e in entries:
         st["Approved" if e["status"] in ("Approved", "Edited") else e["status"]] += e["hours"]
@@ -403,7 +444,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
         status_line = "Submitted: %s hours waiting for approval, %s approved" % (fmt(st["Submitted"]), fmt(st["Approved"]))
     else:
         status_line = "Approved: all %s hours" % fmt(st["Approved"])
-    b.append("<p><b>Week status:</b> %s</p>" % status_line)
+    b.append('<p class="stat"><b>Week status:</b> %s</p>' % status_line)
     if not period:
         b.append("<p>This week has not been opened for timewriting. Ask an admin to open it.</p>")
     elif not open_week:
@@ -464,13 +505,13 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     adds_hidden = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"])
     b.append('<form id="tsform" method="post" action="/timesheet/save">'
              '<input type="hidden" name="u" value="%d"><input type="hidden" name="w" value="%s">%s' % (u, d0, adds_hidden))
-    head = ["Client", "Project", "Scope", "CTR", "Skill code", "Location", "Type"] + [d.strftime("%a %d/%m") for d in days] + ["Total"]
+    head = ["Booking"] + [d.strftime("%a %d/%m") for d in days] + ["Total"]
     trs = []
     day_tot = {d.isoformat(): 0.0 for d in days}
     day_norm, day_ot = dict(day_tot), dict(day_tot)  # the same, split into normal time and overtime
     for (pid, rid, lid, ot), r in rows.items():
-        tds = ['<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td style="white-space:nowrap">%s</td><td style="white-space:nowrap">%s</td><td>%s</td>' % (
-            esc(r["client"]), esc(r["project"]), esc(r["scope"]), esc(r["phase"]), esc(r["skill"]), esc(r["location"]),
+        tds = ['<td class="bk"><b>%s</b><br><span class="sub">%s &rsaquo; %s &rsaquo; %s</span><br><span class="chips">%s &middot; %s &middot; %s</span></td>' % (
+            esc(r["phase"]), esc(r["client"]), esc(r["project"]), esc(r["scope"]), esc(r["skill"]), esc(r["location"]),
             "<b>Overtime</b>" if ot else "Normal")]
         rt = 0.0
         for d in days:
@@ -479,7 +520,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
             name = "h_%d_%d_%d_%d_%s" % (pid, rid, lid, ot, iso)
             fixed = ""  # hours the person cannot type over (shown as text), so the live totals can still count them
             if e is None:
-                cell = '<input type="text" size="4" name="%s" value="">' % name if open_week and active(iso) else ("&ndash;" if open_week else "&nbsp;")
+                cell = '<input type="text" size="4" name="%s" value="">' % name if can_edit and active(iso) else ("&ndash;" if can_edit else "&nbsp;")
             else:
                 rt += e["hours"]
                 day_tot[iso] += e["hours"]
@@ -491,25 +532,32 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
                     why = (' title="Sent back: %s"' % esc(e["reject_reason"]) if e["status"] == "Draft" and e["reject_reason"] else
                            ' title="Reopened: %s"' % esc(e["reopen_reason"]) if e["status"] == "Draft" and e["reopen_reason"] else "")
                     cell = '<input type="text" size="4" name="%s" value="%s"%s>' % (name, fmt(e["hours"]), why)
-            tds.append('<td align="center" class="c" data-day="%s"%s>%s</td>' % (iso, fixed, cell))
+            tds.append('<td align="center" class="c%s" data-day="%s"%s>%s</td>' % (" we" if d.weekday() >= 5 else "", iso, fixed, cell))
         tds.append('<td align="right" class="rt">%s</td>' % fmt(rt))
         trs.append('<tr class="row" data-ot="%d">%s</tr>' % (ot, "".join(tds)))
     if not trs:
-        trs.append('<tr><td colspan="%d">No rows yet. Add a row below.</td></tr>' % len(head))
-    def sum_row(label, day_cls, week_cls, per_day):  # Normal time, Overtime and Total lines under the grid
-        return '<tr><td colspan="7" align="right"><b>%s</b></td>%s<td align="right" class="%s"><b>%s</b></td></tr>' % (
-            label, "".join('<td align="center" class="%s" data-day="%s"><b>%s</b></td>' % (day_cls, d.isoformat(), fmt(per_day[d.isoformat()])) for d in days),
+        trs.append('<tr><td colspan="%d">No rows yet. Add one below.</td></tr>' % len(head))
+
+    def sum_row(label, day_cls, week_cls, per_day, row_cls=""):  # Normal time, Overtime and Total lines under the grid
+        return '<tr class="%s"><td align="right"><b>%s</b></td>%s<td align="right" class="%s"><b>%s</b></td></tr>' % (
+            row_cls, label, "".join('<td align="center" class="%s" data-day="%s"><b>%s</b></td>' % (day_cls, d.isoformat(), fmt(per_day[d.isoformat()])) for d in days),
             week_cls, fmt(sum(per_day.values())))
-    foot = sum_row("Normal time", "dn", "gn", day_norm) + sum_row("Overtime", "do", "go", day_ot) + sum_row("Total", "dt", "gt", day_tot)
-    b.append('<table border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s%s</table>' % (
-        "".join("<th>%s</th>" % esc(h) for h in head), "".join(trs), foot))
+    has_ot = any(k[3] for k in rows)  # the normal time and overtime lines only matter once there is overtime
+    foot = ((sum_row("Normal time", "dn", "gn", day_norm, "sum") + sum_row("Overtime", "do", "go", day_ot, "sum")) if has_ot else
+            '<tr style="display:none"><td></td>%s<td class="gn"></td></tr><tr style="display:none"><td></td>%s<td class="go"></td></tr>' % (
+                "".join('<td class="dn" data-day="%s"><b>0</b></td>' % d.isoformat() for d in days), "".join('<td class="do" data-day="%s"><b>0</b></td>' % d.isoformat() for d in days)))
+    foot += sum_row("Total", "dt", "gt", day_tot, "tot")
+    hdr = "".join('<th class="%s">%s</th>' % ("bkh" if i == 0 else ("we" if 1 <= i <= 7 and days[i - 1].weekday() >= 5 else ""), esc(h).replace(" ", "<br>", 1) if 1 <= i <= 7 else esc(h))
+                  for i, h in enumerate(head))
+    b.append('<table class="ts" border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s%s</table>' % (hdr, "".join(trs), foot))
     b.append(TIMESHEET_JS)
     by_status = {"Approved": 0.0, "Edited": 0.0, "Submitted": 0.0, "Draft": 0.0}
     for e in entries:
         by_status[e["status"]] += e["hours"]
-    b.append("<p><b>Hours this week (all statuses): %s</b> &nbsp; Approved %s, Edited %s, Submitted %s, Draft %s</p>" % (
+    b.append("<p><small><b>Hours this week (all statuses): %s</b> &nbsp; Approved %s, Edited %s, Submitted %s, Draft %s</small></p>" % (
         fmt(sum(by_status.values())), fmt(by_status["Approved"]), fmt(by_status["Edited"]), fmt(by_status["Submitted"]), fmt(by_status["Draft"])))
-    b.append("<p><small>To clear a draft entry, empty its box and click Save draft.</small></p>")
+    if not locked:
+        b.append("<p><small>To clear a draft entry, empty its box and click Save draft.</small></p>")
     # allowances: a row per booking code and allowance, a tick box per day
     arows = {}
     for a in con.execute(
@@ -532,11 +580,11 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     if arows:
         b.append("<p><b>Allowances</b> <small>Tick the days you are claiming. One of each allowance per day. They are submitted and approved with your hours.</small></p>")
     if arows:
-        ahead = ["Client", "Project", "Scope", "CTR", "Allowance"] + [d.strftime("%a %d/%m") for d in days] + ["Days"]
+        ahead = ["Allowance"] + [d.strftime("%a %d/%m") for d in days] + ["Days"]
         atrs = []
         for (pid, aid), r in arows.items():
-            tds = ['<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td style="white-space:nowrap">%s</td>' % (
-                esc(r["client"]), esc(r["project"]), esc(r["scope"]), esc(r["phase"]), esc(r["allowance"]))]
+            tds = ['<td class="bk"><b>%s</b><br><span class="sub">%s &middot; %s &rsaquo; %s &rsaquo; %s</span></td>' % (
+                esc(r["allowance"]), esc(r["phase"]), esc(r["client"]), esc(r["project"]), esc(r["scope"]))]
             n_days = 0
             for d in days:
                 iso = d.isoformat()
@@ -545,19 +593,24 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
                     n_days += 1
                 if a is not None and a["status"] != "Draft":
                     cell = '<span title="%s">&#10003;</span>' % esc(a["status"])
-                elif open_week and active(iso):
+                elif can_edit and active(iso):
                     cell = ('<input type="checkbox" name="a_%d_%d_%s" value="1"%s><input type="hidden" name="ashown" value="%d:%d:%s">' % (
                         pid, aid, iso, " checked" if a is not None else "", pid, aid, iso))
                 else:
                     cell = "&#10003;" if a is not None else "&ndash;"
-                tds.append('<td align="center">%s</td>' % cell)
+                tds.append('<td align="center"%s>%s</td>' % (' class="we"' if d.weekday() >= 5 else "", cell))
             tds.append('<td align="right">%d<input type="hidden" name="arow" value="%d:%d"></td>' % (n_days, pid, aid))
             atrs.append("<tr>%s</tr>" % "".join(tds))
-        b.append('<table border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s</table>' % ("".join("<th>%s</th>" % esc(h) for h in ahead), "".join(atrs)))
+        b.append('<table class="ts" border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s</table>' % (
+            "".join('<th class="%s">%s</th>' % ("bkh" if i == 0 else ("we" if 1 <= i <= 7 and days[i - 1].weekday() >= 5 else ""), esc(h).replace(" ", "<br>", 1) if 1 <= i <= 7 else esc(h))
+                    for i, h in enumerate(ahead)), "".join(atrs)))
     if any(e["status"] != "Draft" for e in entries) or any(a["status"] != "Draft" for r in arows.values() for a in r["cells"].values()):
         b.append("<p><small>Submitted and approved hours are locked, and so are submitted and approved allowances. If one needs changing, ask a cost controller to reopen the timesheet.</small></p>")
-    b.append('<p><input type="submit" name="action" value="Save draft"> '
-             '<input type="submit" name="action" value="Submit week"></p></form>')
+    if locked:
+        b.append('<div class="actions"><b>Locked.</b> <small>This timesheet has been submitted. Ask a cost controller to reopen it if something needs changing.</small></div></form>')
+    else:
+        b.append('<div class="actions"><input type="submit" name="action" value="Save draft"> '
+                 '<input type="submit" name="action" value="Submit week"> <small>Save draft keeps your hours private; Submit week sends them for approval.</small></div></form>')
 
     # add a row
     scopes = con.execute(
@@ -574,8 +627,8 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     for pf in con.execute("select c.name as client, p.expiry_date from paaf p join client c on c.client_id=p.client_id "
                           "where p.user_id=? and c.is_internal=0 and p.expiry_date is not null and p.expiry_date < ? order by c.name", (u, d0)):
         b.append("<p><small><b>%s:</b> you came off this client's list on %s, so its CTRs are not offered from that date.</small></p>" % (esc(pf["client"]), dmy(pf["expiry_date"])))
-    if week_inactive:
-        pass  # the note above says why nothing can be added
+    if week_inactive or locked:
+        pass  # the notes above say why nothing can be added
     elif scopes:
         def label(s):
             if s["is_internal"]:  # e.g. "Internal - Business Services"
@@ -586,18 +639,21 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
         keep = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"])
         akeep = "".join('<input type="hidden" name="aadd" value="%d:%d">' % k for k in arows if not arows[k]["cells"])
         lo = "".join('<option value="%d">%s</option>' % (lid, esc(name)) for lid, name in locations(con))
-        b.append('<p><b>Add row:</b> CTR <select form="tsform" name="add_phase">%s</select> '
-                 'Skill code <select form="tsform" name="add_role">%s</select> Location <select form="tsform" name="add_loc">%s</select> '
-                 '<label><input form="tsform" type="checkbox" name="add_ot" value="1"> Overtime</label> '
+        b.append('<div class="addbox"><p><b>Add row:</b> CTR <select form="tsform" name="add_phase">%s</select> '
                  '<input form="tsform" type="submit" name="action" value="Add row"> <small>(hours you have typed are saved first)</small></p>'
+                 '<details><summary>Different skill code, location or overtime</summary>'
+                 '<p>Skill code <select form="tsform" name="add_role">%s</select> Location <select form="tsform" name="add_loc">%s</select> '
+                 '<label><input form="tsform" type="checkbox" name="add_ot" value="1"> Overtime</label></p>'
                  "<p><small>Your own skill code is pre-selected. Choose a different one if you are covering another role. "
                  "Hours NMC pays for itself (not billed to a client) go to an Internal code, for example Internal - Business Services. "
-                 "Tick Overtime for overtime hours: they go on their own line and have no separate rate yet.</small></p>" % (so, ro, lo))
+                 "Tick Overtime for overtime hours: they go on their own line and have no separate rate yet.</small></p></details>" % (so, ro, lo))
         if atypes:
             ao = "".join('<option value="%d">%s</option>' % (t["allowance_id"], esc(t["name"])) for t in atypes)
-            b.append('<p><b>Add allowance:</b> Booking code <select form="tsform" name="aadd_phase">%s</select> Allowance <select form="tsform" name="aadd_type">%s</select> '
+            b.append('<details><summary>Claim an allowance</summary>'
+                     '<p>Booking code <select form="tsform" name="aadd_phase">%s</select> Allowance <select form="tsform" name="aadd_type">%s</select> '
                      '<input form="tsform" type="submit" name="action" value="Add allowance row"></p>'
-                     "<p><small>An allowance is claimed against a booking code, so the code's approver approves it.</small></p>" % (so, ao))
+                     "<p><small>An allowance is claimed against a booking code, so the code's approver approves it.</small></p></details>" % (so, ao))
+        b.append("</div>")
     else:
         b.append("<p>You are not on the personnel list of any client with open scopes, so there is nothing to book to.</p>")
     return layout(con, u, "My Timesheet", "".join(b))
@@ -640,6 +696,8 @@ def save_timesheet(con, form):
     adds = parse_adds(form.get("add", []))
     msgs, saved, cleared = [], 0, 0
     d0, d6 = w.isoformat(), (w + datetime.timedelta(days=6)).isoformat()
+    if sheet_locked(con, u, d0, d6):  # nothing at all can be added to or changed on a submitted sheet
+        return view_timesheet(con, u, w, [LOCKED_MSG])
     for key, vals in form.items():
         if not key.startswith("h_"):
             continue
@@ -1484,7 +1542,8 @@ def view_reports(con, u, q):
 
     period_q = urlencode([("u", u), ("from", d_from), ("to", d_to)] + [(k, v) for k, v in (("client", client), ("project", project), ("scope", scope), ("phase", phase)) if v is not None])
     b = ['<p><a href="/reports/grid?u=%d">Timesheet grid: hours by person, code and day</a> (ready-made layouts you can tailor) &nbsp; '
-         '<a href="/reports/period.xlsx?%s">Download the period report as Excel</a></p>' % (u, esc(period_q)),
+         '<a href="/reports/period.xlsx?%s">Download the period report as Excel</a>%s</p>' % (
+             u, esc(period_q), (' &nbsp; <a href="/reports/manhours?u=%d">Manhour report by client (people and roles, Excel)</a>' % u) if manhour_clients(con, u) else ""),
          "<h4>CTR (Cost Time Resource) - by client, project, scope and CTR</h4>",
          "<p><small>%s</small></p>" % tree_note,
          '<p><input type="button" value="Expand all" onclick="openTo(9)"> <input type="button" value="Collapse all" onclick="openTo(0)"> '
@@ -1704,6 +1763,125 @@ def grid_query(g, u):
     return urlencode(pairs)
 
 
+def manhour_clients(con, u):
+    """The clients whose manhour report this person can run: every client for a cost controller; for anyone else the clients where they are the main
+    approver (the project manager) or a secondary approver on a scope. Internal is never offered: it has no client to report to."""
+    if permission_of(con, u) == "controller":
+        return [(r[0], r[1]) for r in con.execute("select client_id, name from client where is_internal=0 order by name")]
+    if permission_of(con, u) == "admin":
+        return []
+    return [(r[0], r[1]) for r in con.execute(
+        "select distinct c.client_id, c.name from client c join scope s on s.client_id=c.client_id join v_scope_approver va on va.scope_id=s.scope_id "
+        "where c.is_internal=0 and va.user_id=? order by c.name", (u,))]
+
+
+def manhour_data(con, u, q):
+    """The manhour report for one client: approved hours by job family, role and person, one column per week, with subtotals. Hours only, never money.
+    Returns None when this person has no client to report on."""
+    clients = manhour_clients(con, u)
+    if not clients:
+        return None
+    try:
+        cid = int(q.get("client", [""])[0])
+    except ValueError:
+        cid = 0
+    if cid not in [c[0] for c in clients]:
+        cid = clients[0][0]
+    this_year = datetime.date.today().year
+    d_from = q.get("from", [""])[0] or "%d-01-01" % this_year
+    d_to = q.get("to", [""])[0] or "%d-12-31" % this_year
+    vis, vargs = visible_to(report_view(con, u), u)
+    found = con.execute(
+        "select date(t.work_date,'weekday 0','-6 days') as wk, ro.family, ro.skill_code, ro.name as role, us.name as person, "
+        "sum(case when t.status='Approved' then t.hours else 0 end) as approved, "
+        "sum(case when t.status in ('Submitted','Edited') then t.hours else 0 end) as pending "
+        "from time_entry t join scope s on s.scope_id=t.scope_id join role ro on ro.role_id=t.worked_role_id join app_user us on us.user_id=t.user_id "
+        "where s.client_id=? and t.status<>'Draft' and date(t.work_date,'weekday 0','-6 days') between ? and ?" + vis +
+        " group by wk, ro.role_id, us.user_id order by ro.family, ro.skill_code, us.name, wk", (cid, d_from, d_to) + vargs).fetchall()
+    weeks = sorted({r["wk"] for r in found})
+    tree = {}  # family -> (skill code, role) -> person -> {"w": {week: approved}, "pending": hours}
+    for r in found:
+        person = tree.setdefault(r["family"], {}).setdefault((r["skill_code"], r["role"]), {}).setdefault(r["person"], {"w": {}, "pending": 0.0})
+        person["w"][r["wk"]] = person["w"].get(r["wk"], 0.0) + r["approved"]
+        person["pending"] += r["pending"]
+    return {"clients": clients, "client_id": cid, "client": dict(clients)[cid], "from": d_from, "to": d_to, "weeks": weeks, "tree": tree}
+
+
+def manhour_lines(data):
+    """The report as rows of cells, each flagged: 'head', 'row', 'role' (subtotal), 'family' (subtotal) or 'grand'."""
+    weeks = data["weeks"]
+    dmy = lambda iso: "%s/%s/%s" % (iso[8:], iso[5:7], iso[:4])
+    lines = [("head", ["Job family", "Skill code", "Role", "Person"] + [dmy(w) for w in weeks] + ["Approved hrs", "Pending hrs"])]
+    grand = {w: 0.0 for w in weeks}
+    grand_p = 0.0
+
+    def total_cells(per_week, pending):
+        return [per_week[w] or None for w in weeks] + [sum(per_week.values()), pending]   # a week with no hours is left blank
+    for family, roles in data["tree"].items():
+        fam = {w: 0.0 for w in weeks}
+        fam_p = 0.0
+        for (code, role), people in roles.items():
+            rol = {w: 0.0 for w in weeks}
+            rol_p = 0.0
+            for person, d in people.items():
+                per = {w: d["w"].get(w, 0.0) for w in weeks}
+                lines.append(("row", [family, code, role, person] + total_cells(per, d["pending"])))
+                for w in weeks:
+                    rol[w] += per[w]
+                rol_p += d["pending"]
+            if len(people) > 1:  # a role with one person needs no subtotal under that person's line
+                lines.append(("role", ["", code, "Total " + role, ""] + total_cells(rol, rol_p)))
+            for w in weeks:
+                fam[w] += rol[w]
+            fam_p += rol_p
+        lines.append(("family", ["Total " + family, "", "", ""] + total_cells(fam, fam_p)))
+        for w in weeks:
+            grand[w] += fam[w]
+        grand_p += fam_p
+    if data["tree"]:
+        lines.append(("grand", ["Total for the client", "", "", ""] + total_cells(grand, grand_p)))
+    return lines
+
+
+def view_manhours(con, u, q):
+    """The manhour report for a client, for the client's project manager (its main approver) and the cost controllers."""
+    data = manhour_data(con, u, q)
+    if data is None:
+        return layout(con, u, "Reports", "<p>The manhour report is for a client's project manager (its main approver) and for cost controllers.</p>")
+    lines = manhour_lines(data)
+    auto = ' onchange="this.form.submit()"'
+    qs = urlencode([("u", u), ("client", data["client_id"]), ("from", data["from"]), ("to", data["to"])])
+    b = ["<p><a href=\"/reports?u=%d\">&lt;&lt; Reports</a></p>" % u,
+         "<p><small>Approved hours for one client, broken down by job family, role and the people who worked in it, one column per week (week commencing). "
+         "Hours only. Pending hrs are submitted hours still waiting for approval and are not in the approved figures.</small></p>",
+         '<form method="get" action="/reports/manhours">%s<p>Client %s From %s To %s <input type="submit" value="Show"> '
+         '<a href="/reports/manhours.xlsx?%s">Download as Excel</a></p></form>' % (
+             hidden(u=u), sel("client", data["clients"], data["client_id"], False, "", auto), date_input("from", data["from"]), date_input("to", data["to"]), esc(qs))]
+    if len(lines) > 1:
+        out = []
+        for kind, cells in lines:
+            tag = "th" if kind == "head" else "td"
+            bold = kind in ("role", "family", "grand")
+            tds = []
+            for i, c in enumerate(cells):
+                txt = fmt(c) if isinstance(c, float) else esc(c)
+                if bold and txt:
+                    txt = "<b>%s</b>" % txt
+                tds.append("<%s%s>%s</%s>" % (tag, ' align="right"' if i >= 4 and kind != "head" else "", txt, tag))
+            out.append('<tr%s>%s</tr>' % (' style="background:#f1f1f2"' if kind in ("role", "family") else ("" if kind != "grand" else ' style="border-top:2px solid #0f0f12"'), "".join(tds)))
+        b.append('<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(out))
+    else:
+        b.append("<p>No hours for %s in this date range.</p>" % esc(data["client"]))
+    return layout(con, u, "Reports", "".join(b))
+
+
+def manhour_sheet(data):
+    lines = manhour_lines(data)
+    rows = [[None if (isinstance(c, str) and c == "" and i >= 4) else c for i, c in enumerate(cells)] for kind, cells in lines]
+    bold = tuple(i + 1 for i, (kind, _) in enumerate(lines) if kind != "row")
+    return rows, bold, "Manhours %s" % data["client"][:20]
+
+
 def view_grid(con, u, q):
     """Hours by person, code and day (or week, or total) with ready-made layouts that can be tailored, and an Excel download."""
     if permission_of(con, u) == "admin":  # Admin (IT) has no reports
@@ -1863,13 +2041,14 @@ DASH_CSS = """<style>
 .chart text{font-family:inherit;fill:var(--grey-dark);font-size:12px}
 .chart .val{fill:var(--black)}
 .chart .grid{stroke:var(--line);stroke-width:1}
-.chart rect.hit:hover{fill:rgba(15,15,18,.05)}
+.chart rect.hit:hover{fill:rgba(254,103,0,.08)}
+.chart a{cursor:pointer}.chart a:hover text{fill:var(--orange)}
 .key{display:flex;flex-wrap:wrap;gap:1.2rem;font-size:.8rem;color:var(--grey-dark);margin:.4rem 0 .8rem}
 .key i{display:inline-block;width:12px;height:12px;margin-right:.35rem;vertical-align:-1px}
 </style>"""
 
 
-def dash_budget_chart(rows):
+def dash_budget_chart(rows, u):
     """Horizontal bars, one per budgeted CTR: the budget as a track with an end tick, approved hours filled, pending hours hatched.
     A CTR over its budget is dark red and says so in words."""
     w, left, right, row_h, top = 900, 170, 210, 30, 8
@@ -1892,7 +2071,7 @@ def dash_budget_chart(rows):
         tip = "%s: budget %s hrs, approved %s hrs, pending %s hrs, %s hrs %s" % (
             r["phase"], fmt(bud), fmt(act), fmt(pend), fmt(abs(bud - act)), "over budget" if over else "remaining")
         fill = "#b3261e" if over else "#fe6700"
-        o.append('<g><title>%s</title><rect class="hit" x="0" y="%d" width="%d" height="%d" fill="transparent"/>' % (esc(tip), y, w, row_h))
+        o.append('<a href="/ctr?u=%d&amp;phase=%d"><g><title>%s (click to open the CTR)</title><rect class="hit" x="0" y="%d" width="%d" height="%d" fill="transparent"/>' % (u, r["phase_id"], esc(tip), y, w, row_h))
         o.append('<text x="%d" y="%d" text-anchor="end" class="val">%s</text>' % (left - 10, y + 19, esc(r["phase"])))
         o.append('<rect x="%.1f" y="%d" width="%.1f" height="14" fill="#e5e5e6"/>' % (left, y + 7, x(bud) - left))                 # the budget
         o.append('<rect x="%.1f" y="%d" width="%.1f" height="14" fill="%s"/>' % (left, y + 7, max(x(act) - left, 0), fill))      # approved
@@ -1901,6 +2080,7 @@ def dash_budget_chart(rows):
         o.append('<rect x="%.1f" y="%d" width="2" height="22" fill="#0f0f12"/>' % (x(bud) - 1, y + 3))                          # the budget line
         o.append('<text x="%d" y="%d" class="val">%s / %s hrs &#183; %s%s</text></g>' % (
             w - right + 12, y + 19, fmt(act), fmt(bud), pct, " &#9650; over" if over else ""))
+        o[-1] = o[-1] + "</a>"
     o.append("</svg>")
     return "".join(o)
 
@@ -1942,7 +2122,7 @@ def view_dashboard(con, u, q):
         return no_access(con, u, "Dashboard")
     rows = con.execute("select * from v_ctr_budget where budget_hours is not null order by actual_hours * 1.0 / nullif(budget_hours, 0) desc, phase").fetchall()
     b = [DASH_CSS, "<p><small>Hours only, as P6 holds hours only. Actual is approved hours; pending is submitted hours waiting for approval. Client work only: "
-         "internal hours are not budgeted. The tables and the CTR detail are on the <a href=\"/reports?u=%d\">Reports</a> page.</small></p>" % u]
+         "internal hours are not budgeted. Click a CTR to open it. The tables are on the <a href=\"/reports?u=%d\">Reports</a> page.</small></p>" % u]
     if rows:
         tb = sum(r["budget_hours"] for r in rows)
         ta = sum(r["actual_hours"] for r in rows)
@@ -1959,7 +2139,7 @@ def view_dashboard(con, u, q):
         b.append('<div class="key"><span><i style="background:#e5e5e6"></i>Budget</span><span><i style="background:#fe6700"></i>Approved</span>'
                  '<span><i style="background:repeating-linear-gradient(135deg,#fe6700 0 2px,#fff 2px 5px)"></i>Pending</span>'
                  '<span><i style="background:#b3261e"></i>Over budget</span><span><i style="background:#0f0f12;width:2px;height:12px"></i>Budget line</span></div>')
-        b.append(dash_budget_chart(rows))
+        b.append(dash_budget_chart(rows, u))
     else:
         b.append("<p>No budgets have been loaded yet. Load them from P6 on Admin, Budgets and the charts will fill in.</p>")
     # approved hours by week and client
@@ -3123,6 +3303,7 @@ page("/reopen")(lambda con, u, q: view_reopen(con, u, q))
 page("/dashboard")(lambda con, u, q: view_dashboard(con, u, q))
 page("/reports")(lambda con, u, q: view_reports(con, u, q))
 page("/reports/grid")(lambda con, u, q: view_grid(con, u, q))
+page("/reports/manhours")(lambda con, u, q: view_manhours(con, u, q))
 page("/ctr")(lambda con, u, q: view_ctr(con, u, q))
 page("/admin")(lambda con, u, q: view_admin(con, u, q.get("t", [""])[0], q=q))
 page("/admin/edit")(lambda con, u, q: view_admin_edit(con, u, q.get("t", [""])[0], int(q.get("id", ["0"])[0])))
@@ -3131,12 +3312,21 @@ page("/audit")(lambda con, u, q: view_audit(con, u, q))
 
 @flask_app.route("/reports/grid.xlsx")
 @flask_app.route("/reports/period.xlsx")
+@flask_app.route("/reports/manhours.xlsx")
 @with_db
 def excel_download(con):
     q = query()
     u = user_id(con, q)
     if permission_of(con, u) == "admin":
         return html_response(no_access(con, u, "Reports"), 403)
+    if request.path.endswith("manhours.xlsx"):
+        data = manhour_data(con, u, q)
+        if data is None:
+            return html_response(no_access(con, u, "Reports"), 403)
+        rows, bold, sheet = manhour_sheet(data)
+        name = re.sub(r"[^A-Za-z0-9]+", "-", data["client"]).strip("-")
+        return Response(xlsx_bytes(sheet, rows, bold), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": 'attachment; filename="manhours-%s.xlsx"' % name})
     rv = report_view(con, u)
     grid = request.path.endswith("grid.xlsx")
     if grid:
