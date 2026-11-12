@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
 # Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
-REQUIRED_SCHEMA = 13
+REQUIRED_SCHEMA = 14
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
 ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "TASAOrbiterVF.woff2"), "font/woff2")}
 
@@ -1833,7 +1833,7 @@ def view_ctr(con, u, q):
         pid = int(q.get("phase", ["0"])[0])
     except ValueError:
         pid = 0
-    ph = con.execute("select ph.phase_id, ph.name as phase, ph.status as phase_status, ph.description as phase_desc, ph.wbs, ph.cbs, ph.abs_code, s.scope_code, s.description, s.status as scope_status, "
+    ph = con.execute("select ph.*, ph.name as phase, ph.status as phase_status, ph.description as phase_desc, s.scope_code, s.description as scope_desc, s.status as scope_status, c.framework_ref, "
                      "pr.project_code, pr.name as project, c.name as client, "
                      "(select group_concat(x.name, ', ') from (select au.name from v_scope_approver va join app_user au on au.user_id=va.user_id "
                      "where va.scope_id=s.scope_id order by au.name) x) as approver "
@@ -1874,7 +1874,7 @@ def view_ctr(con, u, q):
             "<table border=\"0\" cellpadding=\"2\"><tr><td>Client</td><td><b>%s</b></td></tr><tr><td>Project</td><td><b>%s %s</b></td></tr>"
             "<tr><td>Scope</td><td><b>%s %s</b> (%s)</td></tr><tr><td>CTR</td><td><b>%s</b> (%s)</td></tr>"
             "<tr><td>Approver</td><td>%s</td></tr>%s</table>" % (
-                u, esc(ph["client"]), esc(ph["project_code"]), esc(ph["project"]), esc(ph["scope_code"]), esc(ph["description"]),
+                u, esc(ph["client"]), esc(ph["project_code"]), esc(ph["project"]), esc(ph["scope_code"]), esc(ph["scope_desc"]),
                 esc(ph["scope_status"]), esc(ph["phase"]), esc(ph["phase_status"]), esc(ph["approver"]),
                 ("<tr><td>Description</td><td>%s</td></tr>" % esc(ph["phase_desc"]) if ph["phase_desc"] else "")
                 + ("<tr><td>WBS / CBS / ABS</td><td>%s</td></tr>" % esc(" / ".join(x or "-" for x in (ph["wbs"], ph["cbs"], ph["abs_code"])))
@@ -1889,6 +1889,8 @@ def view_ctr(con, u, q):
     a_value = sum(r["value"] for r in arows if r["status"] == "Approved")
     tabs.append(("<b>[Allowances]</b>" if fam == "Allowances" else '<a href="%s&amp;family=Allowances">Allowances</a>' % base) if arows else "")
     tabs = [x for x in tabs if x]
+    if fam == "Summary":  # the CTR sheet carries its own header, so only the way back is shown above it
+        head = '<p><a href="/reports?u=%d">&lt;&lt; Back to Reports</a></p>' % u
     b = [head, "<p>CTR tabs: %s</p>" % " | ".join(tabs)]
     if not ents and not arows:
         b.append("<p>No hours have been submitted to this CTR yet.</p>")
@@ -1908,24 +1910,77 @@ def view_ctr(con, u, q):
 
     tcol = "<th>Total</th>" if money else ""
     if fam == "Allowances":
-        b.append("<h4>Allowances - %s %s, %s</h4>" % (esc(ph["scope_code"]), esc(ph["description"]), esc(ph["phase"])) + allow_table)
-        return layout(con, u, "CTR - %s %s - %s" % (ph["scope_code"], ph["description"], ph["phase"]), "".join(b))
+        b.append("<h4>Allowances - %s %s, %s</h4>" % (esc(ph["scope_code"]), esc(ph["scope_desc"]), esc(ph["phase"])) + allow_table)
+        return layout(con, u, "CTR - %s %s - %s" % (ph["scope_code"], ph["scope_desc"], ph["phase"]), "".join(b))
     if fam == "Summary":
-        b.append("<h4>CTR summary - %s %s, %s</h4><p><small>Actual booked hrs are approved hours. Pending hrs are submitted or edited hours waiting for approval. "
-                 "Click a job family tab for its resources, people and timesheet entries.</small></p>" % (esc(ph["scope_code"]), esc(ph["description"]), esc(ph["phase"])))
-        rows = []
-        for f in families:
-            h, t, p = tot([e for e in ents if e["family"] == f])
-            rows.append("<tr><td><a href=\"%s&amp;family=%s\">%s</a></td>%s%s%s</tr>" % (
-                base, quote(f), esc(f), td(fmt(h), True), td("%.2f" % t, True) if money else "", td(fmt(p), True)))
-        h, t, p = tot(ents)
-        rows.append(sub_row(["Total", fmt(h)] + (["%.2f" % t] if money else []) + [fmt(p)], right_from=1))
-        if ents:
-            b.append('<table border="1" cellpadding="3" cellspacing="0"><tr><th>Job family</th><th>Actual booked hrs</th>%s<th>Pending hrs</th></tr>%s</table>' % (tcol, "".join(rows)))
-        if arows:
-            b.append(allow_table)
-            if money:
-                b.append("<p><b>Hours value %.2f + allowances %.2f = CTR value including allowances %.2f</b></p>" % (tot(ents)[1], a_value, tot(ents)[1] + a_value))
+        def para(v):
+            return esc(v).replace("\n", "<br>") if v else "&ndash;"
+
+        def label(x):
+            return "<td><b>%s</b></td>" % x
+        ctr_no = "%s-%s" % (ph["scope_code"], ph["ctr_code"] or ph["phase"].upper())
+        b.append("<h4>CTR %s</h4>" % esc(ctr_no))
+        b.append('<table border="1" cellpadding="3" cellspacing="0">'
+                 "<tr>%s<td colspan=\"3\">%s</td></tr><tr>%s<td colspan=\"3\">%s</td></tr><tr>%s<td colspan=\"3\">%s</td></tr>"
+                 "<tr>%s<td colspan=\"3\">%s</td></tr><tr>%s<td colspan=\"3\">%s</td></tr>"
+                 "<tr>%s<td>%s</td>%s<td>%s</td></tr>"
+                 "<tr>%s<td>%s</td>%s<td>%s</td>%s<td>%s</td></tr></table>" % (
+                     label("Project Name"), esc(ph["project"]), label("Project Title"), esc("%s - %s" % (ph["scope_desc"], ph["phase"])),
+                     label("Client"), esc(ph["client"]), label("Date"), datetime.date.today().strftime("%d/%m/%Y"),
+                     label("Framework Agreement Ref"), esc(ph["framework_ref"] or "-"),
+                     label("CTR Title"), esc(ph["phase_desc"] or ph["phase"]), label("CTR No"), esc(ctr_no),
+                     label("Prepared by"), esc(ph["prepared_by"] or "-"), label("Checked by"), esc(ph["checked_by"] or "-"),
+                     label("Approved by"), esc(ph["approver"] or "-")))
+        for title, key in (("Objectives", "objectives"), ("Input Requirements", "inputs"), ("Scope of Work", "scope_of_work"),
+                           ("This CTR assumes the following", "assumptions"), ("This CTR excludes the following", "exclusions")):
+            b.append('<table border="1" cellpadding="3" cellspacing="0" style="width:100%%;margin-top:.4rem"><tr><th align="left">%s</th></tr><tr><td>%s</td></tr></table>' % (
+                title, para(ph[key])))
+        b.append('<table border="1" cellpadding="3" cellspacing="0" style="margin-top:.4rem"><tr>%s<td>%s</td>%s<td>%s</td></tr><tr>%s<td>%s</td>%s<td>%s</td></tr></table>' % (
+            label("Commencement Date"), esc(ph["book_from"] or "ref plan"), label("Duration"), "ref plan",
+            label("Completion Date"), esc(ph["book_to"] or "ref plan"), label("Expenses"), esc(ph["expenses"])))
+        if ph["wbs"] or ph["cbs"] or ph["abs_code"]:
+            b.append('<table border="1" cellpadding="3" cellspacing="0" style="margin-top:.4rem"><tr>%s<td>%s</td></tr></table>' % (
+                label("WBS / CBS / ABS"), esc(" / ".join(x or "-" for x in (ph["wbs"], ph["cbs"], ph["abs_code"])))))
+        # resources: hours booked and approved, at the client rate card
+        res = {}
+        for e in ents:
+            k = (e["skill_code"], e["title"], e["sales_rate"] if money else None)
+            r = res.setdefault(k, [0.0, 0.0, 0.0])
+            if e["status"] == "Approved":
+                r[0] += e["hours"]
+                r[1] += e["hours"] * e["sales_rate"]
+            else:
+                r[2] += e["hours"]
+        res_rows = "".join("<tr><td>%s</td>%s<td align=\"right\">%s</td>%s<td align=\"right\">%s</td></tr>" % (
+            esc("%s %s" % (k[0], k[1])), ('<td align="right">%.2f</td>' % k[2]) if money else "", fmt(v[0]),
+            ('<td align="right">%.2f</td>' % v[1]) if money else "", fmt(v[2])) for k, v in sorted(res.items(), key=lambda kv: kv[0][0]))
+        h_all, t_all, p_all = tot(ents)
+        res_total = ("<tr><td><b>Sub-Totals</b></td>%s<td align=\"right\"><b>%s</b></td>%s<td align=\"right\"><b>%s</b></td></tr>" % (
+            "<td></td>" if money else "", fmt(h_all), ('<td align="right"><b>%.2f</b></td>' % t_all) if money else "", fmt(p_all)))
+        b.append('<table border="1" cellpadding="3" cellspacing="0" style="margin-top:.4rem"><tr><th>Resource</th>%s<th>Hours</th>%s<th>Pending hrs</th></tr>%s%s</table>' % (
+            "<th>Cost &pound; / Hour</th>" if money else "", "<th>Total</th>" if money else "", res_rows, res_total))
+        # additions: the allowances, at the allowance rate table
+        adds = con.execute(
+            "select at.name as allowance, lo.name as location, a.overtime, a.amount, count(*) as units "
+            "from v_allowance_value a join scope s on s.scope_id=a.scope_id join allowance_type at on at.allowance_id=a.allowance_id "
+            "join location lo on lo.location_id=a.location_id where a.phase_id=? and a.status='Approved'" + avis +
+            " group by a.allowance_id, a.location_id, a.overtime, a.amount order by a.allowance_id, a.location_id, a.overtime, a.amount", (pid,) + aargs).fetchall()
+        add_total = sum(r["amount"] * r["units"] for r in adds)
+        add_rows = "".join("<tr><td>%s</td>%s<td align=\"right\">%d</td>%s</tr>" % (
+            esc("%s - %s%s" % (r["allowance"], r["location"], ", overtime" if r["overtime"] else "")),
+            ('<td align="right">%.2f</td>' % r["amount"]) if money else "", r["units"],
+            ('<td align="right">%.2f</td>' % (r["amount"] * r["units"])) if money else "") for r in adds)
+        b.append('<table border="1" cellpadding="3" cellspacing="0" style="margin-top:.4rem"><tr><th>Addition</th>%s<th>Unit (days)</th>%s</tr>%s</table>' % (
+            "<th>Cost &pound; / Unit</th>" if money else "", "<th>Total</th>" if money else "",
+            add_rows or "<tr><td colspan=\"%d\">No approved allowances.</td></tr>" % (4 if money else 2)))
+        if money:
+            b.append("<p><b>Total for this CTR: %.2f</b> <small>(resources %.2f + additions %.2f; approved hours and allowances only)</small></p>" % (
+                t_all + add_total, t_all, add_total))
+        terms = " &nbsp; ".join("%s [%s]" % (x, "X" if ph["payment_terms"] == x else "&nbsp;") for x in ("Reimbursable", "Budget", "Lump Sum"))
+        b.append('<table border="1" cellpadding="3" cellspacing="0" style="margin-top:.4rem"><tr>%s<td>%s</td></tr></table>' % (label("Payment Terms"), terms))
+        b.append('<table border="1" cellpadding="3" cellspacing="0" style="width:100%%;margin-top:.4rem"><tr><th align="left">Basis of Proposal</th></tr><tr><td>%s</td></tr></table>' % para(ph["basis"]))
+        b.append("<p><small>Hours are those booked and approved against this CTR, priced at the client's rate card for each skill code; additions are approved allowances "
+                 "at the allowance rate table. Pending hrs are submitted and waiting for approval. The job family tabs above list the people and each timesheet entry.</small></p>")
     else:
         fe = [e for e in ents if e["family"] == fam]
         b.append("<h4>%s</h4>" % esc(fam))
@@ -1964,7 +2019,7 @@ def view_ctr(con, u, q):
         b.append('<p><b>Timesheet entries</b> <small>(%sonly Approved entries count towards the CTR)</small></p>'
                  '<table border="1" cellpadding="3" cellspacing="0"><tr><th>Date</th><th>Person</th><th>Booked as</th><th>Location</th><th>Type</th><th>Hours</th>%s'
                  '<th>Status</th><th>Approved by</th></tr>%s</table>' % ("value = hours x sales rate; " if money else "", "<th>Value</th>" if money else "", "".join(rows)))
-    return layout(con, u, "CTR - %s %s - %s" % (ph["scope_code"], ph["description"], ph["phase"]), "".join(b))
+    return layout(con, u, "CTR - %s %s - %s" % (ph["scope_code"], ph["scope_desc"], ph["phase"]), "".join(b))
 
 
 # ---------- Admin ----------
@@ -2393,8 +2448,8 @@ def view_admin_edit(con, u, t, i, msgs=None):
         r = con.execute("select c.*, a.name as approver from client c left join app_user a on a.user_id=c.approver_user_id where c.client_id=?", (i,)).fetchone()
         if not r:
             return layout(con, u, "Admin", "<p>Not found.</p>")
-        form = ("<tr><td>Client</td><td>%s</td></tr><tr><td>Main approver</td><td>%s</td></tr>" % (
-            esc(r["name"]), sel("approver_user_id", opts_approvers(con), r["approver_user_id"], True, "None")))
+        form = ("<tr><td>Client</td><td>%s</td></tr><tr><td>Main approver</td><td>%s</td></tr><tr><td>Framework agreement ref</td><td>%s</td></tr>" % (
+            esc(r["name"]), sel("approver_user_id", opts_approvers(con), r["approver_user_id"], True, "None"), txt("framework_ref", r["framework_ref"] or "", 40)))
         note = ("<p><small>The main approver approves hours booked to any scope of this client (never their own). Changing it moves the waiting entries to the new "
                 "approver's queue.</small></p>")
     elif t in ("scopes", "internal"):  # an internal code is a scope of the Internal client
@@ -2427,12 +2482,26 @@ def view_admin_edit(con, u, t, i, msgs=None):
         people = " ".join('<label><input type="checkbox" name="person" value="%d"%s> %s</label>' % (
             p["user_id"], " checked" if p["user_id"] in allowed else "", esc(p["name"]))
             for p in con.execute("select user_id, name from app_user order by name"))
+        def area(name, value, rows=3):
+            return '<textarea name="%s" rows="%d" cols="70">%s</textarea>' % (name, rows, esc(value or ""))
         form = ("<tr><td>Scope</td><td>%s</td></tr><tr><td>CTR name</td><td>%s</td></tr><tr><td>Status</td><td>%s</td></tr>"
-                "<tr><td>Description</td><td>%s</td></tr><tr><td>WBS</td><td>%s</td></tr><tr><td>CBS</td><td>%s</td></tr><tr><td>ABS</td><td>%s</td></tr>"
+                "<tr><td>CTR code</td><td>%s <small>discipline - phase letter - number, e.g. PM-D-001. The scope code goes in front: %s-&hellip;</small></td></tr>"
+                "<tr><td>CTR title</td><td>%s</td></tr><tr><td>Prepared by</td><td>%s</td></tr><tr><td>Checked by</td><td>%s</td></tr>"
+                "<tr><td>Objectives</td><td>%s</td></tr><tr><td>Input requirements</td><td>%s</td></tr><tr><td>Scope of work</td><td>%s</td></tr>"
+                "<tr><td>This CTR assumes</td><td>%s</td></tr><tr><td>This CTR excludes</td><td>%s</td></tr>"
+                "<tr><td>Expenses</td><td>%s</td></tr><tr><td>Payment terms</td><td>%s</td></tr><tr><td>Basis of proposal</td><td>%s</td></tr>"
+                "<tr><td>WBS</td><td>%s</td></tr><tr><td>CBS</td><td>%s</td></tr><tr><td>ABS</td><td>%s</td></tr>"
                 "<tr><td>Who can book</td><td>%s</td></tr><tr><td>People allowed</td><td>%s</td></tr>"
                 "<tr><td>Bookable from</td><td>%s</td></tr><tr><td>Bookable until</td><td>%s</td></tr>"
                 % (esc(r["scope_code"]), txt("name", r["name"], 20), sel("status", [("Open", "Open"), ("Closed", "Closed")], r["status"]),
-                   txt("description", r["description"] or "", 50), txt("wbs", r["wbs"] or "", 20), txt("cbs", r["cbs"] or "", 20), txt("abs_code", r["abs_code"] or "", 20),
+                   txt("ctr_code", r["ctr_code"] or "", 14), esc(r["scope_code"]),
+                   txt("description", r["description"] or "", 50), txt("prepared_by", r["prepared_by"] or "", 20), txt("checked_by", r["checked_by"] or "", 20),
+                   area("objectives", r["objectives"]), area("inputs", r["inputs"]), area("scope_of_work", r["scope_of_work"]),
+                   area("assumptions", r["assumptions"]), area("exclusions", r["exclusions"]),
+                   txt("expenses", r["expenses"] or "Reimbursable", 20),
+                   sel("payment_terms", [("Reimbursable", "Reimbursable"), ("Budget", "Budget"), ("Lump Sum", "Lump Sum")], r["payment_terms"]),
+                   area("basis", r["basis"]),
+                   txt("wbs", r["wbs"] or "", 20), txt("cbs", r["cbs"] or "", 20), txt("abs_code", r["abs_code"] or "", 20),
                    sel("restricted", [("0", "Anyone with an approved PAAF (or an internal code)"), ("1", "Only the people ticked below")], str(r["restricted"])),
                    people, date_input("book_from", r["book_from"] or ""), date_input("book_to", r["book_to"] or "")))
         note = ("<p><small>Closing a CTR stops new bookings to it. Existing hours are not affected. Hours are approved by the client's main approver or the scope's "
@@ -2567,7 +2636,8 @@ def admin_save(con, form):
                 raise ValueError("At least one location must stay active.")
             con.execute("update location set name=?, active=? where location_id=?", (need_text(g("name"), "Location name"), int(g("active")), i))
         elif t == "clients":
-            con.execute("update client set approver_user_id=? where client_id=?", (int(g("approver_user_id")) if g("approver_user_id") else None, i))
+            con.execute("update client set approver_user_id=?, framework_ref=? where client_id=?",
+                        (int(g("approver_user_id")) if g("approver_user_id") else None, g("framework_ref") or None, i))
         elif t in ("scopes", "internal"):
             con.execute("update scope set description=?, status=? where scope_id=?", (need_text(g("description"), "Description"), g("status"), i))
             con.execute("delete from scope_approver where scope_id=?", (i,))
@@ -2579,10 +2649,16 @@ def admin_save(con, form):
             b_from, b_to = need_date(g("book_from"), "Bookable from", False), need_date(g("book_to"), "Bookable until", False)
             if b_from and b_to and b_to < b_from:
                 raise ValueError("Bookable until cannot be before bookable from.")
-            con.execute("update phase set name=?, status=?, description=?, wbs=?, cbs=?, abs_code=?, restricted=?, "
-                        "book_from=?, book_to=? where phase_id=?",
+            terms = g("payment_terms") or "Reimbursable"
+            if terms not in ("Reimbursable", "Budget", "Lump Sum"):
+                raise ValueError("Payment terms must be Reimbursable, Budget or Lump Sum.")
+            con.execute("update phase set name=?, status=?, description=?, wbs=?, cbs=?, abs_code=?, restricted=?, book_from=?, book_to=?, "
+                        "ctr_code=?, objectives=?, inputs=?, scope_of_work=?, assumptions=?, exclusions=?, prepared_by=?, checked_by=?, expenses=?, payment_terms=?, basis=? "
+                        "where phase_id=?",
                         (need_text(g("name"), "CTR name"), g("status"), g("description") or None, g("wbs") or None, g("cbs") or None,
-                         g("abs_code") or None, 1 if g("restricted") == "1" else 0, b_from, b_to, i))
+                         g("abs_code") or None, 1 if g("restricted") == "1" else 0, b_from, b_to,
+                         g("ctr_code") or None, g("objectives") or None, g("inputs") or None, g("scope_of_work") or None, g("assumptions") or None,
+                         g("exclusions") or None, g("prepared_by") or None, g("checked_by") or None, g("expenses") or "Reimbursable", terms, g("basis") or None, i))
             con.execute("delete from phase_person where phase_id=?", (i,))
             for person in form.get("person", []):
                 con.execute("insert or ignore into phase_person (phase_id, user_id) values (?,?)", (i, int(person)))

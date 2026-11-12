@@ -1,0 +1,15 @@
+.git
+.gitignore
+.vscode
+.venv
+venv
+__pycache__
+*.pyc
+# Source documents stay on this machine (also excluded from Git)
+docs
+# Not needed to run the demo
+backup db
+tests
+build/sandbox.db
+build/schema_tables.csv
+init_db.py

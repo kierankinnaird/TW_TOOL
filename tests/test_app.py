@@ -365,8 +365,9 @@ class TestApp(unittest.TestCase):
 
     def test_ctr_page_shows_hours_only_and_nothing_outside_what_you_can_see(self):
         page = self.get("/ctr?u=5&phase=1")  # BB0001 Define: Ewan Shaw has hours here
-        self.assertIn("Actual booked hrs", page)
+        self.assertIn("<th>Pending hrs</th>", page)
         self.assertNotIn("<th>Total</th>", page)
+        self.assertNotIn("Cost &pound;", page)
         self.assertNotIn("Sales rate", page)
         family = re.search(r"family=([^\"&]+)", page).group(1)
         tab = self.get("/ctr?u=5&phase=1&family=%s" % family)
@@ -1595,7 +1596,8 @@ class TestApp(unittest.TestCase):
 
     def test_the_phase_page_has_description_references_approver_and_controls(self):
         page = self.get("/admin/edit?u=1&t=phases&id=1")
-        for label in ("Description", "WBS", "CBS", "ABS", "Who can book", "People allowed", "Bookable from", "Bookable until"):
+        for label in ("CTR code", "CTR title", "Prepared by", "Checked by", "Objectives", "Input requirements", "Scope of work", "This CTR assumes", "This CTR excludes",
+                      "Expenses", "Payment terms", "Basis of proposal", "WBS", "CBS", "ABS", "Who can book", "People allowed", "Bookable from", "Bookable until"):
             self.assertIn("<td>%s</td>" % label, page, label)
         self.assertNotIn("<td>Approver</td>", page)                      # approvers are on the client and the scope now
         self.assertIn("Saved", self.save_phase(1, description="Clear the wellbay", wbs="1.2.3", cbs="C-40", abs_code="A-7"))
@@ -1612,7 +1614,7 @@ class TestApp(unittest.TestCase):
         self.assertIn("must be a date", self.save_phase(1, book_from="soon"))
         self.assertEqual(self.one("select book_from from phase where phase_id=1")[0], None)
         self.admin_post("/admin/save", {"t": "phases", "id": "1", "name": "Define", "status": "Open", "description": "Sneaky"}, u="5")
-        self.assertIsNone(self.one("select description from phase where phase_id=1")[0])
+        self.assertNotEqual(self.one("select description from phase where phase_id=1")[0], "Sneaky")
 
     def test_a_restricted_code_is_only_offered_to_and_bookable_by_the_people_listed(self):
         both = self.get("/timesheet?u=9&w=2026-11-02")
@@ -1662,6 +1664,61 @@ class TestApp(unittest.TestCase):
         self.admin_post("/admin/save", {"t": "scopes", "id": "2", "description": "Platform Study", "status": "Open", "secondary": "9"}, u="1")
         self.assertNotIn("not named as an approver", self.get("/approvals?u=9"))
         self.assertNotIn("not available to your role", self.get("/missing?u=9"))
+
+    def test_the_ctr_page_is_laid_out_like_the_ctr_sheet(self):
+        page = self.get("/ctr?u=29&phase=1")
+        order = ["CTR BB0001-PM-D-001", "Project Name", "Project Title", "Client", "Framework Agreement Ref", "CTR Title", "CTR No",
+                 "Prepared by", "Checked by", "Approved by", "Objectives", "Input Requirements", "Scope of Work", "This CTR assumes the following",
+                 "This CTR excludes the following", "Commencement Date", "Completion Date", "Expenses", "Resource", "Sub-Totals", "Addition",
+                 "Payment Terms", "Basis of Proposal"]
+        at = -1
+        for part in order:
+            nxt = page.find(part, at + 1)
+            self.assertGreater(nxt, at, "%s should come after the previous section" % part)
+            at = nxt
+        self.assertIn("Define the scope, sequence and cost of clearing the Wellbay", page)       # the seeded example's objectives
+        self.assertIn("Wellbay Clearance - Define", page)                                         # CTR title
+        self.assertIn("AB", page)
+        self.assertIn("Reimbursable [X]", page)                                                   # payment terms with the chosen one marked
+        self.assertIn("Budget [&nbsp;]", page)
+        self.assertIn("Cost &pound; / Hour", page)
+        self.assertNotIn("Framework Agreement Ref</b></td><td colspan=\"3\">SPT", page)          # Apache has none
+        spirit = self.get("/ctr?u=29&phase=6")
+        self.assertIn("A1500-PM-D-001", spirit)
+        self.assertIn("SPT-01163 Contract", spirit)                                               # a client's framework reference
+
+    def test_ctr_sheet_fields_are_edited_on_the_ctr_page_in_admin_and_shown_on_the_sheet(self):
+        data = {"t": "phases", "id": "2", "name": "Execute", "status": "Open", "restricted": "0", "ctr_code": "EN-E-007", "description": "Execution support",
+                "prepared_by": "KN", "checked_by": "GH", "objectives": "Do the work\nSafely", "inputs": "Drawings", "scope_of_work": "All of it",
+                "assumptions": "Access", "exclusions": "Surveys", "expenses": "Included", "payment_terms": "Lump Sum", "basis": "Per the plan",
+                "wbs": "", "cbs": "", "abs_code": "", "book_from": "2026-11-02", "book_to": "2026-11-30"}
+        self.assertIn("Saved", self.admin_post("/admin/save", data, u="1"))
+        page = self.get("/ctr?u=29&phase=2")
+        self.assertIn("CTR BB0001-EN-E-007", page)
+        for text in ("Execution support", "KN", "GH", "Do the work<br>Safely", "Drawings", "All of it", "Access", "Surveys", "Included", "Per the plan", "02/11/2026".replace("02/11/2026", "2026-11-02")):
+            self.assertIn(text, page, text)
+        self.assertIn("Lump Sum [X]", page)
+        self.assertIn("Reimbursable [&nbsp;]", page)
+        self.assertIn("is not", self.admin_post("/admin/save", dict(data, payment_terms="Cash")) if False else "is not")
+        self.assertIn("Payment terms must be", self.admin_post("/admin/save", dict(data, payment_terms="Cash"), u="1"))
+        self.assertIn("already exists", self.admin_post("/admin/save", dict(data, id="1", name="Define", ctr_code="EN-E-007"), u="1"))   # a code is unique within a scope
+        # the client's framework reference
+        self.assertIn("Saved", self.admin_post("/admin/save", {"t": "clients", "id": "1", "approver_user_id": "7", "framework_ref": "APA-77 Master Agreement"}, u="1"))
+        self.assertIn("APA-77 Master Agreement", self.get("/ctr?u=29&phase=2"))
+
+    def test_the_sheets_additions_are_the_approved_allowances_at_the_allowance_rates(self):
+        self.claim(9, [(1, 2, "2026-11-04"), (1, 2, "2026-11-05")], action="Submit week")          # two Per Diem days for a staff member on BB0001 Define
+        ids = [r[0] for r in self.q_all("select allowance_entry_id from allowance_entry order by work_date")]
+        self.post("/approvals/act", {"u": "7", "w": "2026-11-02", "allowance_entry_id": [str(i) for i in ids], "action": "Approve selected"})
+        page = self.get("/ctr?u=29&phase=1")
+        row = page.split("<th>Addition</th>")[1].split("</table>")[0]
+        self.assertIn("Per Diem - On site", row)
+        self.assertIn('<td align="right">100.00</td><td align="right">2</td><td align="right">200.00</td>', row)    # 100 a day x 2 days
+        self.assertIn("additions 200.00", page)
+        seen = self.get("/ctr?u=7&phase=1")                                                                         # an approver sees days, no money
+        self.assertIn("Per Diem - On site", seen)
+        self.assertNotIn("Cost &pound; / Unit", seen)
+        self.assertNotIn("200.00", seen.split("<th>Addition</th>")[1])
 
     # ---------- the approver's week: a line per person, detail, other weeks (R20-R22) ----------
     def week_people(self, approver, monday_iso):
@@ -1759,7 +1816,9 @@ class TestApp(unittest.TestCase):
         con.close()
         self.assertTrue(fams)
         page = self.get("/ctr?u=29&phase=%d" % ph)
-        self.assertIn("CTR summary", page)
+        self.assertIn("CTR BB0001-PM-D-001", page)                    # the CTR number: scope code, then the CTR code
+        for part in ("Sub-Totals", "Payment Terms", "Basis of Proposal", "Objectives"):
+            self.assertIn(part, page, part)
         self.assertIn("%.2f" % v[1], page)
         for f in fams:
             self.assertIn(f, page)
@@ -1768,7 +1827,7 @@ class TestApp(unittest.TestCase):
             self.assertIn("Timesheet entries", tab)
         self.assertIn("Open CTR", self.get("/reports?u=29"))
         self.assertIn("CTR not found", self.get("/ctr?u=29&phase=9999"))
-        self.assertIn("CTR summary", self.get("/ctr?u=29&phase=%d&family=Nonsense" % ph))
+        self.assertIn("CTR BB0001-PM-D-001", self.get("/ctr?u=29&phase=%d&family=Nonsense" % ph))
 
 
 if __name__ == "__main__":

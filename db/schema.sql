@@ -2,7 +2,7 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 13;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+PRAGMA user_version = 14;  -- 2: a cost controller approves the hours a scope approver books to their own scope
                           -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
                           -- 4: every entry has a location (On site / Offshore / Standard) and an overtime flag
                           -- 5: a cost controller can reopen submitted or approved hours (reopen_reason)
@@ -15,6 +15,7 @@ PRAGMA user_version = 13;  -- 2: a cost controller approves the hours a scope ap
                           -- 11: a person cannot book more than 24 hours in one day across all rows
                           -- 12: allowances are for staff only, and are valued from an append-only rate table (by allowance, location and overtime)
                           -- 13: approvers are a main approver per client plus secondary approvers per scope; the phase is the CTR (booking code)
+                          -- 14: a CTR carries the fields of the CTR sheet (CTR code, objectives, inputs, scope, assumptions, payment terms ...) and a client a framework reference
 
 -- Controlled list of job titles, grouped into job families. Editable by admin/superuser.
 CREATE TABLE role (
@@ -31,7 +32,8 @@ CREATE TABLE client (
     client_id   INTEGER PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
     is_internal INTEGER NOT NULL DEFAULT 0 CHECK (is_internal IN (0,1)),
-    approver_user_id INTEGER REFERENCES app_user(user_id)   -- the client's main approver: approves hours booked to any of its scopes
+    approver_user_id INTEGER REFERENCES app_user(user_id),  -- the client's main approver: approves hours booked to any of its scopes
+    framework_ref TEXT                                      -- framework agreement / contract reference, shown on each CTR sheet
 );
 
 -- Client rate card: one row per client + role + effective date.
@@ -102,7 +104,19 @@ CREATE TABLE phase (
     scope_id   INTEGER NOT NULL REFERENCES scope(scope_id),
     name       TEXT NOT NULL,
     status     TEXT NOT NULL DEFAULT 'Open' CHECK (status IN ('Open','Closed')),
-    description TEXT,                                   -- free-text description of the booking code
+    description TEXT,                                   -- the CTR title
+    -- The CTR sheet. The CTR number shown is the scope code plus ctr_code, e.g. A1500-PM-D-001 (discipline - phase letter - sequence).
+    ctr_code   TEXT,
+    objectives TEXT,
+    inputs     TEXT,                                    -- input requirements
+    scope_of_work TEXT,
+    assumptions TEXT,
+    exclusions TEXT,
+    prepared_by TEXT,
+    checked_by TEXT,
+    expenses   TEXT NOT NULL DEFAULT 'Reimbursable',
+    payment_terms TEXT NOT NULL DEFAULT 'Reimbursable' CHECK (payment_terms IN ('Reimbursable','Budget','Lump Sum')),
+    basis      TEXT,                                    -- basis of proposal
     wbs        TEXT,                                    -- optional WBS / CBS / ABS references
     cbs        TEXT,
     abs_code   TEXT,
@@ -111,7 +125,8 @@ CREATE TABLE phase (
     restricted INTEGER NOT NULL DEFAULT 0 CHECK (restricted IN (0,1)),
     book_from  TEXT,
     book_to    TEXT,
-    UNIQUE (scope_id, name)
+    UNIQUE (scope_id, name),
+    UNIQUE (scope_id, ctr_code)
 );
 
 -- People allowed to book to a restricted booking code.

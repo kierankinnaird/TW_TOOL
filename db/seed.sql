@@ -334,3 +334,15 @@ INSERT INTO allowance_type (allowance_id, name) VALUES (1,'Overnight allowance')
 INSERT INTO allowance_rate (allowance_id, location_id, overtime, amount, effective_from)
 SELECT a.allowance_id, l.location_id, o.ot, 100, '2026-01-01' FROM allowance_type a, location l, (SELECT 0 AS ot UNION SELECT 1) o;
 
+-- CTR sheet details. Every CTR has a code (discipline - phase letter - sequence); the number shown is the scope code in front of it,
+-- for example A1500-PM-D-001. One CTR has the sheet fields filled in as an example.
+UPDATE phase SET ctr_code = 'PM-' || upper(substr(name, 1, 1)) || '-001';
+UPDATE client SET framework_ref = 'SPT-01163 Contract' WHERE client_id = 2;
+UPDATE phase SET description = 'Wellbay Clearance - Define', prepared_by = 'AB', checked_by = 'GH / KNic',
+  objectives = 'Define the scope, sequence and cost of clearing the Wellbay so that an execute phase can be sanctioned.',
+  inputs = '- Existing programme and sequencing documentation' || char(10) || '- Latest MDR and well data',
+  scope_of_work = 'Project engineering, planning and cost control support for the define phase.',
+  assumptions = '- Access to information in the data room' || char(10) || '- Client reviews within 5 working days',
+  exclusions = '- Offshore surveys, which are covered by their own CTR',
+  basis = '1. Based on the MDR and programme for the Wellbay Clearance define phase.'
+WHERE phase_id = 1;
