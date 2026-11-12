@@ -36,7 +36,8 @@ INSERT INTO role (role_id, skill_code, name, family) VALUES
  -- bill a client, so they have no rate card (internal codes only).
  (30,'PM-08','Head of Projects','Project Management'),
  (31,'BS-01','System Administrator','Business Services'),
- (32,'BS-02','Commercial Lead','Business Services');
+ (32,'BS-02','Commercial Lead','Business Services'),
+ (33,'BS-03','Managing Director','Business Services');
 
 INSERT INTO client (client_id, name) VALUES (1,'Apache'),(2,'Spirit');
 -- NMC's own client for internal hours (paid by NMC, not billed). Its codes are scopes under one project; admin can add more.
@@ -139,17 +140,18 @@ INSERT INTO app_user (user_id, nmc_id, employment_type, name, role_id, permissio
  -- cost engineers (Stephanie Apedaile is the commercial lead). The admin (IT) account manages users and job roles only.
  -- Neither approves hours. Alisdair Woodhead approves for Apache and Kenneth Nicolson for Spirit (see the scopes below).
  (29,'A029','Staff','Stephanie Apedaile',32,'controller','2026-01-01',NULL),
- (30,'A030','Staff','NMC Admin',31,'admin','2026-01-01',NULL);
+ (30,'A030','Staff','NMC Admin',31,'admin','2026-01-01',NULL),
+ -- The managing director approves the overhead (internal) time, and can delegate it by naming secondary approvers on the internal codes.
+ (31,'A031','Staff','Graeme Hogg',33,'user','2026-01-01',NULL);
 
--- PAAFs: one per user per client. Rate = client sales rate for the user's own role.
+-- PAAFs: the client's list of people, one per user per client. Rate = client sales rate for the user's own role. No client approves
+-- individuals, so each is active from the day it is added.
 INSERT INTO paaf (paaf_id, user_id, client_id, rate_id, status, sent_date, decided_date, document_ref) VALUES
  (1, 5, 1, 4, 'Approved','2026-03-02','2026-03-09','paaf/apache/A005_Ewan_Shaw.pdf'),
  (2, 3, 1, 5, 'Approved','2026-01-05','2026-01-12','paaf/apache/A003_Stuart_Sherwood.pdf'),
  (3, 1, 1, 6, 'Approved','2026-01-05','2026-01-12','paaf/apache/A001_Emma_Noble.pdf'),
- (4, 4, 1, 4, 'Sent',    '2026-11-04',NULL,        NULL),
  (5, 1, 2, 12,'Approved','2026-01-06','2026-01-14','paaf/spirit/A001_Emma_Noble.pdf'),
  (6, 3, 2, 11,'Approved','2026-01-06','2026-01-14','paaf/spirit/A003_Stuart_Sherwood.pdf'),
- (7, 2, 2, 12,'Draft',   NULL,        NULL,        NULL),
  (8, 9, 1, 3, 'Approved','2026-02-02','2026-02-10','paaf/apache/A009_Daniel_Evans.pdf'),
  (9, 9, 2, 9, 'Approved','2026-02-02','2026-02-11','paaf/spirit/A009_Daniel_Evans.pdf'),
  (10,10,2, 10,'Approved','2026-02-02','2026-02-11','paaf/spirit/A010_Ajin_Sabu.pdf'),
@@ -185,7 +187,8 @@ INSERT INTO paaf (paaf_id, user_id, client_id, rate_id, status, sent_date, decid
 
 -- Approvers: each client has a main approver. Secondary approvers on a scope (scope_approver) are added in Admin when a scope needs more
 -- than one person. Alisdair Woodhead is the Apache and Internal main approver and Kenneth Nicolson the Spirit one (both standard users).
-UPDATE client SET approver_user_id = 7 WHERE client_id IN (1, 3);
+UPDATE client SET approver_user_id = 7 WHERE client_id = 1;
+UPDATE client SET approver_user_id = 31 WHERE client_id = 3;   -- the Internal client: Graeme Hogg, managing director
 UPDATE client SET approver_user_id = 8 WHERE client_id = 2;
 
 INSERT INTO project (project_id, project_code, name, client_id) VALUES
@@ -374,3 +377,9 @@ INSERT INTO allowance_entry (user_id, scope_id, phase_id, allowance_id, work_dat
 UPDATE allowance_entry SET status='Submitted', last_edited_by=user_id, last_edited_at='2026-11-06 08:00' WHERE user_id IN (11, 18);
 UPDATE allowance_entry SET status='Approved', approved_by=7, approved_at='2026-11-06 09:30', last_edited_by=7, last_edited_at='2026-11-06 09:30'
  WHERE user_id=11 AND work_date BETWEEN '2026-11-02' AND '2026-11-04';
+
+-- Line managers. Graeme Hogg (managing director) manages the heads and the commercial team; Alisdair Woodhead and Kenneth Nicolson manage
+-- the engineers and planners of their clients; the IT admin has none.
+UPDATE app_user SET line_manager_id = 31 WHERE user_id IN (1, 2, 6, 7, 8, 29);
+UPDATE app_user SET line_manager_id = 7 WHERE user_id IN (3, 4, 5, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
+UPDATE app_user SET line_manager_id = 8 WHERE user_id = 10;

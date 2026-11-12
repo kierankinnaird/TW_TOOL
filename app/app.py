@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
 # Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
-REQUIRED_SCHEMA = 15
+REQUIRED_SCHEMA = 16
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
 ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "TASAOrbiterVF.woff2"), "font/woff2")}
 
@@ -567,11 +567,9 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
         "and (ph.book_to is null or ph.book_to >= ?) and (ph.book_from is null or ph.book_from <= ?) "  # people, and booking dates
         "order by c.is_internal, c.name, pr.name, s.scope_code, ph.name", (u, d0, u, d0, d6)).fetchall()
     roles = con.execute("select role_id, skill_code, name from role where active=1 order by skill_code").fetchall()
-    waiting_paafs = con.execute("select c.name as client, p.status from paaf p join client c on c.client_id=p.client_id "
-                                "where p.user_id=? and p.status<>'Approved' and c.is_internal=0 order by c.name", (u,)).fetchall()
-    for pf in waiting_paafs:
-        b.append("<p><small><b>%s:</b> your PAAF is %s, so %s booking codes are not offered until it is approved.</small></p>" % (
-            esc(pf["client"]), {"Draft": "not yet sent to the client", "Sent": "with the client, waiting for approval", "Rejected": "rejected"}[pf["status"]], esc(pf["client"])))
+    for pf in con.execute("select c.name as client, p.expiry_date from paaf p join client c on c.client_id=p.client_id "
+                          "where p.user_id=? and c.is_internal=0 and p.expiry_date is not null and p.expiry_date < ? order by c.name", (u, d0)):
+        b.append("<p><small><b>%s:</b> you came off this client's list on %s, so its CTRs are not offered from that date.</small></p>" % (esc(pf["client"]), dmy(pf["expiry_date"])))
     if week_inactive:
         pass  # the note above says why nothing can be added
     elif scopes:
@@ -597,7 +595,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
                      '<input form="tsform" type="submit" name="action" value="Add allowance row"></p>'
                      "<p><small>An allowance is claimed against a booking code, so the code's approver approves it.</small></p>" % (so, ao))
     else:
-        b.append("<p>You have no approved PAAF for any client with open scopes, so there is nothing to book to.</p>")
+        b.append("<p>You are not on the personnel list of any client with open scopes, so there is nothing to book to.</p>")
     return layout(con, u, "My Timesheet", "".join(b))
 
 
@@ -617,7 +615,7 @@ def book_entry(con, u, pid, rid, lid, ot, date, hours):
         paaf = con.execute("select p.paaf_id, r.role_id as position from paaf p join rate r on r.rate_id=p.rate_id "
                            "where p.user_id=? and p.client_id=?", (u, info["client_id"])).fetchone()
         if not paaf:
-            return "you have no PAAF for this client."
+            return "you are not on this client's personnel list."
         # Booking as their own role uses the position assigned on their PAAF; covering another role uses that role's line of the rate card.
         # Either way the rate is the one in force on the work date (rates are never edited, a new one is added with a start date).
         own = con.execute("select 1 from app_user where user_id=? and role_id=?", (u, rid)).fetchone()
@@ -1084,7 +1082,7 @@ def view_missing(con, u, q):
             hidden(u=u), date_input("w", d0), sel("s", MISSING_FILTERS, show, False, "-", ' onchange="this.form.submit()"'))]
     if not people:
         b.append("<p>Nobody is expected to submit a timesheet in this week from your list.%s</p>" % (
-            "" if perm == "controller" else " Your people are those with an approved PAAF for a client you approve, "
+            "" if perm == "controller" else " Your people are those on the personnel list of a client you approve, "
             "and anyone who has booked to your internal codes."))
         return layout(con, u, "Missing timesheets", "".join(b))
     b.append("<p><b>%d</b> expected: %s.</p>" % (len(people), ", ".join(
@@ -1093,7 +1091,7 @@ def view_missing(con, u, q):
              "Sent back counts entries an approver rejected or a cost controller reopened that have not been submitted again. "
              "Everyone whose start and end dates cover any part of the week is expected, including the weeks still in progress.</small></p>" % (
                  "Everyone who is active that week." if perm == "controller" else
-                 "Your people: those with an approved PAAF for a client you approve, and anyone who has booked to your internal codes."))
+                 "Your people: those on the personnel list of a client you approve, and anyone who has booked to your internal codes."))
     if rows:
         b.append('<table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>NMC ID</th><th>Job title</th><th>Employment</th>'
                  '<th>Status</th><th>Submitted hrs</th><th>Draft hrs</th><th>Sent back</th>%s</tr>%s</table>' % (
@@ -2131,11 +2129,10 @@ def edit_link(u, t, i):
     return '<a href="/admin/edit?u=%d&amp;t=%s&amp;id=%d">Edit</a>' % (u, t, i)
 
 
-PAAF_STATUSES = ["Draft", "Sent", "Approved", "Rejected"]
+PAAF_STATES = [("current", "On the list"), ("ended", "Ended")]
 PAAF_SORTS = {"id": ("p.paaf_id", "p.paaf_id desc"),
               "name": ("u.name, p.paaf_id", "u.name desc, p.paaf_id desc"),
               "client": ("c.name, u.name, p.paaf_id", "c.name desc, u.name desc, p.paaf_id desc"),
-              "status": ("p.status, p.paaf_id", "p.status desc, p.paaf_id desc"),
               "expiry": ("p.expiry_date is null, p.expiry_date, p.paaf_id", "p.expiry_date is not null, p.expiry_date desc, p.paaf_id desc")}
 
 
@@ -2154,7 +2151,7 @@ def paaf_filters(q):
     if sort.lstrip("-") not in PAAF_SORTS:
         sort, desc = "id", False
     status = one("f_status")
-    return {"person": num("f_person"), "client": num("f_client"), "status": status if status in PAAF_STATUSES else "", "sort": sort.lstrip("-"), "desc": desc}
+    return {"person": num("f_person"), "client": num("f_client"), "status": status if status in dict(PAAF_STATES) else "", "sort": sort.lstrip("-"), "desc": desc}
 
 
 def paaf_hidden(f):
@@ -2184,18 +2181,20 @@ def admin_body(con, u, t, q=None):
         b.append('<form method="get" action="/admin">%s<p>Find a person (name or NMC ID) <input type="text" name="f_q" size="20" value="%s"> '
                  '<input type="submit" value="Search"> <input type="button" value="Clear" onclick="location.href=\'/admin?u=%d&amp;t=users\'"></p></form>' % (
                      hidden(u=u, t="users"), esc(needle), u))
-        rows = [[r["nmc_id"], r["name"], r["employment_type"], r["skill_code"] + " " + r["role"], r["permission"], r["start_date"],
+        rows = [[r["nmc_id"], r["name"], r["employment_type"], r["skill_code"] + " " + r["role"], r["manager"] or "", r["permission"], r["start_date"],
                  r["end_date"], edit_link(u, "users", r["user_id"])]
-                for r in con.execute("select u.*, r.skill_code, r.name as role from app_user u join role r on r.role_id=u.role_id "
+                for r in con.execute("select u.*, r.skill_code, r.name as role, m.name as manager from app_user u join role r on r.role_id=u.role_id "
+                                     "left join app_user m on m.user_id=u.line_manager_id "
                                      "where (? = '' or u.name like '%' || ? || '%' or u.nmc_id like '%' || ? || '%') order by u.nmc_id", (needle, needle, needle))]
-        b.append(table(["NMC ID", "Name", "Employment", "Role", "Permission", "Start", "End", ""], rows, raw_cols=(7,)))
+        b.append(table(["NMC ID", "Name", "Employment", "Role", "Line manager", "Permission", "Start", "End", ""], rows, raw_cols=(8,)))
         b.append('<h4>Add a user</h4><form method="post" action="/admin/add">%s<table border="0" cellpadding="2">'
                  "<tr><td>NMC ID</td><td>%s</td></tr><tr><td>Name</td><td>%s</td></tr>"
-                 "<tr><td>Employment</td><td>%s</td></tr><tr><td>Role</td><td>%s</td></tr>"
+                 "<tr><td>Employment</td><td>%s</td></tr><tr><td>Role</td><td>%s</td></tr><tr><td>Line manager</td><td>%s</td></tr>"
                  "<tr><td>Permission</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr>"
                  "<tr><td>End date (optional)</td><td>%s</td></tr></table><input type=\"submit\" value=\"Add user\"></form>"
                  % (hidden(u=u, t="users"), txt("nmc_id", "", 8), txt("name", "", 30),
                     sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")]), sel("role_id", opts_roles(con)),
+                    sel("line_manager_id", opts_users(con), None, True, "None"),
                     sel("permission", PERMISSION_OPTIONS), date_input("start_date", datetime.date.today().isoformat()),
                     date_input("end_date")))
     elif t == "roles":
@@ -2258,27 +2257,35 @@ def admin_body(con, u, t, q=None):
                     txt("sales_rate", "", 8), date_input("effective_from", datetime.date.today().isoformat())))
     elif t == "paafs":
         flt = paaf_filters(q or {})
+        today = datetime.date.today().isoformat()
         where, wargs = "", []
-        for key, col in (("person", "p.user_id"), ("client", "p.client_id"), ("status", "p.status")):
+        for key, col in (("person", "p.user_id"), ("client", "p.client_id")):
             if flt[key]:
                 where += " and %s=?" % col
                 wargs.append(flt[key])
+        if flt["status"] == "current":
+            where += " and (p.expiry_date is null or p.expiry_date >= ?)"
+            wargs.append(today)
+        elif flt["status"] == "ended":
+            where += " and p.expiry_date < ?"
+            wargs.append(today)
         total = con.execute("select count(*) from paaf").fetchone()[0]
         order = PAAF_SORTS[flt["sort"]][1 if flt["desc"] else 0]
         rows = []
         found = con.execute("select p.*, u.name as uname, c.name as client, ro.skill_code, rt.sales_rate "
                             "from paaf p join app_user u on u.user_id=p.user_id join client c on c.client_id=p.client_id "
                             "join rate rt on rt.rate_id=p.rate_id join role ro on ro.role_id=rt.role_id where 1=1" + where + " order by " + order, wargs).fetchall()
-        # filters (a GET form that stays on this tab)
-        b.append('<form method="get" action="/admin">%s<p>Person %s Client %s Status %s <input type="submit" value="Filter"> '
+        b.append("<p><small>The people who work on each client's projects: the list that goes to the client. None of our clients approve individuals, so a person is "
+                 "on a client's list as soon as they are added and can book to that client's CTRs until their end date.</small></p>")
+        b.append('<form method="get" action="/admin">%s<p>Person %s Client %s Show %s <input type="submit" value="Filter"> '
                  '<input type="button" value="Clear filters" onclick="location.href=\'/admin?u=%d&amp;t=paafs\'"> '
-                 '<small>Showing %d of %d PAAFs, in order of the # column. Click a column heading to sort by it, and again to reverse it.</small></p></form>' % (
+                 '<small>Showing %d of %d entries, in order of the # column. Click a column heading to sort by it, and again to reverse it.</small></p></form>' % (
                      hidden(u=u, t="paafs", f_sort=("-" if flt["desc"] else "") + flt["sort"]),
                      sel("f_person", [(r["user_id"], r["name"]) for r in con.execute(
                          "select distinct a.user_id, a.name from app_user a join paaf p on p.user_id=a.user_id order by a.name")], flt["person"], True, "Everyone"),
                      sel("f_client", [tuple(r) for r in con.execute(
                          "select distinct c.client_id, c.name from client c join paaf p on p.client_id=c.client_id order by c.name")], flt["client"], True, "All clients"),
-                     sel("f_status", [(x, x) for x in PAAF_STATUSES], flt["status"], True, "Any status"), u, len(found), total))
+                     sel("f_status", PAAF_STATES, flt["status"], True, "Everyone listed"), u, len(found), total))
 
         def head(label, key):
             flip = "-" + key if (flt["sort"] == key and not flt["desc"]) else key
@@ -2286,31 +2293,21 @@ def admin_body(con, u, t, q=None):
             return '<a href="/admin?u=%d&amp;t=paafs&amp;f_person=%s&amp;f_client=%s&amp;f_status=%s&amp;f_sort=%s" style="color:inherit">%s%s</a>' % (
                 u, flt["person"] or "", flt["client"] or "", quote(flt["status"]), quote(flip), label, arrow)
         for r in found:
+            ended = bool(r["expiry_date"] and r["expiry_date"] < today)
             f = '<form method="post" action="/admin/paaf" style="display:inline">%s%s' % (hidden(u=u, paaf_id=r["paaf_id"]), paaf_hidden(flt))
-            if r["status"] in ("Draft", "Sent", "Rejected"):  # the assigned rate can still be changed
-                f += ('%s <input type="submit" name="action" value="Change rate"> <br>' % sel("rate_id", rate_options(con, r["client_id"]), r["rate_id"]))
-            if r["status"] == "Draft":
-                f += ('<input type="submit" name="action" value="Authorise internally"> '
-                      '<input type="submit" name="action" value="Mark sent"> <small>(sent = formal client approval)</small>')
-            elif r["status"] == "Sent":
-                f += ('Signed form ref %s Expiry (optional) %s <input type="submit" name="action" value="Approve"> '
-                      '<input type="submit" name="action" value="Reject">' % (txt("document_ref", "", 28), date_input("expiry_date")))
-            elif r["status"] == "Rejected":
-                f += '<input type="submit" name="action" value="Reopen as draft">'
-            f += "</form>"
-            rows.append([r["paaf_id"], r["uname"], r["client"], r["skill_code"], "%g" % r["sales_rate"], r["status"], r["sent_date"],
-                         r["decided_date"], r["document_ref"], r["expiry_date"], f])
-        heads = [head("#", "id"), head("Name", "name"), head("Client", "client"), "Skill code", "Sales rate", head("Status", "status"),
-                 "Sent", "Decided", "Signed form", head("Expiry", "expiry"), "Action"]  # raw: the headings hold sort links
+            f += ('%s <input type="submit" name="action" value="Change rate"> <br>End date %s <input type="submit" name="action" value="Save end date"> '
+                  '<small>(empty = no end)</small></form>' % (sel("rate_id", rate_options(con, r["client_id"]), r["rate_id"]), date_input("expiry_date", r["expiry_date"] or "")))
+            rows.append([r["paaf_id"], r["uname"], r["client"], r["skill_code"], "%g" % r["sales_rate"], ("Ended %s" % r["expiry_date"]) if ended else (r["expiry_date"] or ""), f])
+        heads = [head("#", "id"), head("Name", "name"), head("Client", "client"), "Skill code", "Sales rate", head("Ends", "expiry"), "Action"]  # raw: the headings hold sort links
         if rows:
-            b.append(table(heads, rows, raw_cols=(10,), raw_heads=True))
+            b.append(table(heads, rows, raw_cols=(6,), raw_heads=True))
         else:
-            b.append("<p>No PAAFs match these filters.</p>")
-        b.append('<h4>Raise a PAAF</h4><p><small>One PAAF per person per client. Pick the rate to assign from the client\'s rate card, or leave it '
+            b.append("<p>Nobody matches these filters.</p>")
+        b.append('<h4>Add a person to a client</h4><p><small>One entry per person per client. Pick the rate to assign from the client\'s rate card, or leave it '
                  "on the default, the rate for the person's own role. The rate card line you pick is the person's position on that client: it sets the rate for their hours "
-                 "when they book as their own role, at the rate in force on the work date (covering another role uses the card line for that role). Mark the PAAF sent when it goes to the client, then approve "
-                 "it once the signed form comes back. The rate can be changed until the PAAF is approved.</small></p>"
-                 '<form method="post" action="/admin/add">%s Person %s Client %s Rate %s <input type="submit" value="Raise PAAF"></form>'
+                 "when they book as their own role, at the rate in force on the work date (covering another role uses the card line for that role). "
+                 "The rate can be changed at any time; hours already booked keep the rate they were booked at. Set an end date when someone leaves the client's projects.</small></p>"
+                 '<form method="post" action="/admin/add">%s Person %s Client %s Rate %s <input type="submit" value="Add person"></form>'
                  % (hidden(u=u, t="paafs"), sel("user_id", opts_users(con)), sel("client_id", opts_clients(con, True)),
                     sel("rate_id", rate_options(con), None, True, "Default: the person's own role")))
     elif t == "allowance_rates":
@@ -2413,10 +2410,11 @@ def view_admin_edit(con, u, t, i, msgs=None):
         if not r:
             return layout(con, u, "Admin", "<p>Not found.</p>")
         form = ("<tr><td>NMC ID</td><td>%s</td></tr><tr><td>Name</td><td>%s</td></tr><tr><td>Employment</td><td>%s</td></tr>"
-                "<tr><td>Role</td><td>%s</td></tr><tr><td>Permission</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr>"
+                "<tr><td>Role</td><td>%s</td></tr><tr><td>Line manager</td><td>%s</td></tr><tr><td>Permission</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr>"
                 "<tr><td>End date</td><td>%s</td></tr>" % (
                     esc(r["nmc_id"]), txt("name", r["name"], 30), sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")], r["employment_type"]),
                     sel("role_id", opts_roles(con, active_only=False), r["role_id"]),
+                    sel("line_manager_id", [x for x in opts_users(con) if x[0] != i], r["line_manager_id"], True, "None"),
                     sel("permission", PERMISSION_OPTIONS, r["permission"]), esc(r["start_date"]), date_input("end_date", r["end_date"] or "")))
         note = "<p><small>Changing someone's role does not change their existing PAAFs or booked hours.</small></p>"
     elif t == "roles":
@@ -2512,9 +2510,10 @@ def admin_add(con, form):
     g = lambda k: form.get(k, [""])[0].strip()
     try:
         if t == "users":
-            con.execute("insert into app_user (nmc_id, employment_type, name, role_id, permission, start_date, end_date) values (?,?,?,?,?,?,?)",
+            con.execute("insert into app_user (nmc_id, employment_type, name, role_id, permission, start_date, end_date, line_manager_id) values (?,?,?,?,?,?,?,?)",
                         (need_text(g("nmc_id"), "NMC ID"), g("employment_type"), need_text(g("name"), "Name"), int(g("role_id")),
-                         g("permission"), need_date(g("start_date"), "Start date"), need_date(g("end_date"), "End date", False)))
+                         g("permission"), need_date(g("start_date"), "Start date"), need_date(g("end_date"), "End date", False),
+                         int(g("line_manager_id")) if g("line_manager_id") else None))
             msg = "User added."
         elif t == "roles":
             con.execute("insert into role (skill_code, name, family) values (?,?,?)",
@@ -2578,8 +2577,9 @@ def admin_add(con, form):
                                    (user_id, client_id, datetime.date.today().isoformat())).fetchone()
             if not rate:
                 raise ValueError("That client's rate card has no rate for this person's role. Add the rate first, or pick a rate.")
-            con.execute("insert into paaf (user_id, client_id, rate_id, status) values (?,?,?,'Draft')", (user_id, client_id, rate[0]))
-            msg = "PAAF raised as a draft."
+            con.execute("insert into paaf (user_id, client_id, rate_id, status, decided_date) values (?,?,?,'Approved',?)",
+                        (user_id, client_id, rate[0], datetime.date.today().isoformat()))
+            msg = "Person added to the client's list. They can book to its CTRs now."
         else:
             raise ValueError("Unknown form.")
         con.commit()
@@ -2591,7 +2591,7 @@ def admin_add(con, form):
         if "UNIQUE" in text:
             text = "That already exists (it must be unique)."
             if t == "paafs":
-                text = "That person already has a PAAF for this client."
+                text = "That person is already on this client's list."
         return view_admin(con, u, t, [text])
     except sqlite3.DatabaseError as e:
         return view_admin(con, u, t, [str(e)])
@@ -2604,9 +2604,12 @@ def admin_save(con, form):
     g = lambda k: form.get(k, [""])[0].strip()
     try:
         if t == "users":
-            con.execute("update app_user set name=?, employment_type=?, role_id=?, permission=?, end_date=? where user_id=?",
+            manager = int(g("line_manager_id")) if g("line_manager_id") else None
+            if manager == i:
+                raise ValueError("A person cannot be their own line manager.")
+            con.execute("update app_user set name=?, employment_type=?, role_id=?, permission=?, end_date=?, line_manager_id=? where user_id=?",
                         (need_text(g("name"), "Name"), g("employment_type"), int(g("role_id")), g("permission"),
-                         need_date(g("end_date"), "End date", False), i))
+                         need_date(g("end_date"), "End date", False), manager, i))
         elif t == "roles" and g("old_family"):
             if not g("new_family"):
                 return view_admin(con, u, t, ["Give the family a name."], q={"f_family": [g("old_family")]})
@@ -2700,37 +2703,23 @@ def act_paaf(con, form):
     if not can_use_tab(con, u, "paafs"):
         return view_admin(con, u, "paafs")
     q = form  # the list's filters and order come back with the form
-    today = datetime.date.today().isoformat()
     g = lambda k: form.get(k, [""])[0].strip()
     try:
         p = con.execute("select * from paaf where paaf_id=?", (pid,)).fetchone()
         if not p:
-            raise ValueError("PAAF not found.")
-        if action == "Mark sent" and p["status"] == "Draft":
-            con.execute("update paaf set status='Sent', sent_date=? where paaf_id=?", (today, pid))
-            msg = "PAAF %d marked as sent." % pid
-        elif action == "Change rate" and p["status"] in ("Draft", "Sent", "Rejected"):
+            raise ValueError("That entry was not found.")
+        if action == "Change rate":
             rate = con.execute("select rate_id from rate where rate_id=? and client_id=?", (int(g("rate_id") or 0), p["client_id"])).fetchone()
             if not rate:
                 raise ValueError("Choose one of this client's rates.")
             con.execute("update paaf set rate_id=? where paaf_id=?", (rate[0], pid))
-            msg = "PAAF %d now uses the chosen rate." % pid
-        elif action == "Authorise internally" and p["status"] in ("Draft", "Sent"):
-            con.execute("update paaf set status='Approved', decided_date=? where paaf_id=?", (today, pid))
-            msg = "PAAF %d authorised internally. The person can now book to that client." % pid
-        elif action == "Approve" and p["status"] == "Sent":
-            ref = need_text(g("document_ref"), "The signed form reference")
-            exp = need_date(g("expiry_date"), "Expiry", False)
-            con.execute("update paaf set status='Approved', decided_date=?, document_ref=?, expiry_date=? where paaf_id=?", (today, ref, exp, pid))
-            msg = "PAAF %d approved. The person can now book to that client." % pid
-        elif action == "Reject" and p["status"] == "Sent":
-            con.execute("update paaf set status='Rejected', decided_date=? where paaf_id=?", (today, pid))
-            msg = "PAAF %d rejected." % pid
-        elif action == "Reopen as draft" and p["status"] == "Rejected":
-            con.execute("update paaf set status='Draft', sent_date=NULL, decided_date=NULL where paaf_id=?", (pid,))
-            msg = "PAAF %d reopened as a draft." % pid
+            msg = "Entry %d now uses the chosen rate." % pid
+        elif action == "Save end date":
+            end = need_date(g("expiry_date"), "End date", False)
+            con.execute("update paaf set expiry_date=? where paaf_id=?", (end, pid))
+            msg = "Entry %d now ends on %s." % (pid, end) if end else "Entry %d has no end date." % pid
         else:
-            raise ValueError("That action is not available for a PAAF with status %s." % p["status"])
+            raise ValueError("Unknown action.")
         con.commit()
         return view_admin(con, u, "paafs", [msg], ok=True, q=q)
     except ValueError as e:

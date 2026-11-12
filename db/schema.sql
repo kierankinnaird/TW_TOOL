@@ -2,7 +2,7 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 15;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+PRAGMA user_version = 16;  -- 2: a cost controller approves the hours a scope approver books to their own scope
                           -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
                           -- 4: every entry has a location (On site / Offshore / Standard) and an overtime flag
                           -- 5: a cost controller can reopen submitted or approved hours (reopen_reason)
@@ -15,6 +15,7 @@ PRAGMA user_version = 15;  -- 2: a cost controller approves the hours a scope ap
                           -- 11: a person cannot book more than 24 hours in one day across all rows
                           -- 12: allowances are for staff only, and are valued from an append-only rate table (by allowance, location and overtime)
                           -- 13: approvers are a main approver per client plus secondary approvers per scope; the phase is the CTR (booking code)
+                          -- 16: a line manager on each user; a PAAF is simply the client's list of people (active as soon as it is added, no sign-off)
                           -- 15: one offshore allowance at one rate (no location or overtime matrix); default locations On Shore / Offshore / Site visit
                           -- 14: a CTR carries the fields of the CTR sheet (CTR code, objectives, inputs, scope, assumptions, payment terms ...) and a client a framework reference
 
@@ -56,16 +57,19 @@ CREATE TABLE app_user (
     role_id         INTEGER NOT NULL REFERENCES role(role_id),
     permission      TEXT NOT NULL DEFAULT 'user' CHECK (permission IN ('user','controller','admin')),
     start_date      TEXT NOT NULL,
-    end_date        TEXT
+    end_date        TEXT,
+    line_manager_id INTEGER REFERENCES app_user(user_id) CHECK (line_manager_id IS NULL OR line_manager_id <> user_id)
 );
 
--- Personnel Authorisation Approval Form: user x client, rate resolved from user's role.
+-- PAAF: the list of people who work on a client's projects, one row per person per client, with the rate position they are priced at.
+-- None of the clients approve individuals, so a row is active as soon as it is added (status Approved) and ends on its expiry date. The
+-- Draft / Sent / Rejected statuses and the signed form reference are kept for a client that asks for formal approval later.
 CREATE TABLE paaf (
     paaf_id     INTEGER PRIMARY KEY,
     user_id     INTEGER NOT NULL REFERENCES app_user(user_id),
     client_id   INTEGER NOT NULL REFERENCES client(client_id),
     rate_id     INTEGER NOT NULL REFERENCES rate(rate_id),
-    status      TEXT NOT NULL DEFAULT 'Draft' CHECK (status IN ('Draft','Sent','Approved','Rejected')),
+    status      TEXT NOT NULL DEFAULT 'Approved' CHECK (status IN ('Draft','Sent','Approved','Rejected')),
     sent_date   TEXT,
     decided_date TEXT,
     document_ref TEXT,                               -- link/path to signed client form
@@ -284,7 +288,7 @@ BEGIN
     WHERE EXISTS (SELECT 1 FROM phase WHERE phase_id = NEW.phase_id
                   AND ((book_from IS NOT NULL AND NEW.work_date < book_from) OR (book_to IS NOT NULL AND NEW.work_date > book_to)));
     -- Client work: needs an approved PAAF and a matching rate. Internal hours: neither.
-    SELECT RAISE(ABORT, 'No approved PAAF for this user and client')
+    SELECT RAISE(ABORT, 'This person is not on the client''s personnel list (no PAAF for this client)')
     WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 0
       AND NOT EXISTS (
         SELECT 1 FROM paaf p JOIN scope s ON s.client_id = p.client_id
@@ -515,7 +519,7 @@ BEGIN
     SELECT RAISE(ABORT, 'This booking code cannot be booked on that date (outside its booking dates)')
     WHERE EXISTS (SELECT 1 FROM phase WHERE phase_id = NEW.phase_id
                   AND ((book_from IS NOT NULL AND NEW.work_date < book_from) OR (book_to IS NOT NULL AND NEW.work_date > book_to)));
-    SELECT RAISE(ABORT, 'No approved PAAF for this user and client')
+    SELECT RAISE(ABORT, 'This person is not on the client''s personnel list (no PAAF for this client)')
     WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 0
       AND NOT EXISTS (SELECT 1 FROM paaf p JOIN scope s ON s.client_id = p.client_id
                       WHERE p.user_id = NEW.user_id AND s.scope_id = NEW.scope_id AND p.status = 'Approved'

@@ -32,7 +32,7 @@ class Base(unittest.TestCase):
 
 class TestSeed(Base):
     def test_counts(self):
-        self.assertEqual(self.scalar("select count(*) from app_user"), 30)
+        self.assertEqual(self.scalar("select count(*) from app_user"), 31)
         self.assertEqual(self.scalar("select count(*) from time_entry"), 64)
         self.assertEqual(self.scalar("select count(*) from rate"), 60)
 
@@ -46,7 +46,7 @@ class TestSeed(Base):
             self.assertEqual([rows[n] for n in order], sorted(rows[n] for n in order), client)
 
     def test_job_families_and_titles_from_the_estimate(self):
-        self.assertEqual(self.scalar("select count(*) from role"), 32)
+        self.assertEqual(self.scalar("select count(*) from role"), 33)
         families = {r[0] for r in self.con.execute("select family from role")}
         for f in ["Project Management", "Engineering Management", "Project Engineering", "Piping Engineering", "Technical Safety", "HSES", "QA/QC"]:
             self.assertIn(f, families)
@@ -57,7 +57,7 @@ class TestSeed(Base):
         self.assertEqual(self.scalar("select count(*) from role r where (select count(*) from rate where role_id=r.role_id) not in (0, 2)"), 0)
         # the only titles without a rate card never bill a client
         self.assertEqual({r[0] for r in self.con.execute("select name from role r where not exists (select 1 from rate where role_id=r.role_id)")},
-                         {"System Administrator", "Commercial Lead"})
+                         {"System Administrator", "Commercial Lead", "Managing Director"})
 
     def test_spirit_rates_match_the_morecambe_hub_estimate(self):
         rows = dict(self.con.execute("select r.name, rt.sales_rate from rate rt join role r using(role_id) join client c using(client_id) where c.name='Spirit'"))
@@ -76,7 +76,7 @@ class TestBookingRules(Base):
         self.assertEqual(self.scalar("select count(*) from time_entry_audit where action='CREATE'"), 65)
 
     def test_unapproved_paaf_blocks_booking(self):
-        self.blocked(NEW_ENTRY, (4, 1, 1, 4, 4, 4, "2026-11-06", 8, 4), "No approved PAAF")
+        self.blocked(NEW_ENTRY, (4, 1, 1, 4, 4, 4, "2026-11-06", 8, 4), "personnel list")
 
     def test_paaf_is_per_client_not_per_scope(self):
         # Ewan's single Apache PAAF covers every Apache scope...
@@ -279,7 +279,7 @@ class TestPermissionLevels(Base):
     """user / controller / admin. Approver is not a level: it means being named on a scope, and only standard users can be."""
     def test_there_are_three_levels_and_the_demo_has_controllers_and_one_admin(self):
         levels = dict(self.con.execute("select permission, count(*) from app_user group by permission").fetchall())
-        self.assertEqual(levels, {"user": 26, "controller": 3, "admin": 1})
+        self.assertEqual(levels, {"user": 27, "controller": 3, "admin": 1})
 
     def test_cost_permission_does_not_depend_on_job_title(self):
         # the two cost engineers are controllers, and so is the commercial lead, who is not a cost engineer
@@ -460,7 +460,7 @@ class TestAllowances(Base):
         self.blocked(self.INS, (5, 1, 2, 1, "2026-11-06", 5), "UNIQUE")      # not even against another booking code
 
     def test_the_booking_rules_apply_to_allowances(self):
-        self.blocked(self.INS, (4, 1, 1, 2, "2026-11-06", 4), "No approved PAAF")        # David Hart's PAAF is only Sent
+        self.blocked(self.INS, (4, 1, 1, 2, "2026-11-06", 4), "personnel list")        # David Hart's PAAF is only Sent
         self.blocked(self.INS, (5, 1, 1, 2, "2026-10-30", 5), "period is not open")
         self.blocked(self.INS, (5, 1, 1, 2, "2026-02-27", 5), "not active on that date")
         self.blocked(self.INS, (1, 4, 5, 2, "2026-11-06", 1), "Scope is not Open")
@@ -785,7 +785,7 @@ class TestInternalHours(Base):
         self.blocked(NEW_ENTRY, (5, 7, 8, None, 4, 4, "2026-11-04", 3, 5), msg="Internal hours have no PAAF and no rate")
 
     def test_client_hours_still_need_a_paaf_and_a_rate(self):
-        self.blocked(NEW_ENTRY, (5, 1, 1, None, 4, 4, "2026-11-06", 3, 5), msg="No approved PAAF")
+        self.blocked(NEW_ENTRY, (5, 1, 1, None, 4, 4, "2026-11-06", 3, 5), msg="personnel list")
         self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, None, "2026-11-06", 3, 5), msg="Rate does not match")
 
     def test_internal_codes_get_no_rate_card_and_no_paaf(self):
@@ -802,9 +802,9 @@ class TestInternalHours(Base):
         ctr_before = self.scalar("select sum(hours) from v_ctr")
         period_before = self.scalar("select sum(hours) from v_period_report")
         eid = self.book().lastrowid
-        # approved by the scope approver (7), who is not the owner
-        self.con.execute("UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-05 09:00', "
-                         "last_edited_by=7, last_edited_at='2026-11-05 09:00' WHERE entry_id=?", (eid,))
+        # approved by the internal client approver (31), who is not the owner
+        self.con.execute("UPDATE time_entry SET status='Approved', approved_by=31, approved_at='2026-11-05 09:00', "
+                         "last_edited_by=31, last_edited_at='2026-11-05 09:00' WHERE entry_id=?", (eid,))
         self.assertEqual(self.scalar("select status from time_entry where entry_id=?", eid), "Approved")
         self.assertEqual(self.scalar("select sum(hours) from v_ctr"), ctr_before)
         self.assertEqual(self.scalar("select sum(hours) from v_period_report"), period_before)
