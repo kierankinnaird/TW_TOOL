@@ -19,13 +19,14 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 sys.path.insert(0, os.path.join(ROOT, "app"))
 from build import build  # noqa: E402
 import app  # noqa: E402
+from nmc import core  # noqa: E402
 
 
 class TestApp(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        app.DB_PATH = os.path.join(self.tmp, "t.db")
-        build(app.DB_PATH).close()
+        core.DB_PATH = os.path.join(self.tmp, "t.db")
+        build(core.DB_PATH).close()
         self.server = app.make_server(0)
         self.base = "http://127.0.0.1:%d" % self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -1026,7 +1027,7 @@ class TestApp(unittest.TestCase):
 
     # ---------- schema version ----------
     def test_the_app_refuses_an_older_database_with_a_clear_message(self):
-        self.assertIsNone(app.schema_problem(app.DB_PATH))                         # the test database was just built
+        self.assertIsNone(app.schema_problem(core.DB_PATH))                         # the test database was just built
         self.assertEqual(self.one("pragma user_version")[0], app.REQUIRED_SCHEMA)  # schema.sql and the app agree
         old = os.path.join(self.tmp, "old.db")
         con = sqlite3.connect(old)  # a database from before schema versions existed: user_version 0
@@ -2068,7 +2069,7 @@ class TestApp(unittest.TestCase):
         self.assertIn("A1500-PM-D-001: budget", self.get(base + "&client=abc&show=zzz&from=nope"))
 
     def test_ctr_page(self):
-        con = sqlite3.connect(app.DB_PATH)
+        con = sqlite3.connect(core.DB_PATH)
         con.row_factory = sqlite3.Row
         ph = con.execute("select phase_id from phase where name='Define' and scope_id=(select scope_id from scope where scope_code='BB0001')").fetchone()[0]
         fams = [r[0] for r in con.execute("select distinct r.family from time_entry t join rate rt on rt.rate_id=t.rate_id join role r on r.role_id=rt.role_id "

@@ -9,7 +9,13 @@ db/
   schema.sql      tables, triggers (business rules), views
   seed.sql        demo data (3 locations, 2 clients plus the Internal client with 3 internal codes, 33 job titles in job families (4 with no rate card), 31 users, 4 projects, 9 scopes, 10 CTRs, 64 entries over 2 weeks, including two offshore weeks with allowances)
 app/
-  app.py          front end: Flask routes serving plain HTML pages with one inline stylesheet (the page functions are ordinary Python that return HTML strings)
+  app.py          the Flask app: routes, security headers, the server and the startup checks. The pages themselves are in the nmc package:
+  nmc/core.py       shared helpers, the approval rules, the page layout and the one inline stylesheet (STYLE), and form helpers
+  nmc/timesheet.py  the weekly timesheet, saving, booking rules and copy last week
+  nmc/approvals.py  approvals, missing timesheets and reopening
+  nmc/reports.py    reports, the CTR page, grid, manhour report and the Excel downloads
+  nmc/dashboard.py  the cost controllers' dashboard and its SVG charts
+  nmc/admin.py      the Admin tabs and the audit trail
   static/         the TASA Orbiter font file, the only static file the app serves
 scripts/
   build.py        builds build/timewriting.db from schema + seed
@@ -21,11 +27,11 @@ docs/             source documents such as the SOR (git-ignored, kept on the loc
 build/            generated .db files (git-ignored)
 ```
 
-The web layer is Flask. `python app/app.py` runs Werkzeug's development server, which is fine for the mock; a real deployment would run `flask_app` under a production WSGI server (for example waitress or gunicorn). Every page is a function that takes the database connection and returns HTML; the routes at the bottom of `app.py` only read the request and call it.
+The web layer is Flask. `python app/app.py` runs Werkzeug's development server, which is fine for the mock; a real deployment would run `flask_app` under a production WSGI server (for example waitress or gunicorn). Every page is a function that takes the database connection and returns HTML; the routes in `app.py` only read the request and call it.
 
 ## Look and feel
 
-NMC brand colours (orange `#fe6700`, black `#0f0f12`, off-white `#f5f5f6`), the TASA Orbiter font and square corners, all in one stylesheet in `app.py` (the `STYLE` block) with no external requests. The font is used from the machine if it is installed, otherwise the copy in `app/static/` is served; the route serves that one file only, never a path taken from the request. If the font file is missing, the app falls back to the system sans-serif font.
+NMC brand colours (orange `#fe6700`, black `#0f0f12`, off-white `#f5f5f6`), the TASA Orbiter font and square corners, all in one stylesheet in `nmc/core.py` (the `STYLE` block) with no external requests. The font is used from the machine if it is installed, otherwise the copy in `app/static/` is served; the route serves that one file only, never a path taken from the request. If the font file is missing, the app falls back to the system sans-serif font.
 
 ## Use
 
@@ -42,7 +48,7 @@ pip install -r requirements.txt           # once: Flask
 python app/app.py                            # then open http://localhost:8000
 ```
 
-The app checks the database's schema version when it starts (`PRAGMA user_version` in `db/schema.sql`, `REQUIRED_SCHEMA` in `app/app.py`; raise both together when a schema change would break older databases). If it says the database was built with an older schema, run `python scripts/build.py` to make a fresh `build/timewriting.db`. That leaves any other database file alone, so a database you pointed `TW_DB` at keeps its data; clear `TW_DB` (PowerShell: `Remove-Item Env:TW_DB`) to use the new one.
+The app checks the database's schema version when it starts (`PRAGMA user_version` in `db/schema.sql`, `REQUIRED_SCHEMA` in `app/nmc/core.py`; raise both together when a schema change would break older databases). If it says the database was built with an older schema, run `python scripts/build.py` to make a fresh `build/timewriting.db`. That leaves any other database file alone, so a database you pointed `TW_DB` at keeps its data; clear `TW_DB` (PowerShell: `Remove-Item Env:TW_DB`) to use the new one.
 
 Pages: My Timesheet (weekly grid), Approvals (approvers and cost controllers), Missing timesheets (approvers and cost controllers), Reports (CTR and weekly period reports), Admin and Audit trail (cost controllers and the IT admin, each seeing their own tabs). Rebuilding the database resets the data.
 
