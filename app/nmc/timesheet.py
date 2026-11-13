@@ -1,7 +1,7 @@
-"""The weekly timesheet: showing it, saving hours and allowances, booking rules and copying last week."""
+"""The weekly timesheet: showing it, saving hours, booking rules and copying last week. Allowances are not claimed here (payroll sets them by location)."""
 import datetime
 import sqlite3
-from nmc.core import date_input, esc, fmt, layout, locations, me_row, monday, msgs_html, parse_adds, parse_pairs, stamp
+from nmc.core import date_input, esc, fmt, layout, locations, me_row, monday, msgs_html, parse_adds, stamp
 
 
 TIMESHEET_JS = """<script>
@@ -27,25 +27,27 @@ function recalc(){
   fill('td.dn', dn); fill('td.do', dO); fill('td.dt', dt);
   put('td.gn', gn); put('td.go', go); put('td.gt', gn+go);
 }
+function showOt(a){var tr=a.closest('tr'), nx=tr.nextElementSibling; if(nx){nx.style.display='';var i=nx.querySelector('input[type=text]'); if(i){i.focus();}} a.style.display='none'; return false;}
+function filterCtr(q){q=q.toLowerCase();var s=document.getElementById('addphase'),o=s.options,i,first=null;
+  for(i=0;i<o.length;i++){var m=o[i].text.toLowerCase().indexOf(q)>=0;o[i].hidden=!m;o[i].disabled=!m;if(m&&!first){first=o[i];}}
+  if(first&&(s.selectedIndex<0||o[s.selectedIndex].disabled)){first.selected=true;}}
 document.addEventListener('input',function(e){if(e.target.name&&e.target.name.indexOf('h_')===0){recalc();}});
 </script>"""
 
 
 def sheet_locked(con, u, d0, d6):
-    """A week's sheet is locked once it has been submitted: it has hours or allowances past Draft and nothing left in Draft. Sent-back or
+    """A week's sheet is locked once it has been submitted: it has hours past Draft and nothing left in Draft. Sent-back or
     reopened entries go back to Draft, which opens the sheet again."""
     non_draft, draft = con.execute(
-        "select coalesce(sum(status<>'Draft'),0), coalesce(sum(status='Draft'),0) from (select status from time_entry where user_id=? and work_date between ? and ? "
-        "union all select status from allowance_entry where user_id=? and work_date between ? and ?)", (u, d0, d6, u, d0, d6)).fetchone()
+        "select coalesce(sum(status<>'Draft'),0), coalesce(sum(status='Draft'),0) from time_entry where user_id=? and work_date between ? and ?", (u, d0, d6)).fetchone()
     return non_draft > 0 and draft == 0
 
 
 LOCKED_MSG = "This timesheet has been submitted and is locked. Ask a cost controller to reopen it if something needs changing."
 
 
-def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
+def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
     adds = adds or []
-    aadds = aadds or []
     me = me_row(con, u)
     if not me:
         return layout(con, u, "My Timesheet", "<p>Unknown user.</p>")
@@ -57,7 +59,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     period = con.execute("select * from period where week_start=?", (d0,)).fetchone()
     open_week = bool(period and period["status"] == "Open")
     locked = sheet_locked(con, u, d0, d6)
-    can_edit = open_week and not locked  # a submitted sheet is locked as a whole: no new hours, rows or allowances either
+    can_edit = open_week and not locked  # a submitted sheet is locked as a whole: no new hours or rows either
     start, end = me["start_date"], me["end_date"]  # hours can only be booked on dates from the start date to the end date
 
     def active(iso):
@@ -92,6 +94,16 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
         if s and r and loc and ot in (0, 1):
             rows[(pid, rid, lid, ot)] = {"client": s["client"], "project": s["project"], "scope": "%s %s" % (s["scope_code"], s["description"]),
                                          "phase": s["phase"], "skill": r["skill_code"], "location": loc[0], "overtime": ot, "cells": {}}
+    # every booking shows its normal-time row and, directly under it, an overtime row: hidden until it has hours or "+ Overtime" is clicked
+    for (pid, rid, lid, ot) in list(rows):
+        if (pid, rid, lid, 1 - ot) not in rows:
+            rows[(pid, rid, lid, 1 - ot)] = dict(rows[(pid, rid, lid, ot)], overtime=1 - ot, cells={}, auto=True)
+    ordered = {}
+    for k in rows:
+        for ot in (0, 1):
+            if (k[0], k[1], k[2], ot) in rows and (k[0], k[1], k[2], ot) not in ordered:
+                ordered[(k[0], k[1], k[2], ot)] = rows[(k[0], k[1], k[2], ot)]
+    rows = ordered
 
     b = []
     b.append(msgs_html(msgs, ok))
@@ -172,17 +184,24 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
                      ' onsubmit="return confirm(\'This clears the draft hours already in this week. Continue?\');"' if has_drafts else "",
                      u, d0, prev_d.strftime("%d/%m/%Y"), prev_n, "y" if prev_n == 1 else "ies"))
 
-    adds_hidden = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"])
+    adds_hidden = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"] and not rows[k].get("auto"))
     b.append('<form id="tsform" method="post" action="/timesheet/save">'
              '<input type="hidden" name="u" value="%d"><input type="hidden" name="w" value="%s">%s' % (u, d0, adds_hidden))
-    head = ["Booking"] + [d.strftime("%a %d/%m") for d in days] + ["Total"]
+    head = ["Booking"] + [d.strftime("%a %d/%m") for d in days] + ["Total", ""]
     trs = []
     day_tot = {d.isoformat(): 0.0 for d in days}
     day_norm, day_ot = dict(day_tot), dict(day_tot)  # the same, split into normal time and overtime
     for (pid, rid, lid, ot), r in rows.items():
-        tds = ['<td class="bk"><b>%s</b><br><span class="sub">%s &rsaquo; %s &rsaquo; %s</span><br><span class="chips">%s &middot; %s &middot; %s</span></td>' % (
-            esc(r["phase"]), esc(r["client"]), esc(r["project"]), esc(r["scope"]), esc(r["skill"]), esc(r["location"]),
-            "<b>Overtime</b>" if ot else "Normal")]
+        ot_hidden = bool(ot and not r["cells"] and r.get("auto"))  # an overtime line nobody has asked for yet
+        link = ""
+        if not ot and can_edit and rows.get((pid, rid, lid, 1), {}).get("auto") and not rows[(pid, rid, lid, 1)]["cells"]:
+            link = ' <a href="#" class="addot" onclick="return showOt(this)">+ Overtime</a>'
+        if ot:
+            tds = ['<td class="bk"><span class="sub">%s</span><br><span class="chips">%s &middot; %s &middot; <b>Overtime</b></span></td>' % (
+                esc(r["phase"]), esc(r["skill"]), esc(r["location"]))]
+        else:
+            tds = ['<td class="bk"><b>%s</b><br><span class="sub">%s &rsaquo; %s &rsaquo; %s</span><br><span class="chips">%s &middot; %s &middot; Normal%s</span></td>' % (
+                esc(r["phase"]), esc(r["client"]), esc(r["project"]), esc(r["scope"]), esc(r["skill"]), esc(r["location"]), link)]
         rt = 0.0
         for d in days:
             iso = d.isoformat()
@@ -204,21 +223,29 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
                     cell = '<input type="text" size="4" name="%s" value="%s"%s>' % (name, fmt(e["hours"]), why)
             tds.append('<td align="center" class="c%s" data-day="%s"%s>%s</td>' % (" we" if d.weekday() >= 5 else "", iso, fixed, cell))
         tds.append('<td align="right" class="rt">%s</td>' % fmt(rt))
-        trs.append('<tr class="row" data-ot="%d">%s</tr>' % (ot, "".join(tds)))
+        mine = [rows[(pid, rid, lid, o)]["cells"].values() for o in (0, 1)]
+        if not ot and can_edit and not any(e["status"] != "Draft" for cells in mine for e in cells):  # a booking with submitted or approved hours cannot be deleted
+            has_hours = any(cells for cells in mine)
+            tds.append('<td class="del"><button type="submit" name="delrow" value="h:%d:%d:%d" class="delrow" title="Delete this row"%s>&times;</button></td>' % (
+                pid, rid, lid, ' onclick="return confirm(\'Delete this row and its draft hours?\')"' if has_hours else ""))
+        else:
+            tds.append('<td class="del"></td>')
+        trs.append('<tr class="row%s" data-ot="%d"%s>%s</tr>' % (" otrow" if ot else "", ot, ' style="display:none"' if ot_hidden else "", "".join(tds)))
     if not trs:
-        trs.append('<tr><td colspan="%d">No rows yet. Add one below.</td></tr>' % len(head))
+        trs.append('<tr><td colspan="%d">No rows yet. Use the Add timesheet row button above.</td></tr>' % len(head))
 
     def sum_row(label, day_cls, week_cls, per_day, row_cls=""):  # Normal time, Overtime and Total lines under the grid
-        return '<tr class="%s"><td align="right"><b>%s</b></td>%s<td align="right" class="%s"><b>%s</b></td></tr>' % (
+        return '<tr class="%s"><td align="right"><b>%s</b></td>%s<td align="right" class="%s"><b>%s</b></td><td></td></tr>' % (
             row_cls, label, "".join('<td align="center" class="%s" data-day="%s"><b>%s</b></td>' % (day_cls, d.isoformat(), fmt(per_day[d.isoformat()])) for d in days),
             week_cls, fmt(sum(per_day.values())))
-    has_ot = any(k[3] for k in rows)  # the normal time and overtime lines only matter once there is overtime
+    has_ot = any(k[3] and (rows[k]["cells"] or not rows[k].get("auto")) for k in rows)  # the normal time and overtime lines only matter once there is overtime
     foot = ((sum_row("Normal time", "dn", "gn", day_norm, "sum") + sum_row("Overtime", "do", "go", day_ot, "sum")) if has_ot else
             '<tr style="display:none"><td></td>%s<td class="gn"></td></tr><tr style="display:none"><td></td>%s<td class="go"></td></tr>' % (
                 "".join('<td class="dn" data-day="%s"><b>0</b></td>' % d.isoformat() for d in days), "".join('<td class="do" data-day="%s"><b>0</b></td>' % d.isoformat() for d in days)))
     foot += sum_row("Total", "dt", "gt", day_tot, "tot")
     hdr = "".join('<th class="%s">%s</th>' % ("bkh" if i == 0 else ("we" if 1 <= i <= 7 and days[i - 1].weekday() >= 5 else ""), esc(h).replace(" ", "<br>", 1) if 1 <= i <= 7 else esc(h))
                   for i, h in enumerate(head))
+    b.append('<div class="tools"><!--ADDROW--></div>')
     b.append('<table class="ts" border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s%s</table>' % (hdr, "".join(trs), foot))
     b.append(TIMESHEET_JS)
     by_status = {"Approved": 0.0, "Edited": 0.0, "Submitted": 0.0, "Draft": 0.0}
@@ -228,54 +255,8 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
         fmt(sum(by_status.values())), fmt(by_status["Approved"]), fmt(by_status["Edited"]), fmt(by_status["Submitted"]), fmt(by_status["Draft"])))
     if not locked:
         b.append("<p><small>To clear a draft entry, empty its box and click Save draft.</small></p>")
-    # allowances: a row per booking code and allowance, a tick box per day
-    arows = {}
-    for a in con.execute(
-            "select a.*, at.name as allowance, s.scope_code, s.description, c.name as client, pr.name as project, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase "
-            "from allowance_entry a join allowance_type at on at.allowance_id=a.allowance_id join phase ph on ph.phase_id=a.phase_id "
-            "join scope s on s.scope_id=a.scope_id join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
-            "where a.user_id=? and a.work_date between ? and ? order by c.name, pr.name, s.scope_code, ph.name, a.allowance_id", (u, d0, d6)):
-        arows.setdefault((a["phase_id"], a["allowance_id"]), {"client": a["client"], "project": a["project"], "scope": "%s %s" % (a["scope_code"], a["description"]),
-                                                              "phase": a["phase"], "allowance": a["allowance"], "cells": {}})["cells"][a["work_date"]] = a
-    for (pid, aid) in aadds:
-        if (pid, aid) in arows:
-            continue
-        i = con.execute("select s.scope_code, s.description, c.name as client, pr.name as project, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, at.name as allowance "
-                        "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
-                        "join client c on c.client_id=s.client_id, allowance_type at where ph.phase_id=? and at.allowance_id=? and at.active=1", (pid, aid)).fetchone()
-        if i:
-            arows[(pid, aid)] = {"client": i["client"], "project": i["project"], "scope": "%s %s" % (i["scope_code"], i["description"]),
-                                 "phase": i["phase"], "allowance": i["allowance"], "cells": {}}
-    atypes = con.execute("select allowance_id, name from allowance_type where active=1 order by allowance_id").fetchall() if me["employment_type"] == "Staff" else []
-    if arows:
-        b.append("<p><b>Allowances</b> <small>Tick the days you are claiming. One of each allowance per day. They are submitted and approved with your hours.</small></p>")
-    if arows:
-        ahead = ["Allowance"] + [d.strftime("%a %d/%m") for d in days] + ["Days"]
-        atrs = []
-        for (pid, aid), r in arows.items():
-            tds = ['<td class="bk"><b>%s</b><br><span class="sub">%s &middot; %s &rsaquo; %s &rsaquo; %s</span></td>' % (
-                esc(r["allowance"]), esc(r["phase"]), esc(r["client"]), esc(r["project"]), esc(r["scope"]))]
-            n_days = 0
-            for d in days:
-                iso = d.isoformat()
-                a = r["cells"].get(iso)
-                if a is not None:
-                    n_days += 1
-                if a is not None and a["status"] != "Draft":
-                    cell = '<span title="%s">&#10003;</span>' % esc(a["status"])
-                elif can_edit and active(iso):
-                    cell = ('<input type="checkbox" name="a_%d_%d_%s" value="1"%s><input type="hidden" name="ashown" value="%d:%d:%s">' % (
-                        pid, aid, iso, " checked" if a is not None else "", pid, aid, iso))
-                else:
-                    cell = "&#10003;" if a is not None else "&ndash;"
-                tds.append('<td align="center"%s>%s</td>' % (' class="we"' if d.weekday() >= 5 else "", cell))
-            tds.append('<td align="right">%d<input type="hidden" name="arow" value="%d:%d"></td>' % (n_days, pid, aid))
-            atrs.append("<tr>%s</tr>" % "".join(tds))
-        b.append('<table class="ts" border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s</table>' % (
-            "".join('<th class="%s">%s</th>' % ("bkh" if i == 0 else ("we" if 1 <= i <= 7 and days[i - 1].weekday() >= 5 else ""), esc(h).replace(" ", "<br>", 1) if 1 <= i <= 7 else esc(h))
-                    for i, h in enumerate(ahead)), "".join(atrs)))
-    if any(e["status"] != "Draft" for e in entries) or any(a["status"] != "Draft" for r in arows.values() for a in r["cells"].values()):
-        b.append("<p><small>Submitted and approved hours are locked, and so are submitted and approved allowances. If one needs changing, ask a cost controller to reopen the timesheet.</small></p>")
+    if any(e["status"] != "Draft" for e in entries):
+        b.append("<p><small>Submitted and approved hours are locked. If one needs changing, ask a cost controller to reopen the timesheet.</small></p>")
     if locked:
         b.append('<div class="actions"><b>Locked.</b> <small>This timesheet has been submitted. Ask a cost controller to reopen it if something needs changing.</small></div></form>')
     else:
@@ -297,6 +278,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
     for pf in con.execute("select c.name as client, p.expiry_date from paaf p join client c on c.client_id=p.client_id "
                           "where p.user_id=? and c.is_internal=0 and p.expiry_date is not null and p.expiry_date < ? order by c.name", (u, d0)):
         b.append("<p><small><b>%s:</b> you came off this client's list on %s, so its CTRs are not offered from that date.</small></p>" % (esc(pf["client"]), dmy(pf["expiry_date"])))
+    add_button = ""  # the "Add timesheet row" button above the grid, when a row can be added
     if week_inactive or locked:
         pass  # the notes above say why nothing can be added
     elif scopes:
@@ -306,27 +288,24 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, aadds=None):
             return "%s &gt; %s &gt; %s %s &gt; %s" % (esc(s["client"]), esc(s["project"]), esc(s["scope_code"]), esc(s["description"]), esc(s["phase"]))
         so = "".join('<option value="%d">%s</option>' % (s["phase_id"], label(s)) for s in scopes)
         ro = "".join('<option value="%d"%s>%s %s</option>' % (r["role_id"], " selected" if r["role_id"] == me["role_id"] else "", esc(r["skill_code"]), esc(r["name"])) for r in roles)
-        keep = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"])
-        akeep = "".join('<input type="hidden" name="aadd" value="%d:%d">' % k for k in arows if not arows[k]["cells"])
         lo = "".join('<option value="%d">%s</option>' % (lid, esc(name)) for lid, name in locations(con))
-        b.append('<div class="addbox"><p><b>Add row:</b> CTR <select form="tsform" name="add_phase">%s</select> '
-                 '<input form="tsform" type="submit" name="action" value="Add row"> <small>(hours you have typed are saved first)</small></p>'
-                 '<details><summary>Different skill code, location or overtime</summary>'
-                 '<p>Skill code <select form="tsform" name="add_role">%s</select> Location <select form="tsform" name="add_loc">%s</select> '
-                 '<label><input form="tsform" type="checkbox" name="add_ot" value="1"> Overtime</label></p>'
-                 "<p><small>Your own skill code is pre-selected. Choose a different one if you are covering another role. "
-                 "Hours NMC pays for itself (not billed to a client) go to an Internal code, for example Internal - Business Services. "
-                 "Tick Overtime for overtime hours: they go on their own line and have no separate rate yet.</small></p></details>" % (so, ro, lo))
-        if atypes:
-            ao = "".join('<option value="%d">%s</option>' % (t["allowance_id"], esc(t["name"])) for t in atypes)
-            b.append('<details><summary>Claim an allowance</summary>'
-                     '<p>Booking code <select form="tsform" name="aadd_phase">%s</select> Allowance <select form="tsform" name="aadd_type">%s</select> '
-                     '<input form="tsform" type="submit" name="action" value="Add allowance row"></p>'
-                     "<p><small>An allowance is claimed against a booking code, so the code's approver approves it.</small></p></details>" % (so, ao))
-        b.append("</div>")
+        so_list = "".join('<option value="%d"%s>%s</option>' % (s["phase_id"], " selected" if i == 0 else "", label(s)) for i, s in enumerate(scopes))
+        dlg = ['<dialog id="addrow" class="dlg"><div class="dlg-in"><h4>Add a timesheet row</h4>'
+               '<p><small>Choose a CTR, typing in the box to search. Hours you have typed are saved first. Overtime is added on the row itself, with <b>+ Overtime</b>.</small></p>'
+               '<p><input type="text" id="addq" placeholder="Search by client, project, scope or CTR No" autocomplete="off" oninput="filterCtr(this.value)"></p>'
+               '<p><select form="tsform" name="add_phase" id="addphase" size="8">%s</select></p>'
+               '<details><summary>Different skill code or location</summary>'
+               '<p>Skill code <select form="tsform" name="add_role">%s</select> Location <select form="tsform" name="add_loc">%s</select></p>'
+               "<p><small>Your own skill code is pre-selected. Choose a different one if you are covering another role. "
+               "Hours NMC pays for itself (not billed to a client) go to an Internal code, for example Internal - Business Services.</small></p></details>"
+               '<p class="dlg-actions"><input form="tsform" type="submit" name="action" value="Add row"> '
+               '<input type="button" value="Cancel" onclick="this.closest(\'dialog\').close()"></p>' % (so_list, ro, lo)]
+        dlg.append("</div></dialog>")
+        b.append("".join(dlg))
+        add_button = '<input type="button" value="+ Add timesheet row" onclick="document.getElementById(\'addrow\').showModal()">'
     else:
         b.append("<p>You are not on the personnel list of any client with open scopes, so there is nothing to book to.</p>")
-    return layout(con, u, "My Timesheet", "".join(b))
+    return layout(con, u, "My Timesheet", "".join(b).replace("<!--ADDROW-->", add_button))
 
 
 def book_entry(con, u, pid, rid, lid, ot, date, hours):
@@ -368,6 +347,11 @@ def save_timesheet(con, form):
     d0, d6 = w.isoformat(), (w + datetime.timedelta(days=6)).isoformat()
     if sheet_locked(con, u, d0, d6):  # nothing at all can be added to or changed on a submitted sheet
         return view_timesheet(con, u, w, [LOCKED_MSG])
+    delete = form.get("delrow", [""])[0].split(":")  # "h:phase:role:location"
+    try:
+        del_h = tuple(int(x) for x in delete[1:4]) if delete[0] == "h" and len(delete) == 4 else None
+    except ValueError:
+        del_h = None
     for key, vals in form.items():
         if not key.startswith("h_"):
             continue
@@ -375,6 +359,8 @@ def save_timesheet(con, form):
             _, pid, rid, lid, ot, date = key.split("_", 5)
             pid, rid, lid, ot = int(pid), int(rid), int(lid), int(ot)
         except ValueError:
+            continue
+        if del_h == (pid, rid, lid):  # the row being deleted is not saved first
             continue
         raw = vals[0].strip()
         info = con.execute("select s.scope_id, s.scope_code, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase from phase ph join scope s on s.scope_id=ph.scope_id "
@@ -418,69 +404,40 @@ def save_timesheet(con, form):
             saved += 1
         except sqlite3.DatabaseError as e:
             msgs.append("%s: %s" % (label, e))
-    # allowances: only the tick boxes that were on the page ('ashown') are looked at, so locked days are never touched
-    aadds = parse_pairs(form.get("arow", []))
     if action == "Add row" and form.get("add_phase") and form.get("add_role"):  # saved above; now show the new empty row
         adds += parse_adds(["%s:%s:%s:%s" % (form["add_phase"][0], form["add_role"][0], form.get("add_loc", ["1"])[0], "1" if "add_ot" in form else "0")])
-    if action == "Add allowance row" and form.get("aadd_phase") and form.get("aadd_type"):
-        aadds = list(dict.fromkeys(aadds + parse_pairs(["%s:%s" % (form["aadd_phase"][0], form["aadd_type"][0])])))
-    a_saved = a_cleared = 0
-    for shown in form.get("ashown", []):
-        try:
-            pid, aid, date = shown.split(":")
-            pid, aid = int(pid), int(aid)
-            datetime.date.fromisoformat(date)
-        except ValueError:
-            continue
-        if not d0 <= date <= d6:
-            continue
-        checked = "a_%d_%d_%s" % (pid, aid, date) in form
-        info = con.execute("select s.scope_id, s.scope_code, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, at.name as allowance from phase ph join scope s on s.scope_id=ph.scope_id, "
-                           "allowance_type at where ph.phase_id=? and at.allowance_id=?", (pid, aid)).fetchone()
-        if not info:
-            continue
-        label = "%s on %s (%s %s)" % (info["allowance"], date, info["scope_code"], info["phase"])
-        existing = con.execute("select * from allowance_entry where user_id=? and allowance_id=? and work_date=?", (u, aid, date)).fetchone()
-        try:
-            if checked and not existing:
-                con.execute("insert into allowance_entry (user_id, scope_id, phase_id, allowance_id, work_date, created_by, last_edited_by, last_edited_at) "
-                            "values (?,?,?,?,?,?,?,?)", (u, info["scope_id"], pid, aid, date, u, u, stamp()))
-                a_saved += 1
-            elif checked and existing and existing["phase_id"] != pid:
-                msgs.append("%s: already claimed against another booking code that day." % label)
-            elif not checked and existing and existing["phase_id"] == pid and existing["status"] == "Draft":
-                con.execute("update allowance_entry set last_edited_by=?, last_edited_at=? where allowance_entry_id=?", (u, stamp(), existing["allowance_entry_id"]))
-                con.execute("delete from allowance_entry where allowance_entry_id=?", (existing["allowance_entry_id"],))
-                a_cleared += 1
-        except sqlite3.DatabaseError as e:
-            msgs.append("%s: %s" % (label, e))
     ok_msgs = []
+    if del_h:
+        rowset = con.execute("select entry_id, status from time_entry where user_id=? and phase_id=? and worked_role_id=? and location_id=? and work_date between ? and ?",
+                             (u, del_h[0], del_h[1], del_h[2], d0, d6)).fetchall()
+        if any(x["status"] != "Draft" for x in rowset):
+            msgs.append("That row has submitted or approved hours, so it cannot be deleted. Ask a cost controller to reopen the timesheet.")
+        else:
+            try:
+                for x in rowset:
+                    con.execute("update time_entry set last_edited_by=?, last_edited_at=? where entry_id=?", (u, stamp(), x["entry_id"]))
+                    con.execute("delete from time_entry where entry_id=?", (x["entry_id"],))
+                adds = [a for a in adds if tuple(a[:3]) != del_h]
+                ok_msgs.append("Row deleted%s." % (" (%d draft entr%s removed)" % (len(rowset), "y" if len(rowset) == 1 else "ies") if rowset else ""))
+            except sqlite3.DatabaseError as e:
+                msgs.append("Delete failed: %s" % e)
     if saved:
         ok_msgs.append("%d entr%s saved." % (saved, "y" if saved == 1 else "ies"))
     if cleared:
         ok_msgs.append("%d draft entr%s cleared." % (cleared, "y" if cleared == 1 else "ies"))
-    if a_saved:
-        ok_msgs.append("%d allowance day%s saved." % (a_saved, "" if a_saved == 1 else "s"))
-    if a_cleared:
-        ok_msgs.append("%d allowance day%s cleared." % (a_cleared, "" if a_cleared == 1 else "s"))
     if action == "Submit week":
         try:
             n = con.execute("update time_entry set status='Submitted', last_edited_by=?, last_edited_at=? "
                             "where user_id=? and status='Draft' and work_date between ? and ?", (u, stamp(), u, d0, d6)).rowcount
-            na_before = None
-            na = con.execute("update allowance_entry set status='Submitted', last_edited_by=?, last_edited_at=? "
-                             "where user_id=? and status='Draft' and work_date between ? and ?", (u, stamp(), u, d0, d6)).rowcount
             if n:
                 ok_msgs.append("%d entr%s submitted for approval." % (n, "y" if n == 1 else "ies"))
-            if na:
-                ok_msgs.append("%d allowance day%s submitted for approval." % (na, "" if na == 1 else "s"))
-            if not n and not na:
-                msgs.append("Nothing to submit: there are no draft hours or allowances in this week.")
+            if not n:
+                msgs.append("Nothing to submit: there are no draft hours in this week.")
         except sqlite3.DatabaseError as e:
             msgs.append("Submit failed: %s" % e)
     con.commit()
     body_msgs = ok_msgs if not msgs else msgs + ok_msgs
-    return view_timesheet(con, u, w, body_msgs, adds, ok=not msgs, aadds=aadds)
+    return view_timesheet(con, u, w, body_msgs, adds, ok=not msgs)
 
 
 def copy_week(con, form):

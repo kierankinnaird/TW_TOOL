@@ -188,6 +188,20 @@ table.ts tr.sum td{background:#fafafa;border-bottom:1px solid var(--line)}
 table.ts tr.tot td{background:var(--white);border-top:2px solid var(--black);font-size:1rem}
 .actions{position:sticky;bottom:0;display:flex;align-items:center;gap:.8rem;margin:1rem -1.4rem -1.2rem;padding:.7rem 1.4rem;background:var(--white);border-top:1px solid var(--line)}
 .actions p{margin:0}
+.tools{display:flex;justify-content:flex-end;align-items:center;gap:.6rem;margin:0 0 .6rem}
+dialog.dlg{border:1px solid var(--black);padding:0;width:min(640px,92vw);background:var(--white);color:var(--black)}
+dialog.dlg::backdrop{background:rgba(15,15,18,.5)}
+.dlg-in{padding:1.2rem 1.5rem}
+.dlg-in h4{margin:0 0 .4rem;font-size:1.15rem}
+.dlg-in select[size],.dlg-in input[type=text]#addq{width:100%}
+.dlg-in select[size]{height:auto;padding:.3rem}
+.dlg-actions{display:flex;gap:.6rem;align-items:center;margin-top:.9rem}
+.dlg-in input[type=button]{background:var(--white);color:var(--black);border:1px solid var(--grey-light)}
+table.ts tr.otrow td{background:#fff8f2}
+table.ts tr.otrow td.we{background:#f6ece4}
+button.delrow{background:none;border:0;padding:0 .4rem;font:inherit;font-size:1.3rem;line-height:1;color:var(--grey-mid);cursor:pointer;height:auto}
+button.delrow:hover{color:#b3261e}
+table.ts a.addot{font-size:.8rem;color:var(--orange)}
 .addbox{margin-top:1.4rem;padding:.9rem 1.1rem;background:var(--bg);border:1px solid var(--line)}
 .addbox p{margin:.3rem 0}
 .addbox details{margin:.5rem 0 0}

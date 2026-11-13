@@ -21,7 +21,7 @@ APPROVALS_JS = """<script>
 function openRow(a){var r=document.getElementById(a.getAttribute('data-r')); r.style.display=(r.style.display==='none')?'':'none'; return false;}
 function openAll(show){var d=document.querySelectorAll('tr.drow'), i; for(i=0;i<d.length;i++){d[i].style.display=show?'':'none';} return false;}
 function tickPerson(c){var e=document.querySelectorAll('input[data-p="'+c.getAttribute('data-p')+'"]'), i; for(i=0;i<e.length;i++){e[i].checked=c.checked;}}
-function tickAll(c){var e=document.getElementsByName('entry_id'), g=document.getElementsByName('allowance_entry_id'), p=document.querySelectorAll('input.pp'), i;
+function tickAll(c){var e=document.getElementsByName('entry_ids'), g=document.getElementsByName('allowance_entry_id'), p=document.querySelectorAll('input.pp'), i;
   for(i=0;i<e.length;i++){e[i].checked=c.checked;} for(i=0;i<g.length;i++){g[i].checked=c.checked;} for(i=0;i<p.length;i++){p[i].checked=c.checked;}}
 </script>"""
 
@@ -111,18 +111,27 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
                        ('<button type="submit" name="approve_person" value="%d" title="Approve everything waiting for this person this week">Approve all waiting</button>' % uid) if n_pending else "",
                        "".join('<td align="center">%s</td>' % (fmt(per_day[d.isoformat()]) if per_day[d.isoformat()] else "&ndash;") for d in days),
                        fmt(wait_h + appr_h), fmt(wait_h) if wait_h else "", fmt(appr_h) if appr_h else ""))
-        lines = []
+        # one line per booking (scope, CTR, skill code, location, normal or overtime) with a column per day, not a line per day
+        bookings = {}
         for e in es:
-            pend = e["status"] in ("Submitted", "Edited")
-            lines.append("<tr><td align=\"center\">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
-                         "<td align=\"right\">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                             '<input type="checkbox" name="entry_id" value="%d" data-p="%d">' % (e["entry_id"], uid) if pend else "",
-                             esc(e["client"]), esc(e["project"]), esc(e["scope_code"]), esc(e["phase"]), esc(e["skill_code"]),
-                             esc(e["location"]), "<b>Overtime</b>" if e["overtime"] else "Normal", esc(e["work_date"]),
-                             fmt(e["hours"]), esc(e["status"]), esc(fmt(e["was"]) if e["was"] is not None else ""), esc(e["last_change_reason"] or "")))
+            bookings.setdefault((e["scope_code"], e["phase"], e["skill_code"], e["location"], e["overtime"], e["client"], e["project"]), []).append(e)
+        lines = []
+        for (scope, phase, skill, loc, ot, client, project), bes in bookings.items():
+            pend_ids = [x["entry_id"] for x in bes if x["status"] in ("Submitted", "Edited")]
+            cells = {x["work_date"]: x for x in bes}
+            statuses = sorted({x["status"] for x in bes})
+            was = ", ".join("%s: %s" % (datetime.date.fromisoformat(x["work_date"]).strftime("%a"), fmt(x["was"])) for x in bes if x["was"] is not None)
+            reasons = "; ".join(dict.fromkeys(x["last_change_reason"] for x in bes if x["last_change_reason"]))
+            lines.append("<tr><td align=\"center\">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>%s"
+                         "<td align=\"right\"><b>%s</b></td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                             '<input type="checkbox" name="entry_ids" value="%s" data-p="%d">' % (",".join(str(i) for i in pend_ids), uid) if pend_ids else "",
+                             esc(client), esc(project), esc(scope), esc(phase), esc(skill), esc(loc), "<b>Overtime</b>" if ot else "Normal",
+                             "".join('<td align="center">%s</td>' % (fmt(cells[d.isoformat()]["hours"]) if d.isoformat() in cells else "&ndash;") for d in days),
+                             fmt(sum(x["hours"] for x in bes)), esc(", ".join(statuses)) if len(statuses) == 1 else "Part approved", esc(was), esc(reasons)))
         trs.append('<tr class="drow" id="%s"><td></td><td colspan="%d"><table border="1" cellpadding="3" cellspacing="0">'
-                   "<tr><th></th><th>Client</th><th>Project</th><th>Scope</th><th>CTR</th><th>Skill code</th><th>Location</th><th>Type</th>"
-                   "<th>Date</th><th>Hours</th><th>Status</th><th>Was</th><th>Edit reason</th></tr>%s</table></td></tr>" % (drow, ncol - 2, "".join(lines)))
+                   "<tr><th></th><th>Client</th><th>Project</th><th>Scope</th><th>CTR</th><th>Skill code</th><th>Location</th><th>Type</th>%s"
+                   "<th>Total</th><th>Status</th><th>Was</th><th>Edit reason</th></tr>%s</table></td></tr>" % (
+                       drow, ncol - 2, "".join("<th>%s</th>" % d.strftime("%a %d/%m") for d in days), "".join(lines)))
     foot = ('<tr><td></td><td align="right"><b>All people</b></td>%s<td align="right"><b>%s</b></td><td></td><td></td></tr>' % (
         "".join('<td align="center"><b>%s</b></td>' % (fmt(day_tot[d.isoformat()]) if day_tot[d.isoformat()] else "&ndash;") for d in days), fmt(sum(day_tot.values()))))
     allow_html = ""
@@ -151,7 +160,7 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
 
 def act_approval(con, form):
     u = int(form["u"][0])
-    ids = [int(x) for x in form.get("entry_id", [])]
+    ids = [int(x) for x in form.get("entry_id", [])] + [int(x) for v in form.get("entry_ids", []) for x in v.split(",") if x.strip().isdigit()]
     aids = [int(x) for x in form.get("allowance_entry_id", [])]
     if form.get("approve_person"):  # the Approve all button on a person's line: everything of theirs waiting this week, no ticking
         try:

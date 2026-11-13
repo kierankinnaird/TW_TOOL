@@ -245,6 +245,68 @@ class TestApp(unittest.TestCase):
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 403)
 
+    def test_a_row_is_added_from_a_popup_and_overtime_sits_under_its_booking(self):
+        page = self.get("/timesheet?u=4&w=2026-11-09")
+        # the button above the grid opens a popup holding the CTR list (with a search box), the skill code and location,
+        self.assertIn('value="+ Add timesheet row"', page)
+        self.assertIn('<dialog id="addrow"', page)
+        self.assertIn('id="addq"', page)
+        self.assertIn("Different skill code or location", page)
+        self.assertNotIn('name="add_ot"', page)                                   # overtime is no longer a tick box in the popup
+        # a new booking shows its normal row and, under it, an overtime row that stays hidden until "+ Overtime" is clicked
+        page = self.get("/timesheet?u=4&w=2026-11-09&add_phase=8&add_role=4&add_loc=1")
+        self.assertEqual(page.count('class="row"'), 1)
+        self.assertEqual(page.count('class="row otrow" data-ot="1" style="display:none"'), 1)
+        self.assertIn('class="addot"', page)
+        self.assertIn('name="h_8_4_1_1_2026-11-10"', page)                       # the hidden overtime boxes exist, so the hours can be typed once revealed
+        # typed overtime hours are saved with the normal hours, and the overtime row is then shown
+        self.post("/timesheet/save", {"u": "4", "w": "2026-11-09", "action": "Save draft", "h_8_4_1_0_2026-11-10": "7", "h_8_4_1_1_2026-11-10": "2"})
+        self.assertEqual(self.hours_of(4, "2026-11-10"), [(1, 0, 7, "Draft"), (1, 1, 2, "Draft")])
+        page = self.get("/timesheet?u=4&w=2026-11-09")
+        self.assertNotIn('style="display:none"><td class="bk">', page)
+        self.assertEqual(page.count('class="row otrow" data-ot="1">'), 1)
+        self.assertNotIn('class="addot"', page)                                   # the overtime line is already there
+        self.assertIn('class="do" data-day="2026-11-10"><b>2</b>', page)
+
+    def test_a_row_can_be_deleted_until_it_has_submitted_hours(self):
+        self.open_next_week()
+        base = {"u": "4", "w": "2026-11-09"}
+        # an empty new row: the delete button is there, and deleting it just removes the row
+        page = self.get("/timesheet?u=4&w=2026-11-09&add_phase=8&add_role=4&add_loc=1")
+        self.assertIn('name="delrow" value="h:8:4:1"', page)
+        gone = self.post("/timesheet/save", dict(base, action="Save draft", delrow="h:8:4:1", add="8:4:1:0"))
+        self.assertIn("Row deleted.", gone)
+        self.assertNotIn('name="h_8_4_1_0_', gone)
+        # a row with draft hours: deleting it removes the entries (audited), and saves what was typed on the other rows
+        self.post("/timesheet/save", dict(base, action="Save draft", **{"h_8_4_1_0_2026-11-10": "7", "h_8_4_1_1_2026-11-10": "2", "h_9_4_1_0_2026-11-10": "1"}))
+        self.assertEqual(self.one("select count(*) from time_entry where user_id=4 and work_date='2026-11-10'")[0], 3)
+        out = self.post("/timesheet/save", dict(base, action="Save draft", delrow="h:8:4:1", **{"h_8_4_1_0_2026-11-10": "7", "h_9_4_1_0_2026-11-11": "3"}))
+        self.assertIn("Row deleted (2 draft entries removed).", out)
+        self.assertEqual(self.hours_of(4, "2026-11-10"), [(1, 0, 1, "Draft")])                  # only the other row's hours are left
+        self.assertEqual(self.hours_of(4, "2026-11-11"), [(1, 0, 3, "Draft")])                  # typed hours on the other row were saved
+        self.assertEqual(self.one("select count(*) from time_entry_audit where action='DELETE'")[0], 2)
+        self.assertNotIn('name="h_8_4_1_0_', out)
+        # the delete button asks first when the row has hours
+        self.assertIn("confirm(", self.get("/timesheet?u=4&w=2026-11-09").split('value="h:9:4:1"')[1].split("</button>")[0])
+        # a row with submitted hours has no button, and a hand-made request is refused
+        self.post("/timesheet/save", dict(base, action="Submit week"))
+        locked = self.get("/timesheet?u=4&w=2026-11-09")
+        self.assertNotIn('name="delrow"', locked)
+        self.assertIn("is locked", self.post("/timesheet/save", dict(base, action="Save draft", delrow="h:9:4:1")))
+        self.assertEqual(self.one("select count(*) from time_entry where user_id=4 and work_date>='2026-11-09'")[0], 2)
+
+    def test_a_persons_detail_in_approvals_is_one_line_per_booking_not_per_day(self):
+        self.open_next_week()
+        self.post("/timesheet/save", dict({"u": "5", "w": "2026-11-09", "action": "Submit week"},
+                                          **{"h_1_4_1_0_2026-11-%02d" % d: "8" for d in (9, 10, 11)}))
+        page = self.get("/approvals?u=7&w=2026-11-09")
+        detail = page.split('id="d5"')[1].split("</table>")[0]
+        self.assertEqual(detail.count('name="entry_ids"'), 1)                          # three days on one CTR are one line
+        ids = re.search(r'name="entry_ids" value="([0-9,]+)"', detail).group(1).split(",")
+        self.assertEqual(len(ids), 3)
+        self.assertIn("<th>Mon 09/11</th>", detail)
+        self.assertIn("3 entries approved", self.post("/approvals/act", {"u": "7", "w": "2026-11-09", "entry_ids": ",".join(ids), "action": "Approve selected"}))
+
     def test_admin_only_pages_and_period_actions(self):
         self.assertIn("not available to your role", self.get("/admin?u=5"))
         # a far-future Monday, so it is never the current week (the current week opens by itself)
@@ -598,8 +660,10 @@ class TestApp(unittest.TestCase):
         self.assertEqual(self.hours_of(4, "2026-11-03"), [(1, 0, 6, "Draft"), (1, 1, 2, "Draft")])  # normal and overtime are separate entries
         self.assertEqual(self.hours_of(4, "2026-11-04"), [(2, 0, 4, "Draft")])                      # offshore
         page = self.get("/timesheet?u=4&w=2026-11-02")
-        # three rows, with the day lines split into normal time, overtime and total
-        self.assertEqual(page.count('class="row"'), 3)
+        # two bookings, each with a normal row and an overtime row under it (the offshore one's overtime row stays hidden), and the day lines split into normal time, overtime and total
+        self.assertEqual(page.count('class="row"'), 2)
+        self.assertEqual(page.count('class="row otrow"'), 2)
+        self.assertEqual(page.count('class="row otrow" data-ot="1" style="display:none"'), 1)
         self.assertIn('class="dn" data-day="2026-11-03"><b>6</b>', page)
         self.assertIn('class="do" data-day="2026-11-03"><b>2</b>', page)
         self.assertIn('class="dt" data-day="2026-11-03"><b>8</b>', page)
@@ -1503,24 +1567,20 @@ class TestApp(unittest.TestCase):
         con.close()
 
     def claim(self, user, ticks, w=None, action="Save draft", rows=None):
-        """Save (and optionally submit) allowance ticks: ticks is a list of (phase, allowance, date) that are ticked, rows the (phase, allowance) rows shown."""
+        """Put allowance days on a person's sheet directly (the timesheet no longer takes allowances; payroll sets them by location).
+        ticks is a list of (phase, allowance, date); they are Draft, or Submitted when action is 'Submit week'."""
         self.staff(user)
-        if w is None:  # the week the first day falls in (a submitted week is locked, so tests use weeks the person has not submitted)
-            first = (ticks or rows or [(0, 0, "2026-11-02")])[0][2]
-            w = app.monday(datetime.date.fromisoformat(first)).isoformat()
-        shown = set()
-        data = {"u": str(user), "w": w, "action": action, "arow": [], "ashown": []}
-        for ph, al, d in (rows or []):
-            shown.add((ph, al, d))
-        for ph, al, d in ticks:
-            shown.add((ph, al, d))
-        for ph, al, d in sorted(shown):
-            data["ashown"].append("%d:%d:%s" % (ph, al, d))
-            if "%d:%d" % (ph, al) not in data["arow"]:
-                data["arow"].append("%d:%d" % (ph, al))
-        for ph, al, d in ticks:
-            data["a_%d_%d_%s" % (ph, al, d)] = "1"
-        return self.post("/timesheet/save", data)
+        con = app.db()
+        try:
+            for ph, al, d in ticks:
+                scope = con.execute("select scope_id from phase where phase_id=?", (ph,)).fetchone()[0]
+                con.execute("insert into allowance_entry (user_id, scope_id, phase_id, allowance_id, work_date, status, created_by, last_edited_by, last_edited_at) "
+                            "values (?,?,?,?,?,'Draft',?,?,?)", (user, scope, ph, al, d, user, user, "x"))
+            if action == "Submit week":
+                con.execute("update allowance_entry set status='Submitted', last_edited_by=?, last_edited_at='y' where user_id=? and status='Draft'", (user, user))
+            con.commit()
+        finally:
+            con.close()
 
     def status_of_allowance(self, aid):
         return self.one("select status from allowance_entry where allowance_entry_id=?", aid)[0]
@@ -1534,53 +1594,6 @@ class TestApp(unittest.TestCase):
 
     def allowance_rows(self, user):
         return self.q_all("select phase_id, allowance_id, work_date, status from allowance_entry where user_id=? order by work_date, allowance_id", user)
-
-    def test_the_timesheet_has_an_allowances_section_and_an_add_allowance_row(self):
-        self.open_next_week()
-        self.staff(5)
-        page = self.get("/timesheet?u=5&w=2026-11-09")
-        self.assertNotIn("<b>Allowances</b>", page)          # no heading until there is a row to show
-        self.assertIn("Claim an allowance", page)
-        self.assertIn(">Offshore allowance</option>", page)
-        page = self.get("/timesheet?u=5&w=2026-11-09&aadd_phase=1&aadd_type=2")
-        self.assertIn('name="a_1_2_2026-11-11"', page)               # a Per Diem row against BB0001 Define, a box per day
-        self.assertIn('<th class="bkh">Allowance</th>', page)
-        # an unsaved row stays when another row is added
-        page = self.get("/timesheet?u=5&w=2026-11-09&aadd_phase=1&aadd_type=2&add_phase=1&add_role=4&add_loc=1&aadd=1:1")
-        self.assertIn('name="a_1_1_2026-11-11"', page)
-
-    def test_allowance_days_are_saved_cleared_and_submitted_with_the_week(self):
-        self.open_next_week()
-        page = self.claim(5, [(1, 2, "2026-11-12"), (1, 2, "2026-11-13"), (1, 3, "2026-11-13")])
-        self.assertIn("3 allowance days saved", page)
-        self.assertEqual(self.allowance_rows(5), [(1, 2, "2026-11-12", "Draft"), (1, 2, "2026-11-13", "Draft"), (1, 3, "2026-11-13", "Draft")])
-        self.assertIn('name="a_1_2_2026-11-12" value="1" checked', self.get("/timesheet?u=5&w=2026-11-09"))
-        # untick one: it is cleared
-        page = self.claim(5, [(1, 2, "2026-11-12"), (1, 3, "2026-11-13")], rows=[(1, 2, "2026-11-13")])
-        self.assertIn("1 allowance day cleared", page)
-        self.assertEqual(self.allowance_rows(5), [(1, 2, "2026-11-12", "Draft"), (1, 3, "2026-11-13", "Draft")])
-        # submit the week: the allowances go with it and are locked
-        page = self.claim(5, [(1, 2, "2026-11-12"), (1, 3, "2026-11-13")], action="Submit week")
-        self.assertIn("2 allowance days submitted for approval", page)
-        self.assertEqual({r[3] for r in self.allowance_rows(5)}, {"Submitted"})
-        locked = self.get("/timesheet?u=5&w=2026-11-09")
-        self.assertNotIn('name="a_1_2_2026-11-12"', locked)
-        self.assertIn("&#10003;", locked)
-        self.assertIn("so are submitted and approved allowances", locked)
-        # a hand-made request to untick a locked day changes nothing
-        self.claim(5, [], rows=[(1, 2, "2026-11-12")])
-        self.assertEqual(len(self.allowance_rows(5)), 2)
-
-    def test_the_booking_rules_are_reported_on_screen(self):
-        self.open_next_week()
-        self.assertIn("not on the client", self.claim(4, [(1, 2, "2026-11-12")]))                                 # David Hart is not on Apache's list
-        self.assertIn("period is not open", self.claim(4, [(8, 2, "2026-10-30")], w="2026-10-26"))
-        self.assertEqual(self.allowance_rows(4), [])
-        # one of each allowance a day: a second booking code the same day is refused
-        self.claim(5, [(1, 2, "2026-11-12")])
-        page = self.claim(5, [(1, 2, "2026-11-12"), (2, 2, "2026-11-12")])
-        self.assertIn("already claimed", page)
-        self.assertEqual(self.allowance_rows(5), [(1, 2, "2026-11-12", "Draft")])
 
     def test_the_approver_approves_or_sends_back_allowances_with_the_hours(self):
         self.open_next_week()
@@ -1630,7 +1643,6 @@ class TestApp(unittest.TestCase):
         page = self.post("/reopen/act", {"u": "29", "person": "5", "w": "2026-11-09", "reason": "Wrong night"})
         self.assertIn("with 1 allowance day", page)
         self.assertEqual(self.allowance_rows(5), [(1, 2, "2026-11-12", "Draft")])
-        self.assertIn('name="a_1_2_2026-11-12" value="1" checked', self.get("/timesheet?u=5&w=2026-11-09"))
 
     def test_allowances_appear_in_the_reports_and_the_audit_trail(self):
         self.open_next_week()
@@ -1661,13 +1673,12 @@ class TestApp(unittest.TestCase):
                                              "add_phase": "8", "add_role": "4", "add_loc": "1"})
         self.assertEqual(self.one("select hours from time_entry where user_id=5 and work_date='2026-11-10' and phase_id=1")[0], 6)   # saved, not lost
         self.assertIn('name="h_8_4_1_0_2026-11-10"', page)                                                                           # and the new empty row is there
-        page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Add allowance row", "h_1_4_1_0_2026-11-11": "3",
-                                             "aadd_phase": "1", "aadd_type": "2"})
-        self.assertIn('name="a_1_2_2026-11-11"', page)
+        page = self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Save draft", "h_1_4_1_0_2026-11-11": "3"})
+        self.assertNotIn("llowance", page.split("My Timesheet")[-1].split("<form")[-1])                                          # no allowance claims on the sheet
         self.assertEqual(self.one("select hours from time_entry where user_id=5 and work_date='2026-11-11'")[0], 3)
         # the controls sit under the grid's own form, so they travel with it
         self.assertIn('<form id="tsform" method="post" action="/timesheet/save">', page)
-        self.assertIn('<select form="tsform" name="add_phase">', page)
+        self.assertIn('<select form="tsform" name="add_phase" id="addphase" size="8">', page)
         self.assertIn('<input form="tsform" type="submit" name="action" value="Add row">', page)
 
     def test_the_timesheet_shows_the_week_status_a_this_week_link_and_a_date_picker(self):

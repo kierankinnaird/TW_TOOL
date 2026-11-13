@@ -15,7 +15,7 @@ import sys
 from flask import Flask, Response, request
 from urllib.parse import parse_qs
 from werkzeug.serving import make_server as make_wsgi_server
-from nmc.core import ASSETS, REQUIRED_SCHEMA, db, ensure_current_period, monday, no_access, parse_adds, parse_pairs, permission_of
+from nmc.core import ASSETS, REQUIRED_SCHEMA, db, ensure_current_period, monday, no_access, parse_adds, permission_of
 from nmc.timesheet import copy_week, save_timesheet, view_timesheet
 from nmc.approvals import act_approval, reopen_week, view_approvals, view_missing, view_reopen
 from nmc.reports import (
@@ -138,10 +138,7 @@ def timesheet_page(con):
     adds = parse_adds(q.get("add", []))
     if "add_phase" in q and "add_role" in q:
         adds += parse_adds(["%s:%s:%s:%s" % (q["add_phase"][0], q["add_role"][0], q.get("add_loc", ["1"])[0], "1" if "add_ot" in q else "0")])
-    aadds = parse_pairs(q.get("aadd", []))
-    if "aadd_phase" in q and "aadd_type" in q:
-        aadds += parse_pairs(["%s:%s" % (q["aadd_phase"][0], q["aadd_type"][0])])
-    return html_response(view_timesheet(con, u, w, adds=adds, aadds=list(dict.fromkeys(aadds))))
+    return html_response(view_timesheet(con, u, w, adds=adds))
 
 
 page("/approvals")(lambda con, u, q: view_approvals(con, u, q=q))
