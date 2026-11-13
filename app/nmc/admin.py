@@ -1,6 +1,7 @@
 """Admin tabs (periods, users, roles, clients, rates, PAAFs, scopes, internal codes, locations, allowance rates, budgets) and the audit trail."""
 import csv
 import datetime
+import re
 import sqlite3
 from urllib.parse import quote
 from nmc.core import (
@@ -239,10 +240,13 @@ def admin_body(con, u, t, q=None):
                                      "order by at.allowance_id, ar.effective_from desc")]
         b.append("<h4>Every rate, newest first</h4>" + table(["Allowance", "Per day", "From"], hist))
     elif t == "budgets":
-        b.append("<p><small>Budget hours per CTR come from P6, which holds hours only. Paste the export below: one CTR per line, the CTR No then the budget hours "
-                 "(comma or tab separated; a heading line is ignored). Each load is saved as a snapshot with its as-of date and never edited, so earlier budgets are kept; "
-                 "the latest is compared with the approved hours booked here on the Reports page and each CTR's page. A CTR whose budget has not changed is left alone.</small></p>")
-        b.append('<form method="post" action="/admin/budgets">%s<p>As of %s</p><p><textarea name="data" rows="8" cols="60" placeholder="BB0001-PM-D-001,160"></textarea></p>'
+        b.append("<p><small>Budget hours per CTR come from P6, which holds hours only. Paste either (1) a P6 export copied from SSMS or saved as CSV, with the columns "
+                 "<b>project, WBS name, activity code, budget hours, actual hours, remaining hours, % complete</b> (the CTR No is read from the end of the WBS name, "
+                 "for example <i>Process Engineering - A0101-PR-D-001</i>; you see a preview and choose the P6 project before anything is loaded), or (2) one CTR per line: "
+                 "the CTR No then the budget hours. Comma or tab separated; a heading line is ignored. Each load is saved as a snapshot with its as-of date and never edited, "
+                 "so earlier budgets are kept; the latest is compared with the approved hours booked here on the Reports page, the dashboard and each CTR's page. "
+                 "A CTR whose figures have not changed is left alone.</small></p>")
+        b.append('<form method="post" action="/admin/budgets">%s<p>As of %s</p><p><textarea name="data" rows="8" cols="80" placeholder="BB0001-PM-D-001,160"></textarea></p>'
                  '<input type="submit" value="Load budgets"></form>' % (hidden(u=u), date_input("as_of", datetime.date.today().isoformat())))
         rows = [[r["phase"], r["client"], fmt(r["budget_hours"]), r["as_of"], fmt(r["actual_hours"])]
                 for r in con.execute("select * from v_ctr_budget where budget_hours is not null order by phase")]
@@ -651,6 +655,107 @@ def act_paaf(con, form):
         return view_admin(con, u, "paafs", [str(e)], q=q)
 
 
+P6_CTR_RE = re.compile(r"([A-Z]{1,3}\d{3,5}-[A-Z]{2,3}-[A-Z]{1,3}-\d{3})\s*$", re.I)
+
+
+def _cells(line):
+    return [c.strip() for c in next(csv.reader([line], delimiter="\t" if "\t" in line else ","))]
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def p6_format(data):
+    """True when the pasted text is a P6 export (seven or more columns) and not the simple 'CTR No, hours' lines."""
+    for line in data.replace("\r", "").split("\n"):
+        if line.strip():
+            return len(_cells(line)) >= 7
+    return False
+
+
+def p6_parse(data):
+    """Rows of a P6 export: project, WBS name, activity code, budget, actual, remaining, % complete, and the CTR No read from the end of the WBS name."""
+    rows, bad = [], []
+    lines = [x for x in data.replace("\r", "").split("\n") if x.strip()]
+    for n, line in enumerate(lines, 1):
+        c = _cells(line)
+        budget = _num(c[3]) if len(c) >= 7 else None
+        if budget is None or budget < 0:
+            if n > 1:
+                bad.append("line %d" % n)
+            continue  # (the first line is a heading)
+        m = P6_CTR_RE.search(c[1])
+        rows.append({"project": c[0], "wbs": c[1], "code": c[2], "budget": budget, "actual": _num(c[4]), "remaining": _num(c[5]), "pct": _num(c[6]),
+                     "ctr": m.group(1).upper() if m else None})
+    return rows, bad
+
+
+def p6_budgets(con, u, form, data, as_of):
+    """A P6 export: a preview of what would be loaded for one P6 project (and nothing written), then the load itself once confirmed."""
+    rows, bad = p6_parse(data)
+    if not rows:
+        raise ValueError("No rows were found in that export. The columns are: project, WBS name, activity code, budget hours, actual hours, remaining hours, % complete.")
+    projects = list(dict.fromkeys(r["project"] for r in rows))
+    chosen = form.get("p6_project", [""])[0]
+    chosen = chosen if chosen in projects else projects[0]
+    mine = [r for r in rows if r["project"] == chosen]
+    ctrs = {r["no"].upper(): r["phase_id"] for r in con.execute(
+        "select ph.phase_id, s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name)) as no from phase ph join scope s on s.scope_id=ph.scope_id "
+        "join client c on c.client_id=s.client_id where c.is_internal=0")}
+    times = {}
+    for r in mine:
+        if r["ctr"]:
+            times[r["ctr"]] = times.get(r["ctr"], 0) + 1
+    for r in mine:
+        r["phase_id"] = None
+        if not r["ctr"]:
+            r["result"], r["act"] = "No CTR No at the end of the WBS name", "skip"
+        elif times[r["ctr"]] > 1:
+            r["result"], r["act"] = "CTR No appears %d times in this project: not loaded" % times[r["ctr"]], "skip"
+        elif r["ctr"] not in ctrs:
+            r["result"], r["act"] = "Not a CTR in this system", "skip"
+        else:
+            r["phase_id"] = ctrs[r["ctr"]]
+            cur = con.execute("select hours, as_of, p6_actual_hours, percent_complete from ctr_budget where phase_id=? order by as_of desc limit 1", (r["phase_id"],)).fetchone()
+            same = lambda a, b: (a is None and b is None) or (a is not None and b is not None and abs(a - b) < 1e-6)
+            if cur and same(cur["hours"], r["budget"]) and same(cur["p6_actual_hours"], r["actual"]) and same(cur["percent_complete"], r["pct"]):
+                r["result"], r["act"] = "Unchanged", "same"
+            elif cur and cur["as_of"] >= as_of:
+                r["result"], r["act"] = "A budget as of %s is already held: use a later date" % cur["as_of"], "skip"
+            else:
+                r["result"], r["act"] = ("New" if not cur else "Changed (budget was %s hrs)" % fmt(cur["hours"])), "load"
+    to_load = [r for r in mine if r["act"] == "load"]
+    if "confirm" in form:
+        for r in to_load:
+            con.execute("insert into ctr_budget (phase_id, hours, as_of, p6_actual_hours, percent_complete, p6_project, loaded_by) values (?,?,?,?,?,?,?)",
+                        (r["phase_id"], r["budget"], as_of, r["actual"], r["pct"], chosen, u))
+        con.commit()
+        skipped = sum(1 for r in mine if r["act"] == "skip")
+        return view_admin(con, u, "budgets", ["%d budget%s loaded from P6 project %s, as of %s. %d unchanged, %d not loaded." % (
+            len(to_load), "" if len(to_load) == 1 else "s", chosen, as_of, sum(1 for r in mine if r["act"] == "same"), skipped)], ok=True)
+    body = ['<p><a href="/admin?u=%d&amp;t=budgets">&lt;&lt; Back to Budgets</a></p>' % u,
+            "<p><b>Preview: nothing has been loaded yet.</b> P6 project <b>%s</b>, as of %s. %d of its %d rows would be loaded, %d are unchanged and %d would not be loaded.</p>" % (
+                esc(chosen), esc(as_of), len(to_load), len(mine), sum(1 for r in mine if r["act"] == "same"), sum(1 for r in mine if r["act"] == "skip"))]
+    if bad:
+        body.append("<p><small>Lines that could not be read and are ignored: %s.</small></p>" % esc(", ".join(bad)))
+    trs = ["<tr><th>WBS name</th><th>CTR No</th><th>Budget hrs</th><th>P6 actual hrs</th><th>% complete</th><th>Result</th></tr>"]
+    for r in mine:
+        trs.append('<tr><td>%s</td><td>%s</td><td align="right">%s</td><td align="right">%s</td><td align="right">%s</td><td>%s</td></tr>' % (
+            esc(r["wbs"]), esc(r["ctr"] or ""), fmt(r["budget"]), fmt(r["actual"]), fmt(r["pct"]), esc(r["result"])))
+    body.append('<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(trs))
+    body.append('<form method="post" action="/admin/budgets">%s<input type="hidden" name="as_of" value="%s"><textarea name="data" style="display:none">%s</textarea>'
+                "<p>P6 project %s <input type=\"submit\" value=\"Update preview\"> <small>(the same file can hold several P6 projects, such as a baseline and a later version: "
+                "choose the one to load)</small></p>%s</form>" % (
+                    hidden(u=u), esc(as_of), esc(data), sel("p6_project", [(p, p) for p in projects], chosen),
+                    ('<p><input type="submit" name="confirm" value="Load %d budget%s from %s"></p>' % (len(to_load), "" if len(to_load) == 1 else "s", esc(chosen)))
+                    if to_load else "<p>Nothing to load for this project.</p>"))
+    return layout(con, u, "Admin", "".join(body))
+
+
 def act_budgets(con, form):
     u = int(form["u"][0])
     if not can_use_tab(con, u, "budgets"):
@@ -661,6 +766,8 @@ def act_budgets(con, form):
         lines = [x for x in data.replace("\r", "").split("\n") if x.strip()]
         if not lines:
             raise ValueError("Paste at least one line: CTR No, budget hours.")
+        if p6_format(data):
+            return p6_budgets(con, u, form, data, as_of)
         ctrs = {r["no"].upper(): r["phase_id"] for r in con.execute(
             "select ph.phase_id, s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name)) as no from phase ph join scope s on s.scope_id=ph.scope_id "
             "join client c on c.client_id=s.client_id where c.is_internal=0")}

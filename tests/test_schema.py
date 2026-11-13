@@ -585,6 +585,18 @@ class TestCtrBudgets(Base):
         self.assertEqual(self.scalar("select count(*) from v_ctr_budget where client='Internal'"), 0)    # internal codes have no budgets
 
 
+class TestBuildExtras(unittest.TestCase):
+    def test_extra_sql_is_applied_after_the_seed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            extra = os.path.join(d, "extra.sql")
+            with open(extra, "w", encoding="utf-8") as f:
+                f.write("INSERT INTO scope (scope_code, client_id, project_id, description, status) VALUES ('X9999', 2, 3, 'Local scope', 'Open');")
+            con = build(None, extra=[extra])
+            self.assertEqual(con.execute("select count(*) from scope where scope_code='X9999'").fetchone()[0], 1)
+            self.assertEqual(build(None).execute("select count(*) from scope where scope_code='X9999'").fetchone()[0], 0)
+
+
 class TestRatesAreAppendOnly(Base):
     """FR-12: a rate is never edited; a new row with a later effective date takes over."""
     def test_a_rate_cannot_be_edited_or_deleted(self):

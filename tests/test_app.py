@@ -2068,6 +2068,51 @@ class TestApp(unittest.TestCase):
         # a nonsense value is ignored, not an error
         self.assertIn("A1500-PM-D-001: budget", self.get(base + "&client=abc&show=zzz&from=nope"))
 
+    P6_SAMPLE = "\n".join([
+        "project\twbs_name\ttask_code\tbudget_hours\tactual_hours\tremaining_hours\tphys_complete_pct",
+        "PROJ-A\tProject Management (Direct) - A1500-PM-D-001\tX-1\t300.000000\t120.500000\t179.500000\t40.17",
+        "PROJ-A\tFuture Scope Estimate\tZ-1\t9999\t0\t9999\t0",
+        "PROJ-A\tNMC-A0101 - Spirit - Technical Safety Engineering\tZ-2\t264\t68\t196\t0",
+        "PROJ-A\tSomething - Z9999-PR-D-001\tZ-3\t50\t0\t50\t0",
+        "PROJ-A\tPlanning (Direct) - BB0002-PM-D-001\tD-1\t100\t10\t90\t10",
+        "PROJ-A\tPlanning (Core) - BB0002-PM-D-001\tD-2\t20\t0\t20\t0",
+        "PROJ-B\tProject Management (Direct) - A1500-PM-D-001\tX-1\t800\t1\t799\t1",
+    ])
+
+    def test_a_p6_export_is_previewed_and_then_loaded_for_the_chosen_project(self):
+        before = self.one("select count(*) from ctr_budget")[0]
+        data = {"u": "29", "as_of": "2026-11-13", "data": self.P6_SAMPLE}
+        page = self.admin_post("/admin/budgets", data, u="29")
+        self.assertIn("Preview: nothing has been loaded yet", page)
+        self.assertEqual(self.one("select count(*) from ctr_budget")[0], before)                    # a preview writes nothing
+        self.assertIn("A1500-PM-D-001", page)
+        self.assertIn("Not a CTR in this system", page)                                             # Z9999
+        self.assertIn("No CTR No at the end of the WBS name", page)                                # 'Future Scope Estimate' and the NMC-A0101 line
+        self.assertIn("appears 2 times in this project: not loaded", page)                         # a duplicated CTR No is flagged, never added up
+        self.assertIn("Load 1 budget from PROJ-A", page)
+        self.assertIn(">PROJ-B</option>", page)
+        # the other P6 project can be previewed
+        other = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-B"), u="29")
+        self.assertIn("Load 1 budget from PROJ-B", other)
+        # confirm the first project
+        out = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-A", confirm="1"), u="29")
+        self.assertIn("1 budget loaded from P6 project PROJ-A, as of 2026-11-13. 0 unchanged, 5 not loaded.", out)
+        row = self.one("select hours, p6_actual_hours, percent_complete, p6_project, as_of from ctr_budget where phase_id=6 order by as_of desc limit 1")
+        self.assertEqual(tuple(row), (300, 120.5, 40.17, "PROJ-A", "2026-11-13"))
+        self.assertEqual(self.one("select count(*) from ctr_budget where phase_id=3 and as_of='2026-11-13'")[0], 0)   # BB0002 (duplicated) was not loaded
+        self.assertIn("Budget 300 hrs", self.get("/ctr?u=29&phase=6"))
+        # loading the same figures again changes nothing; a different figure needs a later date
+        again = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-A"), u="29")
+        self.assertIn("Unchanged", again)
+        self.assertIn("Nothing to load for this project", again)
+        clash = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-B"), u="29")
+        self.assertIn("already held: use a later date", clash)
+        # only cost controllers can use it
+        self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-B", confirm="1", u="5"), u="5")
+        self.assertEqual(self.one("select hours from ctr_budget where phase_id=6 order by as_of desc limit 1")[0], 300)
+        # an export with no rows is explained
+        self.assertIn("No rows were found", self.admin_post("/admin/budgets", {"u": "29", "as_of": "2026-11-13", "data": "a\tb\tc\td\te\tf\tg\n"}, u="29"))
+
     def test_ctr_page(self):
         con = sqlite3.connect(core.DB_PATH)
         con.row_factory = sqlite3.Row

@@ -2,7 +2,7 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 17;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+PRAGMA user_version = 18;  -- 2: a cost controller approves the hours a scope approver books to their own scope
                           -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
                           -- 4: every entry has a location (On site / Offshore / Standard) and an overtime flag
                           -- 5: a cost controller can reopen submitted or approved hours (reopen_reason)
@@ -15,6 +15,7 @@ PRAGMA user_version = 17;  -- 2: a cost controller approves the hours a scope ap
                           -- 11: a person cannot book more than 24 hours in one day across all rows
                           -- 12: allowances are for staff only, and are valued from an append-only rate table (by allowance, location and overtime)
                           -- 13: approvers are a main approver per client plus secondary approvers per scope; the phase is the CTR (booking code)
+                          -- 18: a budget snapshot can carry P6's actual hours and % complete (from the P6 export)
                           -- 17: budget hours per CTR (from P6), compared with the approved hours booked here
                           -- 16: a line manager on each user; a PAAF is simply the client's list of people (active as soon as it is added, no sign-off)
                           -- 15: one offshore allowance at one rate (no location or overtime matrix); default locations On Shore / Offshore / Site visit
@@ -657,6 +658,9 @@ CREATE TABLE ctr_budget (
     phase_id  INTEGER NOT NULL REFERENCES phase(phase_id),
     hours     NUMERIC NOT NULL CHECK (hours >= 0),
     as_of     TEXT NOT NULL,
+    p6_actual_hours  NUMERIC,   -- P6's own actual hours and physical % complete on that date, when loaded from a P6 export
+    percent_complete NUMERIC,
+    p6_project       TEXT,      -- the P6 project the figures came from
     loaded_by INTEGER REFERENCES app_user(user_id),
     loaded_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (phase_id, as_of)

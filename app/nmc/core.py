@@ -12,7 +12,7 @@ DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
 
 
 # Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
-REQUIRED_SCHEMA = 17
+REQUIRED_SCHEMA = 18
 
 
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
