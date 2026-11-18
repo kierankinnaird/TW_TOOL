@@ -156,14 +156,14 @@ class TestApp(unittest.TestCase):
         self.assertNotIn('name="action" value="Add row"', page)
         self.assertIn("is locked", self.post("/timesheet/save", {"u": "22", "w": "2026-11-09", "action": "Save draft", key.replace("10", "11"): "4"}))
         self.assertEqual(self.one("select count(*) from time_entry where user_id=22 and work_date='2026-11-11'")[0], 0)
-    def test_closed_week_blocks_new_hours_and_a_person_not_on_the_clients_list_cannot_book(self):
+    def test_closed_week_blocks_new_hours_and_anyone_can_book_to_a_client_code(self):
         self.open_next_week()
         page = self.post("/timesheet/save", {"u": "4", "w": "2026-10-26", "action": "Save draft",
                                              "h_8_4_1_0_2026-10-30": "8", "reason": ""})
         self.assertIn("period is not open", page)
         page = self.post("/timesheet/save", {"u": "4", "w": "2026-11-09", "action": "Save draft",
                                              "h_1_4_1_0_2026-11-13": "8", "reason": ""})
-        self.assertIn("not on this client", page)
+        self.assertIn("1 entry saved", page)  # David Hart is on no client's list, but anyone can book to any open code
 
     def test_clear_draft_entry_but_not_approved_or_submitted(self):
         self.open_next_week()
@@ -367,11 +367,10 @@ class TestApp(unittest.TestCase):
 
 
     # ---------- internal hours, automatic periods, live totals ----------
-    def test_internal_hours_booked_without_a_paaf_and_reported_separately(self):
-        # David Hart (4) has no approved PAAF for any client, but can still book to INT01 Business Services (phase 8)
+    def test_internal_hours_booked_with_no_rate_and_reported_separately(self):
+        # David Hart (4) can book to INT01 Business Services (phase 8) alongside the client codes
         page = self.get("/timesheet?u=4&w=2026-11-02")
         self.assertIn("Internal - Business Services", page)
-        self.assertNotIn("Apache &gt;", page)
         page = self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "h_8_4_1_0_2026-11-04": "3.5", "reason": ""})
         self.assertIn("1 entry saved", page)
         self.assertEqual(tuple(self.one("select paaf_id, rate_id, status from time_entry where user_id=4 and work_date='2026-11-04'")),
@@ -581,7 +580,7 @@ class TestApp(unittest.TestCase):
     def test_an_approver_sees_only_their_own_people(self):
         _, kenneth = self.missing(8, w="2026-11-02", s="all")   # Spirit
         _, alisdair = self.missing(7, w="2026-11-02", s="all")  # Apache
-        # Spirit PAAF holders are Kenneth's people, Apache PAAF holders are Alisdair's; neither sees themselves
+        # people who book to Spirit scopes are Kenneth's, people who book to Apache scopes are Alisdair's; neither sees themselves
         self.assertIn("Ajin Sabu", kenneth)
         self.assertIn("Gary Bridge", kenneth)        # Spirit only
         self.assertNotIn("Gary Bridge", alisdair)
@@ -589,7 +588,7 @@ class TestApp(unittest.TestCase):
         self.assertNotIn("Ewan Shaw", kenneth)
         self.assertNotIn("Kenneth Nicolson", kenneth)
         self.assertNotIn("Alisdair Woodhead", alisdair)
-        # David Hart is on no client's list, so he is in neither list until he books to an internal code
+        # David Hart has booked to no client scope, so he is in neither list until he books to an internal code
         self.assertNotIn("David Hart", alisdair)
         self.assertNotIn("David Hart", kenneth)
         self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "h_8_4_1_0_2026-11-04": "2", "reason": ""})  # INT01: Alisdair's code
@@ -634,7 +633,7 @@ class TestApp(unittest.TestCase):
         self.admin_post("/admin/save", {"t": "internal", "id": str(fid), "description": "Facilities", "status": "Open", "secondary": "6"})   # Jamie is its secondary approver
         page = self.get("/missing?u=6&w=2026-11-09")
         self.assertIn("Nobody is expected", page)
-        self.assertIn("personnel list of a client you approve", page)
+        self.assertIn("booked to your scopes", page)
         # once someone books to her internal code, that person is hers
         code = self.one("select s.scope_id, ph.phase_id from scope s join phase ph on ph.scope_id=s.scope_id where s.description='Facilities'")
         self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Save draft", "h_%d_4_1_0_2026-11-11" % code[1]: "1", "reason": ""})
@@ -799,12 +798,12 @@ class TestApp(unittest.TestCase):
 
     def test_copy_says_what_it_could_not_copy(self):
         con = app.db()
-        con.execute("update paaf set expiry_date='2026-10-31' where user_id=24 and client_id=1")  # Rob's Apache PAAF ends before 4 Nov
+        con.execute("update app_user set end_date='2026-10-31' where user_id=24")  # Rob leaves before 4 Nov
         con.commit()
         con.close()
         page = self.post("/timesheet/copy", {"u": "24", "w": "2026-11-02", "copy_hours": "x"})
         self.assertIn("1 entry could not be copied", page)
-        self.assertIn("PAAF has expired", page)
+        self.assertIn("not active on that date", page)
         self.assertEqual(self.hours_of(24, "2026-11-04"), [])
 
     def test_nothing_to_copy_and_no_buttons_when_copying_is_not_possible(self):
@@ -1025,20 +1024,17 @@ class TestApp(unittest.TestCase):
         self.assertNotIn("h_8_6_1_0_2026-11-03", page)
         self.assertIn("h_8_6_1_0_2026-11-05", page)
 
-    def test_client_hours_cannot_be_booked_after_the_paaf_expires(self):
-        # David Hart is added to Apache's list, until Wednesday 4 Nov.
+    def test_a_paaf_end_date_does_not_stop_booking(self):
+        # David Hart is added to Apache's list, until Wednesday 4 Nov. The list is only what goes to the client: booking is not limited by it.
         self.assertIn("Person added", self.admin_post("/admin/add", {"t": "paafs", "user_id": "4", "client_id": "1"}))
         pid = self.one("select paaf_id from paaf where user_id=4 and client_id=1")[0]
         self.assertIn("now ends on", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Save end date", "expiry_date": "2026-11-04"}))
         self.assertIn("Apache &gt; Wellbay Decommissioning", self.get("/timesheet?u=4&w=2026-11-02"))      # valid for part of that week
-        self.assertNotIn("Apache &gt;", self.get("/timesheet?u=4&w=2026-11-09"))                           # expired before this one starts
+        self.assertIn("Apache &gt; Wellbay Decommissioning", self.get("/timesheet?u=4&w=2026-11-09"))      # still offered after the end date
         self.assertIn("1 entry saved", self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft",
                                                                     "h_1_4_1_0_2026-11-03": "4", "reason": ""}))
-        late = self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "h_1_4_1_0_2026-11-05": "4", "reason": ""})
-        self.assertIn("PAAF has expired", late)
-        # internal hours do not depend on the PAAF
         self.assertIn("1 entry saved", self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft",
-                                                                    "h_8_4_1_0_2026-11-05": "2", "reason": ""}))
+                                                                    "h_1_4_1_0_2026-11-05": "4", "reason": ""}))
 
     # ---------- approvers book time too; a cost controller approves it ----------
     def test_an_approver_can_book_to_their_own_scope_and_a_cost_controller_approves_it(self):
@@ -1242,24 +1238,21 @@ class TestApp(unittest.TestCase):
                                        "permission": "user", "start_date": "2026-11-01", "end_date": ""})
         uid = self.one("select user_id from app_user where nmc_id='A901'")[0]
         book = {"u": str(uid), "w": "2026-11-02", "action": "Save draft", "h_1_6_1_0_2026-11-06": "4", "reason": ""}
-        self.assertIn("not on this client", self.post("/timesheet/save", book))                      # not on Apache's list yet
         self.assertIn("Person added to the client", self.admin_post("/admin/add", {"t": "paafs", "user_id": str(uid), "client_id": "1"}))
-        # the rate was resolved from the person's role (Cost Engineer on Apache), and there is no sign-off: the entry is active at once
-        self.assertEqual(self.one("select rt.sales_rate from paaf p join rate rt on rt.rate_id=p.rate_id where p.user_id=?", uid)[0], 85.5)
+        # there is no sign-off: the entry is active at once
         self.assertEqual(self.one("select status from paaf where user_id=?", uid)[0], "Approved")
         self.assertIn("already on this client", self.admin_post("/admin/add", {"t": "paafs", "user_id": str(uid), "client_id": "1"}))
+        # booking never depended on the list: the hours are priced at the client's rate for their skill code (Cost Engineer on Apache)
         self.assertIn("1 entry saved", self.post("/timesheet/save", book))
+        self.assertEqual(self.one("select rt.sales_rate from time_entry t join rate rt on rt.rate_id=t.rate_id where t.user_id=?", uid)[0], 85.5)
 
-    def test_the_list_shows_who_is_on_it_and_the_rate_and_end_date_can_be_changed(self):
+    def test_the_list_shows_who_is_on_it_and_the_end_date_can_be_changed(self):
         page = self.get("/admin?u=29&t=paafs")
         self.assertIn("None of our clients approve individuals", page)
         self.assertNotIn("Mark sent", page)
         self.assertNotIn("Reject", page)
         pid = self.one("select paaf_id from paaf where user_id=5 and client_id=1")[0]
-        other = self.one("select rate_id from rate where client_id=1 and rate_id<>(select rate_id from paaf where paaf_id=?) limit 1", pid)[0]
-        self.assertIn("now uses the chosen rate", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Change rate", "rate_id": str(other)}))
-        self.assertEqual(self.one("select rate_id from paaf where paaf_id=?", pid)[0], other)
-        self.assertIn("Choose one of this client", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Change rate", "rate_id": "999"}))
+        self.assertNotIn("Change rate", page)  # a position / rate is no longer set on the list
         self.assertIn("now ends on 2026-11-04", self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Save end date", "expiry_date": "2026-11-04"}))
         self.assertIn("Ended 2026-11-04", self.get("/admin?u=29&t=paafs&f_status=ended"))
         self.assertIn("Nobody matches", self.get("/admin?u=29&t=paafs&f_status=current&f_client=1&f_person=5"))
@@ -1696,13 +1689,11 @@ class TestApp(unittest.TestCase):
         self.assertIn("Nothing to submit", page)
         self.assertNotIn("0 entries submitted", page)
 
-    def test_an_ended_assignment_is_explained_on_the_timesheet(self):
+    def test_the_timesheet_says_nothing_about_a_clients_list(self):
         self.admin_post("/admin/add", {"t": "paafs", "user_id": "4", "client_id": "1"})
         pid = self.one("select paaf_id from paaf where user_id=4 and client_id=1")[0]
         self.admin_post("/admin/paaf", {"paaf_id": str(pid), "action": "Save end date", "expiry_date": "2026-10-30"})
-        page = self.get("/timesheet?u=4&w=2026-11-02")
-        self.assertIn("Apache:</b> you came off this client's list on 30/10/2026", page)
-        self.assertNotIn("you came off this client's list", self.get("/timesheet?u=5&w=2026-11-02"))   # Ewan Shaw is still on it
+        self.assertNotIn("you came off this client's list", self.get("/timesheet?u=4&w=2026-11-02"))
 
     def test_the_it_admin_account_is_not_expected_to_submit_a_timesheet(self):
         page = self.get("/missing?u=29&w=2026-11-02&s=all")
@@ -1838,6 +1829,31 @@ class TestApp(unittest.TestCase):
         # the client's framework reference
         self.assertIn("Saved", self.admin_post("/admin/save", {"t": "clients", "id": "1", "approver_user_id": "7", "framework_ref": "APA-77 Master Agreement"}, u="1"))
         self.assertIn("APA-77 Master Agreement", self.get("/ctr?u=29&phase=2"))
+
+    def test_a_ctr_can_be_non_reimbursable_or_a_lump_sum_tracked_against_its_value(self):
+        base = {"t": "phases", "id": "1", "name": "Define", "status": "Open", "restricted": "0", "ctr_code": "PM-D-001"}
+        # created with its payment terms
+        self.assertIn("CTR added", self.admin_post("/admin/add", {"t": "phases", "scope_id": "1", "name": "Fixed price", "payment_terms": "Lump Sum", "lump_sum_value": "12,500"}, u="1"))
+        self.assertEqual(tuple(self.one("select payment_terms, lump_sum_value from phase where name='Fixed price'")), ("Lump Sum", 12500))
+        self.assertIn("CTR added", self.admin_post("/admin/add", {"t": "phases", "scope_id": "1", "name": "Free", "payment_terms": "Non-reimbursable"}, u="1"))
+        self.assertEqual(tuple(self.one("select payment_terms, lump_sum_value from phase where name='Free'")), ("Non-reimbursable", None))
+        self.assertIn("must be a number", self.admin_post("/admin/add", {"t": "phases", "scope_id": "1", "name": "Bad", "payment_terms": "Lump Sum", "lump_sum_value": "lots"}, u="1"))
+        # the share of the lump sum used is worked out on the sheet from the approved hours, and is not stored
+        self.assertIn("Saved", self.admin_post("/admin/save", dict(base, payment_terms="Lump Sum", lump_sum_value="10000"), u="1"))
+        page = self.get("/ctr?u=29&phase=1")
+        self.assertIn("Lump Sum [X]", page)
+        self.assertIn("<b>Lump sum 10000.00</b>", page)
+        self.assertRegex(page, r"used \d+%")
+        # an empty value is allowed until it is agreed
+        self.assertIn("Saved", self.admin_post("/admin/save", dict(base, payment_terms="Lump Sum", lump_sum_value=""), u="1"))
+        self.assertIn("no value has been agreed yet", self.get("/ctr?u=29&phase=1"))
+        # only a lump sum carries a value
+        self.assertIn("Saved", self.admin_post("/admin/save", dict(base, payment_terms="Budget", lump_sum_value="500"), u="1"))
+        self.assertIsNone(self.one("select lump_sum_value from phase where phase_id=1")[0])
+        self.assertIn("Saved", self.admin_post("/admin/save", dict(base, payment_terms="Non-reimbursable"), u="1"))
+        page = self.get("/ctr?u=29&phase=1")
+        self.assertIn("Non-reimbursable [X]", page)
+        self.assertIn("left out of billing extracts", page)
 
     def test_the_sheets_additions_are_the_approved_offshore_allowance_at_its_rate(self):
         self.open_next_week()
@@ -1995,7 +2011,8 @@ class TestApp(unittest.TestCase):
 
     def test_budget_hours_from_p6_are_loaded_and_compared_with_the_approved_hours(self):
         self.assertIn("not available to your role", self.get("/admin?u=5&t=budgets"))
-        page = self.get("/admin?u=29&t=budgets")
+        self.assertIn("not available to your role", self.get("/admin?u=29&t=budgets"))   # P6 is parked for v1: the IT admin only
+        page = self.get("/admin?u=30&t=budgets")
         self.assertIn("P6, which holds hours only", page)
         self.assertIn("BB0001-PM-D-001", page)                                     # the seeded budgets are listed
         # the CTR page and the report compare budget with approved hours (BB0001-PM-D-001: 160 budget, 71.5 approved)
@@ -2008,14 +2025,14 @@ class TestApp(unittest.TestCase):
         self.assertNotIn("Budget against actual hours", self.get("/reports?u=5&from=2026-01-01&to=2026-12-31"))   # cost controllers only
         # load a new snapshot: a changed budget, an unchanged one, a heading line, an unknown CTR and a bad figure
         data = "CTR No,Budget hrs\nBB0001-PM-D-001,200\nBB0001-PM-E-001,40\nZZ-NOPE,10\nA1500-PM-D-001,lots\n"
-        out = self.admin_post("/admin/budgets", {"u": "29", "as_of": "2026-11-13", "data": data}, u="29")
+        out = self.admin_post("/admin/budgets", {"u": "30", "as_of": "2026-11-13", "data": data}, u="30")
         self.assertIn("1 budget loaded, as of 2026-11-13. 1 unchanged.", out)
         self.assertIn("ZZ-NOPE", out)
         self.assertIn("line 5", out)
         self.assertIn("Budget 200 hrs", self.get("/ctr?u=29&phase=1"))
         self.assertEqual(self.one("select count(*) from ctr_budget where phase_id=1")[0], 2)           # the old snapshot is kept
         # the same or an earlier as-of date cannot be loaded with a different figure
-        out = self.admin_post("/admin/budgets", {"u": "29", "as_of": "2026-11-13", "data": "BB0001-PM-D-001,300"}, u="29")
+        out = self.admin_post("/admin/budgets", {"u": "30", "as_of": "2026-11-13", "data": "BB0001-PM-D-001,300"}, u="30")
         self.assertIn("use a later date", out)
         self.assertEqual(self.one("select hours from ctr_budget where phase_id=1 order by as_of desc limit 1")[0], 200)
         # nobody else can load budgets
@@ -2043,7 +2060,7 @@ class TestApp(unittest.TestCase):
         self.assertNotIn("&pound;", page)                                                            # hours only
         self.assertIn("Week commencing 26/10/2026", page)
         # budgets that are later loaded show up on it
-        self.admin_post("/admin/budgets", {"u": "29", "as_of": "2026-11-13", "data": "A1500-PM-D-001,200"}, u="29")
+        self.admin_post("/admin/budgets", {"u": "30", "as_of": "2026-11-13", "data": "A1500-PM-D-001,200"}, u="30")
         self.assertIn("A1500-PM-D-001: budget 200 hrs, approved 100 hrs, pending 0 hrs, 100 hrs remaining", self.get("/dashboard?u=29"))
 
     def test_the_dashboard_can_be_filtered(self):
@@ -2092,8 +2109,8 @@ class TestApp(unittest.TestCase):
 
     def test_a_p6_export_is_previewed_and_then_loaded_for_the_chosen_project(self):
         before = self.one("select count(*) from ctr_budget")[0]
-        data = {"u": "29", "as_of": "2026-11-13", "data": self.P6_SAMPLE}
-        page = self.admin_post("/admin/budgets", data, u="29")
+        data = {"u": "30", "as_of": "2026-11-13", "data": self.P6_SAMPLE}
+        page = self.admin_post("/admin/budgets", data, u="30")
         self.assertIn("Preview: nothing has been loaded yet", page)
         self.assertEqual(self.one("select count(*) from ctr_budget")[0], before)                    # a preview writes nothing
         self.assertIn("A1500-PM-D-001", page)
@@ -2103,26 +2120,26 @@ class TestApp(unittest.TestCase):
         self.assertIn("Load 1 budget from PROJ-A", page)
         self.assertIn(">PROJ-B</option>", page)
         # the other P6 project can be previewed
-        other = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-B"), u="29")
+        other = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-B"), u="30")
         self.assertIn("Load 1 budget from PROJ-B", other)
         # confirm the first project
-        out = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-A", confirm="1"), u="29")
+        out = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-A", confirm="1"), u="30")
         self.assertIn("1 budget loaded from P6 project PROJ-A, as of 2026-11-13. 0 unchanged, 5 not loaded.", out)
         row = self.one("select hours, p6_actual_hours, percent_complete, p6_project, as_of from ctr_budget where phase_id=6 order by as_of desc limit 1")
         self.assertEqual(tuple(row), (300, 120.5, 40.17, "PROJ-A", "2026-11-13"))
         self.assertEqual(self.one("select count(*) from ctr_budget where phase_id=3 and as_of='2026-11-13'")[0], 0)   # BB0002 (duplicated) was not loaded
         self.assertIn("Budget 300 hrs", self.get("/ctr?u=29&phase=6"))
         # loading the same figures again changes nothing; a different figure needs a later date
-        again = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-A"), u="29")
+        again = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-A"), u="30")
         self.assertIn("Unchanged", again)
         self.assertIn("Nothing to load for this project", again)
-        clash = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-B"), u="29")
+        clash = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-B"), u="30")
         self.assertIn("already held: use a later date", clash)
         # only cost controllers can use it
         self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-B", confirm="1", u="5"), u="5")
         self.assertEqual(self.one("select hours from ctr_budget where phase_id=6 order by as_of desc limit 1")[0], 300)
         # an export with no rows is explained
-        self.assertIn("No rows were found", self.admin_post("/admin/budgets", {"u": "29", "as_of": "2026-11-13", "data": "a\tb\tc\td\te\tf\tg\n"}, u="29"))
+        self.assertIn("No rows were found", self.admin_post("/admin/budgets", {"u": "30", "as_of": "2026-11-13", "data": "a\tb\tc\td\te\tf\tg\n"}, u="30"))
 
     def test_ctr_page(self):
         con = sqlite3.connect(core.DB_PATH)

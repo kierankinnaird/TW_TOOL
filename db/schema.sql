@@ -2,7 +2,7 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 18;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+PRAGMA user_version = 20;  -- 2: a cost controller approves the hours a scope approver books to their own scope
                           -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
                           -- 4: every entry has a location (On site / Offshore / Standard) and an overtime flag
                           -- 5: a cost controller can reopen submitted or approved hours (reopen_reason)
@@ -15,6 +15,8 @@ PRAGMA user_version = 18;  -- 2: a cost controller approves the hours a scope ap
                           -- 11: a person cannot book more than 24 hours in one day across all rows
                           -- 12: allowances are for staff only, and are valued from an append-only rate table (by allowance, location and overtime)
                           -- 13: approvers are a main approver per client plus secondary approvers per scope; the phase is the CTR (booking code)
+                          -- 20: a CTR can be Non-reimbursable (left out of billing) or Lump sum, with the agreed lump sum value
+                          -- 19: a PAAF is only the client's list of people: it no longer limits who books or sets the rate (the rate is the client's rate for the skill code booked)
                           -- 18: a budget snapshot can carry P6's actual hours and % complete (from the P6 export)
                           -- 17: budget hours per CTR (from P6), compared with the approved hours booked here
                           -- 16: a line manager on each user; a PAAF is simply the client's list of people (active as soon as it is added, no sign-off)
@@ -63,14 +65,15 @@ CREATE TABLE app_user (
     line_manager_id INTEGER REFERENCES app_user(user_id) CHECK (line_manager_id IS NULL OR line_manager_id <> user_id)
 );
 
--- PAAF: the list of people who work on a client's projects, one row per person per client, with the rate position they are priced at.
--- None of the clients approve individuals, so a row is active as soon as it is added (status Approved) and ends on its expiry date. The
--- Draft / Sent / Rejected statuses and the signed form reference are kept for a client that asks for formal approval later.
+-- PAAF: the list of people who work on a client's projects, one row per person per client. It is the list that goes to the client and it
+-- does not limit who can book or what they are priced at: hours are priced at the client's rate for the skill code booked. rate_id is no
+-- longer used (kept nullable for older data). None of the clients approve individuals, so a row is active as soon as it is added (status
+-- Approved) and ends on its expiry date. The Draft / Sent / Rejected statuses and the signed form reference are kept for a client that asks later.
 CREATE TABLE paaf (
     paaf_id     INTEGER PRIMARY KEY,
     user_id     INTEGER NOT NULL REFERENCES app_user(user_id),
     client_id   INTEGER NOT NULL REFERENCES client(client_id),
-    rate_id     INTEGER NOT NULL REFERENCES rate(rate_id),
+    rate_id     INTEGER REFERENCES rate(rate_id),
     status      TEXT NOT NULL DEFAULT 'Approved' CHECK (status IN ('Draft','Sent','Approved','Rejected')),
     sent_date   TEXT,
     decided_date TEXT,
@@ -122,7 +125,10 @@ CREATE TABLE phase (
     prepared_by TEXT,
     checked_by TEXT,
     expenses   TEXT NOT NULL DEFAULT 'Reimbursable',
-    payment_terms TEXT NOT NULL DEFAULT 'Reimbursable' CHECK (payment_terms IN ('Reimbursable','Budget','Lump Sum')),
+    -- Non-reimbursable CTRs are left out of the billing extracts. A Lump Sum CTR works as a budget in money: lump_sum_value is the price
+    -- agreed with the client, and the % billed is worked out when it is needed, not stored.
+    payment_terms TEXT NOT NULL DEFAULT 'Reimbursable' CHECK (payment_terms IN ('Reimbursable','Budget','Lump Sum','Non-reimbursable')),
+    lump_sum_value NUMERIC CHECK (lump_sum_value IS NULL OR (lump_sum_value >= 0 AND payment_terms = 'Lump Sum')),
     basis      TEXT,                                    -- basis of proposal
     wbs        TEXT,                                    -- optional WBS / CBS / ABS references
     cbs        TEXT,
@@ -230,7 +236,7 @@ CREATE TABLE time_entry (
     user_id     INTEGER NOT NULL REFERENCES app_user(user_id),
     scope_id    INTEGER NOT NULL REFERENCES scope(scope_id),
     phase_id    INTEGER NOT NULL REFERENCES phase(phase_id), -- lowest booking level; must belong to scope_id
-    paaf_id     INTEGER REFERENCES paaf(paaf_id),            -- required for client work, NULL for internal hours
+    paaf_id     INTEGER REFERENCES paaf(paaf_id),            -- no longer used (always NULL on new entries)
     worked_role_id INTEGER NOT NULL REFERENCES role(role_id), -- skill code booked under (defaults to user's role)
     rate_id     INTEGER REFERENCES rate(rate_id),            -- client sales rate for worked role, snapshot at booking; NULL for internal hours
     work_date   TEXT NOT NULL,
@@ -264,7 +270,7 @@ CREATE TABLE time_entry_audit (
     old_location_id INTEGER, old_overtime INTEGER
 );
 
--- Booking guard: Open scope, Approved PAAF for the scope's client, matching rate, Open weekly period.
+-- Booking guard: Open scope, matching rate for the client, Open weekly period.
 CREATE TRIGGER trg_time_entry_valid
 BEFORE INSERT ON time_entry
 BEGIN
@@ -289,28 +295,15 @@ BEGIN
     SELECT RAISE(ABORT, 'This booking code cannot be booked on that date (outside its booking dates)')
     WHERE EXISTS (SELECT 1 FROM phase WHERE phase_id = NEW.phase_id
                   AND ((book_from IS NOT NULL AND NEW.work_date < book_from) OR (book_to IS NOT NULL AND NEW.work_date > book_to)));
-    -- Client work: needs an approved PAAF and a matching rate. Internal hours: neither.
-    SELECT RAISE(ABORT, 'This person is not on the client''s personnel list (no PAAF for this client)')
-    WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 0
-      AND NOT EXISTS (
-        SELECT 1 FROM paaf p JOIN scope s ON s.client_id = p.client_id
-        WHERE p.paaf_id = NEW.paaf_id AND p.user_id = NEW.user_id
-          AND s.scope_id = NEW.scope_id AND p.status = 'Approved');
-    -- A PAAF with an expiry date stops covering hours worked after that date (no expiry date = open-ended).
-    SELECT RAISE(ABORT, 'The PAAF has expired for that date')
-    WHERE EXISTS (SELECT 1 FROM paaf p WHERE p.paaf_id = NEW.paaf_id AND p.expiry_date IS NOT NULL AND NEW.work_date > p.expiry_date);
+    -- Client work needs the client's rate for the skill code booked. Internal hours have no rate.
     SELECT RAISE(ABORT, 'Rate does not match the scope client and worked role')
     WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 0
       AND NOT EXISTS (
         SELECT 1 FROM rate r JOIN scope s ON s.client_id = r.client_id
-        WHERE r.rate_id = NEW.rate_id AND s.scope_id = NEW.scope_id
-          AND (r.role_id = NEW.worked_role_id
-               -- or, booking as their own role, the position they are assigned on their PAAF
-               OR (NEW.worked_role_id = (SELECT role_id FROM app_user WHERE user_id = NEW.user_id)
-                   AND r.role_id = (SELECT pr.role_id FROM paaf p JOIN rate pr ON pr.rate_id = p.rate_id WHERE p.paaf_id = NEW.paaf_id))));
-    SELECT RAISE(ABORT, 'Internal hours have no PAAF and no rate')
+        WHERE r.rate_id = NEW.rate_id AND s.scope_id = NEW.scope_id AND r.role_id = NEW.worked_role_id);
+    SELECT RAISE(ABORT, 'Internal hours have no rate')
     WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 1
-      AND (NEW.paaf_id IS NOT NULL OR NEW.rate_id IS NOT NULL);
+      AND NEW.rate_id IS NOT NULL;
     SELECT RAISE(ABORT, 'Weekly period is not open')
     WHERE NOT EXISTS (
         SELECT 1 FROM period
@@ -521,11 +514,6 @@ BEGIN
     SELECT RAISE(ABORT, 'This booking code cannot be booked on that date (outside its booking dates)')
     WHERE EXISTS (SELECT 1 FROM phase WHERE phase_id = NEW.phase_id
                   AND ((book_from IS NOT NULL AND NEW.work_date < book_from) OR (book_to IS NOT NULL AND NEW.work_date > book_to)));
-    SELECT RAISE(ABORT, 'This person is not on the client''s personnel list (no PAAF for this client)')
-    WHERE (SELECT c.is_internal FROM scope sc JOIN client c ON c.client_id = sc.client_id WHERE sc.scope_id = NEW.scope_id) = 0
-      AND NOT EXISTS (SELECT 1 FROM paaf p JOIN scope s ON s.client_id = p.client_id
-                      WHERE p.user_id = NEW.user_id AND s.scope_id = NEW.scope_id AND p.status = 'Approved'
-                        AND (p.expiry_date IS NULL OR NEW.work_date <= p.expiry_date));
     SELECT RAISE(ABORT, 'Weekly period is not open')
     WHERE NOT EXISTS (SELECT 1 FROM period WHERE week_start = date(NEW.work_date, 'weekday 0', '-6 days') AND status = 'Open');
 END;

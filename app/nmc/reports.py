@@ -908,8 +908,17 @@ def view_ctr(con, u, q):
         if money:
             b.append("<p><b>Total for this CTR: %.2f</b> <small>(resources %.2f + additions %.2f; approved hours and allowances only)</small></p>" % (
                 t_all + add_total, t_all, add_total))
-        terms = " &nbsp; ".join("%s [%s]" % (x, "X" if ph["payment_terms"] == x else "&nbsp;") for x in ("Reimbursable", "Budget", "Lump Sum"))
+        terms = " &nbsp; ".join("%s [%s]" % (x, "X" if ph["payment_terms"] == x else "&nbsp;") for x in ("Reimbursable", "Budget", "Lump Sum", "Non-reimbursable"))
         b.append('<table border="1" cellpadding="3" cellspacing="0" style="margin-top:.4rem"><tr>%s<td>%s</td></tr></table>' % (label("Payment Terms"), terms))
+        if ph["payment_terms"] == "Lump Sum" and money:  # a lump sum works as a budget in money; the share of it used is worked out here, not stored
+            cost = t_all + add_total
+            if ph["lump_sum_value"]:
+                b.append("<p><b>Lump sum %.2f</b> &nbsp; cost to date %.2f (approved hours and allowances) &nbsp; remaining %.2f &nbsp; used %.0f%%</p>" % (
+                    ph["lump_sum_value"], cost, ph["lump_sum_value"] - cost, 100 * cost / ph["lump_sum_value"]))
+            else:
+                b.append("<p><b>Lump sum:</b> no value has been agreed yet. Cost to date %.2f.</p>" % cost)
+        elif ph["payment_terms"] == "Non-reimbursable":
+            b.append("<p><b>Non-reimbursable:</b> not billed to the client, and left out of billing extracts.</p>")
         b.append('<table border="1" cellpadding="3" cellspacing="0" style="width:100%%;margin-top:.4rem"><tr><th align="left">Basis of Proposal</th></tr><tr><td>%s</td></tr></table>' % para(ph["basis"]))
         bud = con.execute("select * from v_ctr_budget where phase_id=?", (pid,)).fetchone() if money else None
         if bud and bud["budget_hours"] is not None:

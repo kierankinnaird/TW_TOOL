@@ -267,17 +267,12 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
     scopes = con.execute(
         "select ph.phase_id, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, ph.name as phase_name, s.scope_code, s.description, pr.name as project, c.name as client, c.is_internal "
         "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
-        "join client c on c.client_id=s.client_id left join paaf p on p.client_id=s.client_id and p.user_id=? "
-        "and p.status='Approved' and (p.expiry_date is null or p.expiry_date >= ?) "
-        "where s.status='Open' and ph.status='Open' and pr.status='Open' "
-        "and (c.is_internal=1 or p.paaf_id is not null) "  # client work needs an approved PAAF, internal codes are open to everyone
+        "join client c on c.client_id=s.client_id "
+        "where s.status='Open' and ph.status='Open' and pr.status='Open' "  # anyone can book to any open code, unless it is restricted
         "and (ph.restricted=0 or exists (select 1 from phase_person pp where pp.phase_id=ph.phase_id and pp.user_id=?)) "  # transaction controls:
         "and (ph.book_to is null or ph.book_to >= ?) and (ph.book_from is null or ph.book_from <= ?) "  # people, and booking dates
-        "order by c.is_internal, c.name, pr.name, s.scope_code, ph.name", (u, d0, u, d0, d6)).fetchall()
+        "order by c.is_internal, c.name, pr.name, s.scope_code, ph.name", (u, d0, d6)).fetchall()
     roles = con.execute("select role_id, skill_code, name from role where active=1 order by skill_code").fetchall()
-    for pf in con.execute("select c.name as client, p.expiry_date from paaf p join client c on c.client_id=p.client_id "
-                          "where p.user_id=? and c.is_internal=0 and p.expiry_date is not null and p.expiry_date < ? order by c.name", (u, d0)):
-        b.append("<p><small><b>%s:</b> you came off this client's list on %s, so its CTRs are not offered from that date.</small></p>" % (esc(pf["client"]), dmy(pf["expiry_date"])))
     add_button = ""  # the "Add timesheet row" button above the grid, when a row can be added
     if week_inactive or locked:
         pass  # the notes above say why nothing can be added
@@ -304,13 +299,13 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
         b.append("".join(dlg))
         add_button = '<input type="button" value="+ Add timesheet row" onclick="document.getElementById(\'addrow\').showModal()">'
     else:
-        b.append("<p>You are not on the personnel list of any client with open scopes, so there is nothing to book to.</p>")
+        b.append("<p>There are no open booking codes you can book to.</p>")
     return layout(con, u, "My Timesheet", "".join(b).replace("<!--ADDROW-->", add_button))
 
 
 def book_entry(con, u, pid, rid, lid, ot, date, hours):
-    """Create one Draft entry for u. Returns None when it is booked, or a short reason when it cannot be (no rate, no PAAF, location
-    switched off). The database rules (open scope, start and end dates, PAAF expiry, open week) raise sqlite3.DatabaseError instead."""
+    """Create one Draft entry for u. Returns None when it is booked, or a short reason when it cannot be (no rate, location switched
+    off). The database rules (open scope, start and end dates, open week) raise sqlite3.DatabaseError instead."""
     info = con.execute("select s.scope_id, s.client_id, c.is_internal from phase ph join scope s on s.scope_id=ph.scope_id "
                        "join client c on c.client_id=s.client_id where ph.phase_id=?", (pid,)).fetchone()
     if not info:
@@ -318,24 +313,19 @@ def book_entry(con, u, pid, rid, lid, ot, date, hours):
     loc = con.execute("select active from location where location_id=?", (lid,)).fetchone()
     if not loc or not loc[0] or ot not in (0, 1):
         return "that location is not available."
-    if info["is_internal"]:  # NMC pays for these hours: no PAAF, no sales rate
-        paaf_id = rate_id = None
+    if info["is_internal"]:  # NMC pays for these hours: no sales rate
+        rate_id = None
     else:
-        paaf = con.execute("select p.paaf_id, r.role_id as position from paaf p join rate r on r.rate_id=p.rate_id "
-                           "where p.user_id=? and p.client_id=?", (u, info["client_id"])).fetchone()
-        if not paaf:
-            return "you are not on this client's personnel list."
-        # Booking as their own role uses the position assigned on their PAAF; covering another role uses that role's line of the rate card.
-        # Either way the rate is the one in force on the work date (rates are never edited, a new one is added with a start date).
-        own = con.execute("select 1 from app_user where user_id=? and role_id=?", (u, rid)).fetchone()
+        # The rate is the client's rate for the skill code booked (the person's job title, unless they are covering another role), at the
+        # rate in force on the work date (rates are never edited, a new one is added with a start date).
         rate = con.execute("select rate_id from rate where client_id=? and role_id=? and effective_from<=? "
-                           "order by effective_from desc limit 1", (info["client_id"], paaf["position"] if own else rid, date)).fetchone()
+                           "order by effective_from desc limit 1", (info["client_id"], rid, date)).fetchone()
         if not rate:
             return "no rate for that skill code on this client."
-        rate_id, paaf_id = rate[0], paaf["paaf_id"]
-    con.execute("insert into time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, "
-                "status, created_by, location_id, overtime) values (?,?,?,?,?,?,?,?, 'Draft', ?, ?, ?)",
-                (u, info["scope_id"], pid, paaf_id, rid, rate_id, date, hours, u, lid, ot))
+        rate_id = rate[0]
+    con.execute("insert into time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, "
+                "status, created_by, location_id, overtime) values (?,?,?,?,?,?,?, 'Draft', ?, ?, ?)",
+                (u, info["scope_id"], pid, rid, rate_id, date, hours, u, lid, ot))
     return None
 
 

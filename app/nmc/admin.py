@@ -9,7 +9,7 @@ from nmc.core import (
     fmt_time, hidden, layout, msgs_html,
     need_date, need_text, no_access, opts_approvers,
     opts_clients, opts_projects, opts_roles, opts_scopes,
-    opts_users, permission_of, rate_options, sel,
+    opts_users, permission_of, sel,
     stamp, table, txt)
 
 
@@ -24,7 +24,26 @@ ADMIN_TABS = [("periods", "Weekly periods"), ("users", "Users"), ("roles", "Job 
 # Weekly periods is open to both controllers and admins until the cost team confirms who owns it (the audit trail is handled the same way).
 TAB_ACCESS = {"periods": ("controller", "admin"), "users": ("admin",), "roles": ("admin",), "clients": ("controller",),
               "rates": ("controller",), "paafs": ("controller",), "scopes": ("controller",), "internal": ("controller",),
-              "locations": ("admin",), "allowance_rates": ("controller",), "budgets": ("controller",)}
+              "locations": ("admin",), "allowance_rates": ("controller",), "budgets": ("admin",)}  # budgets (P6) are parked for v1: IT only
+
+
+PAYMENT_TERMS = [("Reimbursable", "Reimbursable"), ("Budget", "Budget"), ("Lump Sum", "Lump Sum"), ("Non-reimbursable", "Non-reimbursable")]
+
+
+def payment_terms(g):
+    """The payment terms and lump sum value from a CTR form: (terms, value). Only a Lump Sum CTR carries a value, which may be left empty until agreed."""
+    terms = g("payment_terms") or "Reimbursable"
+    if terms not in dict(PAYMENT_TERMS):
+        raise ValueError("Payment terms must be Reimbursable, Budget, Lump Sum or Non-reimbursable.")
+    if terms != "Lump Sum" or not g("lump_sum_value"):
+        return terms, None
+    try:
+        value = float(g("lump_sum_value").replace(",", "").lstrip("£"))
+    except ValueError:
+        raise ValueError("The lump sum value must be a number.")
+    if value < 0:
+        raise ValueError("The lump sum value cannot be negative.")
+    return terms, value
 
 
 PERMISSION_OPTIONS = [("user", "user"), ("controller", "controller (cost controller)"), ("admin", "admin (IT)")]
@@ -187,11 +206,12 @@ def admin_body(con, u, t, q=None):
         total = con.execute("select count(*) from paaf").fetchone()[0]
         order = PAAF_SORTS[flt["sort"]][1 if flt["desc"] else 0]
         rows = []
-        found = con.execute("select p.*, u.name as uname, c.name as client, ro.skill_code, rt.sales_rate "
+        found = con.execute("select p.*, u.name as uname, c.name as client, ro.skill_code "
                             "from paaf p join app_user u on u.user_id=p.user_id join client c on c.client_id=p.client_id "
-                            "join rate rt on rt.rate_id=p.rate_id join role ro on ro.role_id=rt.role_id where 1=1" + where + " order by " + order, wargs).fetchall()
+                            "join role ro on ro.role_id=u.role_id where 1=1" + where + " order by " + order, wargs).fetchall()
         b.append("<p><small>The people who work on each client's projects: the list that goes to the client. None of our clients approve individuals, so a person is "
-                 "on a client's list as soon as they are added and can book to that client's CTRs until their end date.</small></p>")
+                 "on a client's list as soon as they are added. The list does not limit who can book: anyone can book to any open CTR, "
+                 "priced at the client's rate for the skill code they book.</small></p>")
         b.append('<form method="get" action="/admin">%s<p>Person %s Client %s Show %s <input type="submit" value="Filter"> '
                  '<input type="button" value="Clear filters" onclick="location.href=\'/admin?u=%d&amp;t=paafs\'"> '
                  '<small>Showing %d of %d entries, in order of the # column. Click a column heading to sort by it, and again to reverse it.</small></p></form>' % (
@@ -210,21 +230,17 @@ def admin_body(con, u, t, q=None):
         for r in found:
             ended = bool(r["expiry_date"] and r["expiry_date"] < today)
             f = '<form method="post" action="/admin/paaf" style="display:inline">%s%s' % (hidden(u=u, paaf_id=r["paaf_id"]), paaf_hidden(flt))
-            f += ('%s <input type="submit" name="action" value="Change rate"> <br>End date %s <input type="submit" name="action" value="Save end date"> '
-                  '<small>(empty = no end)</small></form>' % (sel("rate_id", rate_options(con, r["client_id"]), r["rate_id"]), date_input("expiry_date", r["expiry_date"] or "")))
-            rows.append([r["paaf_id"], r["uname"], r["client"], r["skill_code"], "%g" % r["sales_rate"], ("Ended %s" % r["expiry_date"]) if ended else (r["expiry_date"] or ""), f])
-        heads = [head("#", "id"), head("Name", "name"), head("Client", "client"), "Skill code", "Sales rate", head("Ends", "expiry"), "Action"]  # raw: the headings hold sort links
+            f += ('End date %s <input type="submit" name="action" value="Save end date"> '
+                  '<small>(empty = no end)</small></form>' % date_input("expiry_date", r["expiry_date"] or ""))
+            rows.append([r["paaf_id"], r["uname"], r["client"], r["skill_code"], ("Ended %s" % r["expiry_date"]) if ended else (r["expiry_date"] or ""), f])
+        heads = [head("#", "id"), head("Name", "name"), head("Client", "client"), "Skill code", head("Ends", "expiry"), "Action"]  # raw: the headings hold sort links
         if rows:
-            b.append(table(heads, rows, raw_cols=(6,), raw_heads=True))
+            b.append(table(heads, rows, raw_cols=(5,), raw_heads=True))
         else:
             b.append("<p>Nobody matches these filters.</p>")
-        b.append('<h4>Add a person to a client</h4><p><small>One entry per person per client. Pick the rate to assign from the client\'s rate card, or leave it '
-                 "on the default, the rate for the person's own role. The rate card line you pick is the person's position on that client: it sets the rate for their hours "
-                 "when they book as their own role, at the rate in force on the work date (covering another role uses the card line for that role). "
-                 "The rate can be changed at any time; hours already booked keep the rate they were booked at. Set an end date when someone leaves the client's projects.</small></p>"
-                 '<form method="post" action="/admin/add">%s Person %s Client %s Rate %s <input type="submit" value="Add person"></form>'
-                 % (hidden(u=u, t="paafs"), sel("user_id", opts_users(con)), sel("client_id", opts_clients(con, True)),
-                    sel("rate_id", rate_options(con), None, True, "Default: the person's own role")))
+        b.append('<h4>Add a person to a client</h4><p><small>One entry per person per client. Set an end date when someone leaves the client\'s projects.</small></p>'
+                 '<form method="post" action="/admin/add">%s Person %s Client %s <input type="submit" value="Add person"></form>'
+                 % (hidden(u=u, t="paafs"), sel("user_id", opts_users(con)), sel("client_id", opts_clients(con, True))))
     elif t == "allowance_rates":
         today = datetime.date.today().isoformat()
         grid = []
@@ -313,8 +329,10 @@ def admin_body(con, u, t, q=None):
             rows.append([r["client"], r["scope_code"], r["scope_desc"], r["name"], r["description"] or "", r["status"],
                          "; ".join(controls) or "open to all", edit_link(u, "phases", r["phase_id"])])
         b.append(table(["Client", "Scope", "Scope description", "CTR (booking code)", "CTR description", "Status", "Who and when can book", ""], rows, raw_cols=(7,)))
-        b.append('<form method="post" action="/admin/add">%s Scope %s CTR name %s <input type="submit" value="Add CTR"></form>'
-                 % (hidden(u=u, t="phases"), sel("scope_id", opts_scopes(con)), txt("name", "", 20)))
+        b.append('<form method="post" action="/admin/add">%s Scope %s CTR name %s Payment terms %s Lump sum value &pound; %s <input type="submit" value="Add CTR"> '
+                 "<small>Non-reimbursable CTRs are left out of billing. A lump sum CTR is tracked against its agreed value (leave it empty until agreed).</small></form>"
+                 % (hidden(u=u, t="phases"), sel("scope_id", opts_scopes(con)), txt("name", "", 20), sel("payment_terms", PAYMENT_TERMS, "Reimbursable"),
+                    txt("lump_sum_value", "", 10)))
     return "".join(b)
 
 
@@ -403,7 +421,7 @@ def view_admin_edit(con, u, t, i, msgs=None):
                 "<tr><td>CTR title</td><td>%s</td></tr><tr><td>Prepared by</td><td>%s</td></tr><tr><td>Checked by</td><td>%s</td></tr>"
                 "<tr><td>Objectives</td><td>%s</td></tr><tr><td>Input requirements</td><td>%s</td></tr><tr><td>Scope of work</td><td>%s</td></tr>"
                 "<tr><td>This CTR assumes</td><td>%s</td></tr><tr><td>This CTR excludes</td><td>%s</td></tr>"
-                "<tr><td>Expenses</td><td>%s</td></tr><tr><td>Payment terms</td><td>%s</td></tr><tr><td>Basis of proposal</td><td>%s</td></tr>"
+                "<tr><td>Expenses</td><td>%s</td></tr><tr><td>Payment terms</td><td>%s</td></tr><tr><td>Lump sum value (&pound;)</td><td>%s <small>Lump Sum CTRs only: the price agreed with the client</small></td></tr><tr><td>Basis of proposal</td><td>%s</td></tr>"
                 "<tr><td>WBS</td><td>%s</td></tr><tr><td>CBS</td><td>%s</td></tr><tr><td>ABS</td><td>%s</td></tr>"
                 "<tr><td>Who can book</td><td>%s</td></tr><tr><td>People allowed</td><td>%s</td></tr>"
                 "<tr><td>Bookable from</td><td>%s</td></tr><tr><td>Bookable until</td><td>%s</td></tr>"
@@ -413,10 +431,11 @@ def view_admin_edit(con, u, t, i, msgs=None):
                    area("objectives", r["objectives"]), area("inputs", r["inputs"]), area("scope_of_work", r["scope_of_work"]),
                    area("assumptions", r["assumptions"]), area("exclusions", r["exclusions"]),
                    txt("expenses", r["expenses"] or "Reimbursable", 20),
-                   sel("payment_terms", [("Reimbursable", "Reimbursable"), ("Budget", "Budget"), ("Lump Sum", "Lump Sum")], r["payment_terms"]),
+                   sel("payment_terms", PAYMENT_TERMS, r["payment_terms"]),
+                   txt("lump_sum_value", "%g" % r["lump_sum_value"] if r["lump_sum_value"] is not None else "", 12),
                    area("basis", r["basis"]),
                    txt("wbs", r["wbs"] or "", 20), txt("cbs", r["cbs"] or "", 20), txt("abs_code", r["abs_code"] or "", 20),
-                   sel("restricted", [("0", "Anyone with an approved PAAF (or an internal code)"), ("1", "Only the people ticked below")], str(r["restricted"])),
+                   sel("restricted", [("0", "Anyone"), ("1", "Only the people ticked below")], str(r["restricted"])),
                    people, date_input("book_from", r["book_from"] or ""), date_input("book_to", r["book_to"] or "")))
         note = ("<p><small>Closing a CTR stops new bookings to it. Existing hours are not affected. Hours are approved by the client's main approver or the scope's "
                 "secondary approvers (set on the scope). Transaction controls: by default anyone who may book to the client "
@@ -474,7 +493,9 @@ def admin_add(con, form):
             con.execute("insert into phase (scope_id, name) values (?, 'General')", (cur.lastrowid,))
             msg = "Scope added with a General CTR."
         elif t == "phases":
-            con.execute("insert into phase (scope_id, name) values (?,?)", (int(g("scope_id")), need_text(g("name"), "CTR name")))
+            terms, value = payment_terms(g)
+            con.execute("insert into phase (scope_id, name, payment_terms, lump_sum_value) values (?,?,?,?)",
+                        (int(g("scope_id")), need_text(g("name"), "CTR name"), terms, value))
             msg = "CTR added."
         elif t == "locations":
             con.execute("insert into location (name) values (?)", (need_text(g("name"), "Location name"),))
@@ -494,19 +515,11 @@ def admin_add(con, form):
             msg = "Internal code %s added." % code
         elif t == "paafs":
             user_id, client_id = int(g("user_id")), int(g("client_id"))
-            if g("rate_id"):  # a rate picked from the dropdown must be on this client's rate card
-                rate = con.execute("select rate_id from rate where rate_id=? and client_id=?", (int(g("rate_id")), client_id)).fetchone()
-                if not rate:
-                    raise ValueError("That rate is not on this client's rate card. Choose one of the client's rates.")
-            else:
-                rate = con.execute("select rt.rate_id from rate rt join app_user u on u.role_id=rt.role_id where u.user_id=? and rt.client_id=? "
-                                   "and rt.effective_from<=? order by rt.effective_from desc limit 1",
-                                   (user_id, client_id, datetime.date.today().isoformat())).fetchone()
-            if not rate:
-                raise ValueError("That client's rate card has no rate for this person's role. Add the rate first, or pick a rate.")
-            con.execute("insert into paaf (user_id, client_id, rate_id, status, decided_date) values (?,?,?,'Approved',?)",
-                        (user_id, client_id, rate[0], datetime.date.today().isoformat()))
-            msg = "Person added to the client's list. They can book to its CTRs now."
+            if not con.execute("select 1 from rate rt join app_user u on u.role_id=rt.role_id where u.user_id=? and rt.client_id=?", (user_id, client_id)).fetchone():
+                raise ValueError("That client's rate card has no rate for this person's role. Add the rate first.")
+            con.execute("insert into paaf (user_id, client_id, status, decided_date) values (?,?,'Approved',?)",
+                        (user_id, client_id, datetime.date.today().isoformat()))
+            msg = "Person added to the client's list."
         else:
             raise ValueError("Unknown form.")
         con.commit()
@@ -568,16 +581,14 @@ def admin_save(con, form):
             b_from, b_to = need_date(g("book_from"), "Bookable from", False), need_date(g("book_to"), "Bookable until", False)
             if b_from and b_to and b_to < b_from:
                 raise ValueError("Bookable until cannot be before bookable from.")
-            terms = g("payment_terms") or "Reimbursable"
-            if terms not in ("Reimbursable", "Budget", "Lump Sum"):
-                raise ValueError("Payment terms must be Reimbursable, Budget or Lump Sum.")
+            terms, lump = payment_terms(g)
             con.execute("update phase set name=?, status=?, description=?, wbs=?, cbs=?, abs_code=?, restricted=?, book_from=?, book_to=?, "
-                        "ctr_code=?, objectives=?, inputs=?, scope_of_work=?, assumptions=?, exclusions=?, prepared_by=?, checked_by=?, expenses=?, payment_terms=?, basis=? "
+                        "ctr_code=?, objectives=?, inputs=?, scope_of_work=?, assumptions=?, exclusions=?, prepared_by=?, checked_by=?, expenses=?, payment_terms=?, lump_sum_value=?, basis=? "
                         "where phase_id=?",
                         (need_text(g("name"), "CTR name"), g("status"), g("description") or None, g("wbs") or None, g("cbs") or None,
                          g("abs_code") or None, 1 if g("restricted") == "1" else 0, b_from, b_to,
                          g("ctr_code") or None, g("objectives") or None, g("inputs") or None, g("scope_of_work") or None, g("assumptions") or None,
-                         g("exclusions") or None, g("prepared_by") or None, g("checked_by") or None, g("expenses") or "Reimbursable", terms, g("basis") or None, i))
+                         g("exclusions") or None, g("prepared_by") or None, g("checked_by") or None, g("expenses") or "Reimbursable", terms, lump, g("basis") or None, i))
             con.execute("delete from phase_person where phase_id=?", (i,))
             for person in form.get("person", []):
                 con.execute("insert or ignore into phase_person (phase_id, user_id) values (?,?)", (i, int(person)))
@@ -635,13 +646,7 @@ def act_paaf(con, form):
         p = con.execute("select * from paaf where paaf_id=?", (pid,)).fetchone()
         if not p:
             raise ValueError("That entry was not found.")
-        if action == "Change rate":
-            rate = con.execute("select rate_id from rate where rate_id=? and client_id=?", (int(g("rate_id") or 0), p["client_id"])).fetchone()
-            if not rate:
-                raise ValueError("Choose one of this client's rates.")
-            con.execute("update paaf set rate_id=? where paaf_id=?", (rate[0], pid))
-            msg = "Entry %d now uses the chosen rate." % pid
-        elif action == "Save end date":
+        if action == "Save end date":
             end = need_date(g("expiry_date"), "End date", False)
             con.execute("update paaf set expiry_date=? where paaf_id=?", (end, pid))
             msg = "Entry %d now ends on %s." % (pid, end) if end else "Entry %d has no end date." % pid

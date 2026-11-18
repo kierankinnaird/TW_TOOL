@@ -75,14 +75,12 @@ class TestBookingRules(Base):
         self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 8, 5))
         self.assertEqual(self.scalar("select count(*) from time_entry_audit where action='CREATE'"), 65)
 
-    def test_unapproved_paaf_blocks_booking(self):
-        self.blocked(NEW_ENTRY, (4, 1, 1, 4, 4, 4, "2026-11-06", 8, 4), "personnel list")
-
-    def test_paaf_is_per_client_not_per_scope(self):
-        # Ewan's single Apache PAAF covers every Apache scope...
-        self.con.execute(NEW_ENTRY, (5, 2, 3, 1, 4, 4, "2026-11-06", 4, 5))
-        # ...but not Spirit.
-        self.blocked(NEW_ENTRY, (5, 5, 6, 1, 4, 10, "2026-11-06", 4, 5))
+    def test_a_paaf_is_not_needed_to_book(self):
+        # David Hart's PAAF is only 'Sent' and Ewan has none for Spirit, but anyone can book to any open client code at the client's rate
+        self.con.execute(NEW_ENTRY, (4, 1, 1, None, 4, 4, "2026-11-06", 8, 4))
+        spirit_planner = self.scalar("select rate_id from rate where client_id=2 and role_id=4 order by effective_from desc limit 1")
+        self.con.execute(NEW_ENTRY, (5, 5, 6, None, 4, spirit_planner, "2026-11-06", 4, 5))
+        self.blocked(NEW_ENTRY, (5, 5, 6, None, 4, 4, "2026-11-06", 4, 5), "Rate does not match")  # but the rate must be the client's own
 
     def test_closed_scope_blocks_booking(self):
         self.blocked(NEW_ENTRY, (1, 3, 4, 3, 6, 6, "2026-11-06", 8, 1), "Scope is not Open")
@@ -351,7 +349,7 @@ class TestPermissionLevels(Base):
 
 
 class TestActiveDatesAndPaafExpiry(Base):
-    """Only live people can book (start and end dates), and a PAAF stops covering hours after its expiry date."""
+    """Only live people can book (start and end dates). A PAAF ending changes nothing."""
     # Ewan Shaw (5) started on 1 Mar 2026 and has no end date. His Apache PAAF is 1 (rate 4, Planner). BB0001 is scope 1, phase 1.
     def book(self, date, user=5, scope=1, phase=1, paaf=1, role=4, rate=4):
         return self.con.execute(NEW_ENTRY, (user, scope, phase, paaf, role, rate, date, 2, user))
@@ -375,23 +373,15 @@ class TestActiveDatesAndPaafExpiry(Base):
         self.con.execute("INSERT INTO period (week_start) VALUES ('2026-12-14')")  # a far later week, opened
         self.book("2026-12-18")                                                    # still allowed: no end date
 
-    def test_a_paaf_stops_covering_hours_after_it_expires(self):
+    def test_a_paaf_ending_does_not_stop_booking(self):
+        # the PAAF is only the client's list of people: its end date does not limit what can be booked
         self.con.execute("UPDATE paaf SET expiry_date='2026-11-05' WHERE paaf_id=1")
-        self.book("2026-11-05")                                                                              # the expiry day is covered
-        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, 4, "2026-11-06", 2, 5), msg="PAAF has expired")
-        # internal hours never needed a PAAF, so an expired one changes nothing
-        self.con.execute(NEW_ENTRY, (5, 7, 8, None, 4, None, "2026-11-06", 2, 5))
-
-    def test_a_paaf_with_no_expiry_date_is_open_ended(self):
-        self.assertIsNone(self.scalar("select expiry_date from paaf where paaf_id=1"))
         self.book("2026-11-06")
 
     def test_the_seed_data_respects_the_rules(self):
-        # every booking in the seed is on or after the person's start date, on or before their end date, and within their PAAF
+        # every booking in the seed is on or after the person's start date and on or before their end date
         bad = self.scalar("select count(*) from time_entry t join app_user u on u.user_id=t.user_id where t.work_date < u.start_date "
                           "or (u.end_date is not null and t.work_date > u.end_date)")
-        self.assertEqual(bad, 0)
-        bad = self.scalar("select count(*) from time_entry t join paaf p on p.paaf_id=t.paaf_id where p.expiry_date is not null and t.work_date > p.expiry_date")
         self.assertEqual(bad, 0)
 
 
@@ -460,7 +450,6 @@ class TestAllowances(Base):
         self.blocked(self.INS, (5, 1, 2, 1, "2026-11-06", 5), "UNIQUE")      # not even against another booking code
 
     def test_the_booking_rules_apply_to_allowances(self):
-        self.blocked(self.INS, (4, 1, 1, 2, "2026-11-06", 4), "personnel list")        # David Hart's PAAF is only Sent
         self.blocked(self.INS, (5, 1, 1, 2, "2026-10-30", 5), "period is not open")
         self.blocked(self.INS, (5, 1, 1, 2, "2026-02-27", 5), "not active on that date")
         self.blocked(self.INS, (1, 4, 5, 2, "2026-11-06", 1), "Scope is not Open")
@@ -633,21 +622,28 @@ class TestAuditTrailIsAppendOnly(Base):
         self.assertGreater(self.scalar("select count(*) from time_entry_audit"), before)
 
 
-class TestPaafPosition(Base):
-    """R09: the person is assigned a position (a line of the client's rate card) on their PAAF, and it sets the rate for their own-role hours."""
+class TestPaymentTerms(Base):
+    def test_only_a_lump_sum_ctr_carries_a_value(self):
+        self.con.execute("UPDATE phase SET payment_terms='Lump Sum', lump_sum_value=5000 WHERE phase_id=1")
+        self.blocked("UPDATE phase SET payment_terms='Reimbursable' WHERE phase_id=1", msg="CHECK")        # the value must go first
+        self.blocked("UPDATE phase SET lump_sum_value=-1 WHERE phase_id=1", msg="CHECK")
+        self.con.execute("UPDATE phase SET payment_terms='Non-reimbursable', lump_sum_value=NULL WHERE phase_id=1")
+        self.blocked("UPDATE phase SET lump_sum_value=100 WHERE phase_id=1", msg="CHECK")
+
+
+class TestRateForSkillCode(Base):
+    """Rates: hours are priced at the client's rate for the skill code booked, not by any position assigned on a PAAF."""
     def apache_rate(self, role):
         return self.scalar("select rate_id from rate where client_id=1 and role_id=? order by effective_from desc limit 1", role)
 
-    def test_a_person_booking_as_their_own_role_may_use_the_position_on_their_paaf(self):
-        # Ewan Shaw is a Planner (role 4) but his PAAF assigns him the Project Engineer position (role 3)
-        self.con.execute("UPDATE paaf SET rate_id=? WHERE paaf_id=1", (self.apache_rate(3),))
-        self.con.execute(NEW_ENTRY, (5, 1, 1, 1, 4, self.apache_rate(3), "2026-11-06", 8, 5))
-        self.assertEqual(self.scalar("select rate_id from time_entry where user_id=5 and work_date='2026-11-06'"), self.apache_rate(3))
+    def test_a_person_is_priced_at_the_rate_of_the_skill_code_they_book(self):
+        # Ewan Shaw is a Planner (role 4): booking as a Planner needs the Planner rate, not another position's
+        self.blocked(NEW_ENTRY, (5, 1, 1, None, 4, self.apache_rate(3), "2026-11-06", 8, 5), "Rate does not match")
+        self.con.execute(NEW_ENTRY, (5, 1, 1, None, 4, self.apache_rate(4), "2026-11-06", 8, 5))
 
-    def test_the_position_does_not_cover_other_roles_or_other_clients(self):
-        self.con.execute("UPDATE paaf SET rate_id=? WHERE paaf_id=1", (self.apache_rate(3),))
-        # covering another role (5) with the assigned position's rate is not allowed, and neither is a rate of another client
-        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 5, self.apache_rate(3), "2026-11-06", 8, 5), "Rate does not match")
+    def test_the_rate_does_not_cover_other_roles_or_other_clients(self):
+        # covering another role (5) with the Project Engineer rate is not allowed, and neither is a rate of another client
+        self.blocked(NEW_ENTRY, (5, 1, 1, None, 5, self.apache_rate(3), "2026-11-06", 8, 5), "Rate does not match")
         other = self.scalar("select rate_id from rate where client_id=2 and role_id=3 limit 1")
         self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, other, "2026-11-06", 8, 5), "Rate does not match")
 
@@ -810,13 +806,11 @@ class TestInternalHours(Base):
         row = self.con.execute("select paaf_id, rate_id, status from time_entry where user_id=4").fetchone()
         self.assertEqual(tuple(row), (None, None, "Submitted"))  # the column default; the app saves drafts
 
-    def test_internal_hours_cannot_carry_a_paaf_or_a_rate(self):
-        self.blocked(NEW_ENTRY, (5, 7, 8, 1, 4, None, "2026-11-04", 3, 5), msg="Internal hours have no PAAF and no rate")
-        self.blocked(NEW_ENTRY, (5, 7, 8, None, 4, 4, "2026-11-04", 3, 5), msg="Internal hours have no PAAF and no rate")
+    def test_internal_hours_cannot_carry_a_rate(self):
+        self.blocked(NEW_ENTRY, (5, 7, 8, None, 4, 4, "2026-11-04", 3, 5), msg="Internal hours have no rate")
 
-    def test_client_hours_still_need_a_paaf_and_a_rate(self):
-        self.blocked(NEW_ENTRY, (5, 1, 1, None, 4, 4, "2026-11-06", 3, 5), msg="personnel list")
-        self.blocked(NEW_ENTRY, (5, 1, 1, 1, 4, None, "2026-11-06", 3, 5), msg="Rate does not match")
+    def test_client_hours_still_need_a_rate(self):
+        self.blocked(NEW_ENTRY, (5, 1, 1, None, 4, None, "2026-11-06", 3, 5), msg="Rate does not match")
 
     def test_internal_codes_get_no_rate_card_and_no_paaf(self):
         internal = self.scalar("select client_id from client where is_internal=1")

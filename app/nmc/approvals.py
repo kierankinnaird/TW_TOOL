@@ -250,9 +250,13 @@ def week_status(n_submitted, n_draft):
     return "Partly submitted" if n_draft else "Submitted"
 
 
+PEOPLE_WEEKS = 8  # how far back an approver's booking history reaches to work out who their people are
+
+
 def view_missing(con, u, q):
     """Who has not completed their timesheet for a week. Cost controllers see everyone who is active that week. An approver sees
-    their own people: those with an approved PAAF for a client they approve, and anyone who has booked to their internal codes."""
+    their own people: anyone who has booked to a scope they approve (the scopes of a client they are main approver of, or scopes they are named
+    on), internal codes included, in the last PEOPLE_WEEKS weeks up to the week shown."""
     perm = permission_of(con, u)
     if perm != "controller" and not is_approver(con, u):
         return no_access(con, u, "Missing timesheets")
@@ -267,11 +271,10 @@ def view_missing(con, u, q):
 
     scope_sql, scope_args = "", []
     if perm != "controller":
-        scope_sql = (" and p.user_id<>? and (p.user_id in (select user_id from paaf where status='Approved' and client_id in "
-                     "(select s2.client_id from scope s2 join v_scope_approver va on va.scope_id=s2.scope_id where va.user_id=?)) or p.user_id in "
-                     "(select t.user_id from time_entry t join scope s on s.scope_id=t.scope_id join client c on c.client_id=s.client_id "
-                     "where c.is_internal=1 and exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=?)))")
-        scope_args = [u, u, u]
+        since = (w - datetime.timedelta(weeks=PEOPLE_WEEKS)).isoformat()
+        scope_sql = (" and p.user_id<>? and p.user_id in (select t.user_id from time_entry t join v_scope_approver va on va.scope_id=t.scope_id "
+                     "where va.user_id=? and t.work_date between ? and ?)")
+        scope_args = [u, u, since, d6]
     # everyone who is active at some point in the week (start and end dates)
     people = con.execute(
         "select p.user_id, p.nmc_id, p.name, p.employment_type, r.name as title from app_user p join role r on r.role_id=p.role_id "
@@ -308,8 +311,7 @@ def view_missing(con, u, q):
             hidden(u=u), date_input("w", d0), sel("s", MISSING_FILTERS, show, False, "-", ' onchange="this.form.submit()"'))]
     if not people:
         b.append("<p>Nobody is expected to submit a timesheet in this week from your list.%s</p>" % (
-            "" if perm == "controller" else " Your people are those on the personnel list of a client you approve, "
-            "and anyone who has booked to your internal codes."))
+            "" if perm == "controller" else " Your people are those who have booked to your scopes in the last %d weeks." % PEOPLE_WEEKS))
         return layout(con, u, "Missing timesheets", "".join(b))
     b.append("<p><b>%d</b> expected: %s.</p>" % (len(people), ", ".join(
         link(w, st, "%d %s" % (counts[st], st.lower())) for st in order)))
@@ -317,7 +319,7 @@ def view_missing(con, u, q):
              "Sent back counts entries an approver rejected or a cost controller reopened that have not been submitted again. "
              "Everyone whose start and end dates cover any part of the week is expected, including the weeks still in progress.</small></p>" % (
                  "Everyone who is active that week." if perm == "controller" else
-                 "Your people: those on the personnel list of a client you approve, and anyone who has booked to your internal codes."))
+                 "Your people: anyone who has booked to a scope you approve in the last %d weeks." % PEOPLE_WEEKS))
     if rows:
         b.append('<table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>NMC ID</th><th>Job title</th><th>Employment</th>'
                  '<th>Status</th><th>Submitted hrs</th><th>Draft hrs</th><th>Sent back</th>%s</tr>%s</table>' % (
