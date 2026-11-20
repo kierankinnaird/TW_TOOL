@@ -136,54 +136,13 @@ INSERT INTO app_user (user_id, nmc_id, employment_type, name, role_id, permissio
  (26,'A026','Contract','Greig McAndrew',8,'user','2026-01-01',NULL),
  (27,'A027','Staff','Jai Hart',10,'user','2026-01-01',NULL),
  (28,'A028','Staff','Jamie McNab',25,'user','2026-01-01',NULL),
- -- Permission levels. Cost controllers manage codes, scopes, rates and PAAFs and see all reports with values; they do not have to be
+ -- Permission levels. Cost controllers manage codes, scopes and rates and see all reports with values; they do not have to be
  -- cost engineers (Stephanie Apedaile is the commercial lead). The admin (IT) account manages users and job roles only.
  -- Neither approves hours. Alisdair Woodhead approves for Apache and Kenneth Nicolson for Spirit (see the scopes below).
  (29,'A029','Staff','Stephanie Apedaile',32,'controller','2026-01-01',NULL),
  (30,'A030','Staff','NMC Admin',31,'admin','2026-01-01',NULL),
  -- The managing director approves the overhead (internal) time, and can delegate it by naming secondary approvers on the internal codes.
  (31,'A031','Staff','Graeme Hogg',33,'user','2026-01-01',NULL);
-
--- PAAFs: the client's list of people, one per user per client. Rate = client sales rate for the user's own role. No client approves
--- individuals, so each is active from the day it is added.
-INSERT INTO paaf (paaf_id, user_id, client_id, rate_id, status, sent_date, decided_date, document_ref) VALUES
- (1, 5, 1, 4, 'Approved','2026-03-02','2026-03-09','paaf/apache/A005_Ewan_Shaw.pdf'),
- (2, 3, 1, 5, 'Approved','2026-01-05','2026-01-12','paaf/apache/A003_Stuart_Sherwood.pdf'),
- (3, 1, 1, 6, 'Approved','2026-01-05','2026-01-12','paaf/apache/A001_Emma_Noble.pdf'),
- (5, 1, 2, 12,'Approved','2026-01-06','2026-01-14','paaf/spirit/A001_Emma_Noble.pdf'),
- (6, 3, 2, 11,'Approved','2026-01-06','2026-01-14','paaf/spirit/A003_Stuart_Sherwood.pdf'),
- (8, 9, 1, 3, 'Approved','2026-02-02','2026-02-10','paaf/apache/A009_Daniel_Evans.pdf'),
- (9, 9, 2, 9, 'Approved','2026-02-02','2026-02-11','paaf/spirit/A009_Daniel_Evans.pdf'),
- (10,10,2, 10,'Approved','2026-02-02','2026-02-11','paaf/spirit/A010_Ajin_Sabu.pdf'),
- (11,11,1,13,'Approved','2026-02-02','2026-02-10','paaf/apache/A011.pdf'),
- (12,12,1,21,'Approved','2026-02-02','2026-02-10','paaf/apache/A012.pdf'),
- (13,13,1,22,'Approved','2026-02-02','2026-02-10','paaf/apache/A013.pdf'),
- (14,14,1,23,'Approved','2026-02-02','2026-02-10','paaf/apache/A014.pdf'),
- (15,15,1,25,'Approved','2026-02-02','2026-02-10','paaf/apache/A015.pdf'),
- (16,16,1,24,'Approved','2026-02-02','2026-02-10','paaf/apache/A016.pdf'),
- (17,17,1,26,'Approved','2026-02-02','2026-02-10','paaf/apache/A017.pdf'),
- (18,18,1,27,'Approved','2026-02-02','2026-02-10','paaf/apache/A018.pdf'),
- (19,19,1,29,'Approved','2026-02-02','2026-02-10','paaf/apache/A019.pdf'),
- (20,20,1,28,'Approved','2026-02-02','2026-02-10','paaf/apache/A020.pdf'),
- (21,21,1,17,'Approved','2026-02-02','2026-02-10','paaf/apache/A021.pdf'),
- (22,22,1,19,'Approved','2026-02-02','2026-02-10','paaf/apache/A022.pdf'),
- (23,23,1,16,'Approved','2026-02-02','2026-02-10','paaf/apache/A023.pdf'),
- (24,24,1,30,'Approved','2026-02-02','2026-02-10','paaf/apache/A024.pdf'),
- (25,26,1,14,'Approved','2026-02-02','2026-02-10','paaf/apache/A026.pdf'),
- (26,27,1,16,'Approved','2026-02-02','2026-02-10','paaf/apache/A027.pdf'),
- (27,28,1,31,'Approved','2026-02-02','2026-02-10','paaf/apache/A028.pdf'),
- (28,11,2,36,'Approved','2026-02-02','2026-02-11','paaf/spirit/A011.pdf'),
- (29,12,2,44,'Approved','2026-02-02','2026-02-11','paaf/spirit/A012.pdf'),
- (30,13,2,45,'Approved','2026-02-02','2026-02-11','paaf/spirit/A013.pdf'),
- (31,17,2,49,'Approved','2026-02-02','2026-02-11','paaf/spirit/A017.pdf'),
- (32,19,2,52,'Approved','2026-02-02','2026-02-11','paaf/spirit/A019.pdf'),
- (33,20,2,51,'Approved','2026-02-02','2026-02-11','paaf/spirit/A020.pdf'),
- (34,25,2,38,'Approved','2026-02-02','2026-02-11','paaf/spirit/A025.pdf'),
- (35,26,2,37,'Approved','2026-02-02','2026-02-11','paaf/spirit/A026.pdf'),
- -- The approvers hold a PAAF for the client they approve, so they can book hours to its scopes too. Their own hours are approved
- -- by a cost controller, since nobody may approve their own and the scope has no other approver.
- (36,8,2,60,'Approved','2026-02-02','2026-02-11','paaf/spirit/A008.pdf'),
- (37,7,1,2, 'Approved','2026-02-02','2026-02-10','paaf/apache/A007.pdf');
 
 -- Approvers: each client has a main approver. Secondary approvers on a scope (scope_approver) are added in Admin when a scope needs more
 -- than one person. Alisdair Woodhead is the Apache and Internal main approver and Kenneth Nicolson the Spirit one (both standard users).
@@ -204,7 +163,7 @@ INSERT INTO scope (scope_id, scope_code, client_id, project_id, description, sta
  (4,'A1400', 2,3,'Rivers and Calder','Pipeline'),
  (5,'A1500', 2,3,'PGC & NRU',        'Open'),
  (6,'A1600', 2,3,'Pipeline Removal', 'Open'),
- -- Internal codes (no PAAF, no rate)
+ -- Internal codes (no rate)
  (7,'INT01',3,4,'Business Services',   'Open'),
  (8,'INT02',3,4,'Training',            'Open'),
  (9,'INT03',3,4,'Business Development','Open');
@@ -216,78 +175,78 @@ INSERT INTO phase (phase_id, scope_id, name) VALUES
 
 -- Hour types: where hours are worked. Entries default to location 1 (On Shore) and normal time; overtime is a flag on the entry.
 -- The choices are On Shore, Offshore and Site visit; the IT admin can add more on the Locations tab.
-INSERT INTO location (location_id, name) VALUES (1,'On Shore'),(2,'Offshore'),(3,'Site visit');
+INSERT INTO location (location_id, name, earns_allowance) VALUES (1,'On Shore',0),(2,'Offshore',1),(3,'Site visit',0);
 
 -- Weekly periods: week of 26 Oct (to be closed later) and week of 2 Nov.
 INSERT INTO period (week_start) VALUES ('2026-10-26'),('2026-11-02');
 
--- Time entries. Columns: user, scope, phase, paaf, worked role, rate, date, hours, created_by.
-INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by) VALUES
+-- Time entries. Columns: user, scope, phase, worked role, rate, date, hours, created_by.
+INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by) VALUES
  -- Week of 26 Oct
- (5,1,1,1,4,4,  '2026-10-26',8,5),
- (5,1,1,1,4,4,  '2026-10-27',8,5),
- (3,1,1,2,5,5,  '2026-10-28',8,3),
- (1,5,6,5,6,12, '2026-10-28',8,1),
- (9,2,3,8,3,3,  '2026-10-29',8,9),
- (10,5,6,10,4,10,'2026-10-27',8,10),
+ (5,1,1,4,4,  '2026-10-26',8,5),
+ (5,1,1,4,4,  '2026-10-27',8,5),
+ (3,1,1,5,5,  '2026-10-28',8,3),
+ (1,5,6,6,12, '2026-10-28',8,1),
+ (9,2,3,3,3,  '2026-10-29',8,9),
+ (10,5,6,4,10,'2026-10-27',8,10),
  -- Week of 2 Nov. Ewan Shaw (Planner): own role Mon-Tue, covering Project Controls Manager Wed-Thu
- (5,1,1,1,4,4, '2026-11-02',8,5),
- (5,1,1,1,4,4, '2026-11-03',8,5),
- (5,1,1,1,5,5, '2026-11-04',8,5),
- (5,1,1,1,5,5, '2026-11-05',8,5),
+ (5,1,1,4,4, '2026-11-02',8,5),
+ (5,1,1,4,4, '2026-11-03',8,5),
+ (5,1,1,5,5, '2026-11-04',8,5),
+ (5,1,1,5,5, '2026-11-05',8,5),
  -- Stuart Sherwood (Project Controls Manager): two Apache scopes in one day, then Spirit
- (3,1,1,2,5,5, '2026-11-02',6,3),
- (3,2,3,2,5,5, '2026-11-02',2,3),
- (3,5,6,6,5,11,'2026-11-03',8,3),
- (3,5,6,6,5,11,'2026-11-04',8,3),
- (3,2,3,2,5,5, '2026-11-05',4,3),
- (3,6,7,6,5,11,'2026-11-05',4,3),
+ (3,1,1,5,5, '2026-11-02',6,3),
+ (3,2,3,5,5, '2026-11-02',2,3),
+ (3,5,6,5,11,'2026-11-03',8,3),
+ (3,5,6,5,11,'2026-11-04',8,3),
+ (3,2,3,5,5, '2026-11-05',4,3),
+ (3,6,7,5,11,'2026-11-05',4,3),
  -- Emma Noble (Cost Engineer): Apache and Spirit
- (1,1,1,3,6,6, '2026-11-02',4,1),
- (1,5,6,5,6,12,'2026-11-02',4,1),
- (1,6,7,5,6,12,'2026-11-03',8,1),
- (1,2,3,3,6,6, '2026-11-04',8,1),
- (1,1,1,3,6,6, '2026-11-05',8,1),
+ (1,1,1,6,6, '2026-11-02',4,1),
+ (1,5,6,6,12,'2026-11-02',4,1),
+ (1,6,7,6,12,'2026-11-03',8,1),
+ (1,2,3,6,6, '2026-11-04',8,1),
+ (1,1,1,6,6, '2026-11-05',8,1),
  -- Daniel Evans (Project Engineer): Apache and Spirit
- (9,1,1,8,3,3, '2026-11-02',8,9),
- (9,5,6,9,3,9, '2026-11-03',8,9),
- (9,2,3,8,3,3, '2026-11-04',8,9),
- (9,6,7,9,3,9, '2026-11-05',8,9),
+ (9,1,1,3,3, '2026-11-02',8,9),
+ (9,5,6,3,9, '2026-11-03',8,9),
+ (9,2,3,3,3, '2026-11-04',8,9),
+ (9,6,7,3,9, '2026-11-05',8,9),
  -- Ajin Sabu (Planner): Spirit, covering Project Controls Manager on Wednesday
- (10,5,6,10,4,10,'2026-11-02',8,10),
- (10,5,6,10,4,10,'2026-11-03',8,10),
- (10,6,7,10,5,11,'2026-11-04',8,10),
+ (10,5,6,4,10,'2026-11-02',8,10),
+ (10,5,6,4,10,'2026-11-03',8,10),
+ (10,6,7,5,11,'2026-11-04',8,10),
  -- Execute phase of BB0001: Daniel Evans (Project Engineer)
- (9,1,2,8,3,3,'2026-11-03',8,9);
+ (9,1,2,3,3,'2026-11-03',8,9);
 
 -- More people across job families (booked to their own job title)
-INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by) VALUES
- (11,2,3,11,7,13,'2026-10-27',8,11),
- (11,2,3,11,7,13,'2026-10-28',8,11),
- (12,2,3,12,15,21,'2026-10-27',8,12),
- (13,2,3,13,16,22,'2026-10-28',8,13),
- (14,2,3,14,17,23,'2026-10-28',8,14),
- (15,2,3,15,19,25,'2026-10-29',8,15),
- (16,2,3,16,18,24,'2026-10-29',8,16),
- (17,2,3,17,20,26,'2026-10-29',8,17),
- (20,2,3,20,22,28,'2026-10-27',8,20),
- (19,2,3,19,23,29,'2026-11-03',8,19),
- (18,1,1,18,21,27,'2026-10-28',8,18),
- (22,1,2,22,13,19,'2026-11-03',8,22),
- (23,1,1,23,10,16,'2026-10-27',8,23),
- (12,5,6,29,15,44,'2026-10-28',8,12),
- (13,5,6,30,16,45,'2026-11-02',8,13),
- (25,5,6,34,9,38,'2026-10-29',8,25),
- (26,5,6,35,8,37,'2026-11-03',8,26),
- (17,5,6,31,20,49,'2026-11-02',8,17),
- (20,6,7,33,22,51,'2026-11-03',8,20),
- (19,6,7,32,23,52,'2026-11-04',8,19),
- (11,6,7,28,7,36,'2026-11-04',4,11);
+INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by) VALUES
+ (11,2,3,7,13,'2026-10-27',8,11),
+ (11,2,3,7,13,'2026-10-28',8,11),
+ (12,2,3,15,21,'2026-10-27',8,12),
+ (13,2,3,16,22,'2026-10-28',8,13),
+ (14,2,3,17,23,'2026-10-28',8,14),
+ (15,2,3,19,25,'2026-10-29',8,15),
+ (16,2,3,18,24,'2026-10-29',8,16),
+ (17,2,3,20,26,'2026-10-29',8,17),
+ (20,2,3,22,28,'2026-10-27',8,20),
+ (19,2,3,23,29,'2026-11-03',8,19),
+ (18,1,1,21,27,'2026-10-28',8,18),
+ (22,1,2,13,19,'2026-11-03',8,22),
+ (23,1,1,10,16,'2026-10-27',8,23),
+ (12,5,6,15,44,'2026-10-28',8,12),
+ (13,5,6,16,45,'2026-11-02',8,13),
+ (25,5,6,9,38,'2026-10-29',8,25),
+ (26,5,6,8,37,'2026-11-03',8,26),
+ (17,5,6,20,49,'2026-11-02',8,17),
+ (20,6,7,22,51,'2026-11-03',8,20),
+ (19,6,7,23,52,'2026-11-04',8,19),
+ (11,6,7,7,36,'2026-11-04',4,11);
 
 -- Examples of the other hour types: an overtime day on site, and a day offshore.
-INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) VALUES
- (21,1,2,21,11,17,'2026-11-02',8,21, 1,1),
- (24,1,1,24,24,30,'2026-10-28',4,24, 2,0);
+INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) VALUES
+ (21,1,2,11,17,'2026-11-02',8,21, 1,1),
+ (24,1,1,24,30,'2026-10-28',4,24, 2,0);
 
 -- Approvals are edits, so they name who did it (and are written to time_entry_audit).
 -- Week of 26 Oct: approved by each scope's approver.
@@ -329,7 +288,7 @@ UPDATE time_entry SET status='Draft', reject_reason='Project Controls Manager co
        last_edited_by=8, last_edited_at='2026-11-06 10:00'
  WHERE user_id=10 AND work_date='2026-11-04';
 
--- The offshore allowance: one allowance, claimed per day, staff only. It is worth GBP 100 a day, whatever the hours; cost controllers
+-- The offshore allowance: one allowance, paid per night spent offshore, staff only (worked out from the hours, nothing is claimed). It is worth GBP 100 a night; cost controllers
 -- change it on the Admin, Allowance rate tab by adding a row with a later effective date.
 INSERT INTO allowance_type (allowance_id, name) VALUES (1,'Offshore allowance');
 INSERT INTO allowance_rate (allowance_id, amount, effective_from) VALUES (1, 100, '2026-01-01');
@@ -348,35 +307,28 @@ UPDATE phase SET description = 'Wellbay Clearance - Define', prepared_by = 'AB',
 WHERE phase_id = 1;
 
 -- ---------------------------------------------------------------------------------------------------------------------
--- An offshore week, with the offshore allowance. Both are staff, so they can claim allowances; the rates are on the allowance rate table.
+-- An offshore week, with the offshore allowance. Both are staff (contractors would earn none). A night is earned when someone is
+-- offshore that day and the next, so the last offshore day earns no night. Nothing is claimed: nights are worked out from the hours.
 --   Louis Ducharme (Operations Superintendent): week of 2 Nov offshore on BB0002 Mon-Fri (8 normal hours a day, plus 4 hours overtime
---     on Wed and Thu). Hours and allowances are approved Mon-Wed and submitted Thu-Fri.
---   Lloyd Quinn (Lead Construction Engineer): Mon on site, Tue-Fri offshore on BB0001 Define, all submitted, allowances submitted.
+--     on Wed and Thu): 4 nights (Mon-Thu). Hours are approved Mon-Wed and submitted Thu-Fri.
+--   Lloyd Quinn (Lead Construction Engineer): Mon on site, Tue-Fri offshore on BB0001 Define, all submitted: 3 nights (Tue-Thu).
+--   Rob Millman (HSES Advisor) has a single offshore day on 28 Oct: a day trip, no night.
 -- ---------------------------------------------------------------------------------------------------------------------
-INSERT INTO time_entry (user_id, scope_id, phase_id, paaf_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) VALUES
- (11,2,3,11,7,13,'2026-11-02',8,11,2,0),
- (11,2,3,11,7,13,'2026-11-03',8,11,2,0),
- (11,2,3,11,7,13,'2026-11-04',8,11,2,0),
- (11,2,3,11,7,13,'2026-11-05',8,11,2,0),
- (11,2,3,11,7,13,'2026-11-06',8,11,2,0),
- (11,2,3,11,7,13,'2026-11-04',4,11,2,1),
- (11,2,3,11,7,13,'2026-11-05',4,11,2,1),
- (18,1,1,18,21,27,'2026-11-02',8,18,1,0),
- (18,1,1,18,21,27,'2026-11-03',8,18,2,0),
- (18,1,1,18,21,27,'2026-11-04',8,18,2,0),
- (18,1,1,18,21,27,'2026-11-05',8,18,2,0),
- (18,1,1,18,21,27,'2026-11-06',8,18,2,0);
+INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) VALUES
+ (11,2,3,7,13,'2026-11-02',8,11,2,0),
+ (11,2,3,7,13,'2026-11-03',8,11,2,0),
+ (11,2,3,7,13,'2026-11-04',8,11,2,0),
+ (11,2,3,7,13,'2026-11-05',8,11,2,0),
+ (11,2,3,7,13,'2026-11-06',8,11,2,0),
+ (11,2,3,7,13,'2026-11-04',4,11,2,1),
+ (11,2,3,7,13,'2026-11-05',4,11,2,1),
+ (18,1,1,21,27,'2026-11-02',8,18,1,0),
+ (18,1,1,21,27,'2026-11-03',8,18,2,0),
+ (18,1,1,21,27,'2026-11-04',8,18,2,0),
+ (18,1,1,21,27,'2026-11-05',8,18,2,0),
+ (18,1,1,21,27,'2026-11-06',8,18,2,0);
 UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-05 10:00', last_edited_by=7, last_edited_at='2026-11-05 10:00'
  WHERE user_id=11 AND scope_id=2 AND status='Submitted' AND work_date BETWEEN '2026-11-02' AND '2026-11-04';
-
-INSERT INTO allowance_entry (user_id, scope_id, phase_id, allowance_id, work_date, created_by, last_edited_by, last_edited_at) VALUES
- (11,2,3,1,'2026-11-02',11,11,'2026-11-06 07:00'), (11,2,3,1,'2026-11-03',11,11,'2026-11-06 07:00'), (11,2,3,1,'2026-11-04',11,11,'2026-11-06 07:00'),
- (11,2,3,1,'2026-11-05',11,11,'2026-11-06 07:00'), (11,2,3,1,'2026-11-06',11,11,'2026-11-06 07:00'),
- (18,1,1,1,'2026-11-03',18,18,'2026-11-06 07:00'), (18,1,1,1,'2026-11-04',18,18,'2026-11-06 07:00'), (18,1,1,1,'2026-11-05',18,18,'2026-11-06 07:00'),
- (18,1,1,1,'2026-11-06',18,18,'2026-11-06 07:00');
-UPDATE allowance_entry SET status='Submitted', last_edited_by=user_id, last_edited_at='2026-11-06 08:00' WHERE user_id IN (11, 18);
-UPDATE allowance_entry SET status='Approved', approved_by=7, approved_at='2026-11-06 09:30', last_edited_by=7, last_edited_at='2026-11-06 09:30'
- WHERE user_id=11 AND work_date BETWEEN '2026-11-02' AND '2026-11-04';
 
 -- Line managers. Graeme Hogg (managing director) manages the heads and the commercial team; Alisdair Woodhead and Kenneth Nicolson manage
 -- the engineers and planners of their clients; the IT admin has none.

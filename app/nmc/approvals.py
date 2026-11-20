@@ -3,9 +3,10 @@ import datetime
 import sqlite3
 from urllib.parse import quote
 from nmc.core import (
-    allowance_queue, approval_queue, date_input, esc,
+    dmy,
+    approval_queue, date_input, esc,
     fmt, hidden, is_approver, layout,
-    may_action, may_action_allowance, monday, msgs_html,
+    may_action, monday, msgs_html,
     no_access, permission_of, sel, stamp,
     table, txt)
 
@@ -21,8 +22,8 @@ APPROVALS_JS = """<script>
 function openRow(a){var r=document.getElementById(a.getAttribute('data-r')); r.style.display=(r.style.display==='none')?'':'none'; return false;}
 function openAll(show){var d=document.querySelectorAll('tr.drow'), i; for(i=0;i<d.length;i++){d[i].style.display=show?'':'none';} return false;}
 function tickPerson(c){var e=document.querySelectorAll('input[data-p="'+c.getAttribute('data-p')+'"]'), i; for(i=0;i<e.length;i++){e[i].checked=c.checked;}}
-function tickAll(c){var e=document.getElementsByName('entry_ids'), g=document.getElementsByName('allowance_entry_id'), p=document.querySelectorAll('input.pp'), i;
-  for(i=0;i<e.length;i++){e[i].checked=c.checked;} for(i=0;i<g.length;i++){g[i].checked=c.checked;} for(i=0;i<p.length;i++){p[i].checked=c.checked;}}
+function tickAll(c){var e=document.getElementsByName('entry_ids'), p=document.querySelectorAll('input.pp'), i;
+  for(i=0;i<e.length;i++){e[i].checked=c.checked;} for(i=0;i<p.length;i++){p[i].checked=c.checked;}}
 </script>"""
 
 
@@ -35,12 +36,10 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
                       "You are not named as an approver on any code, so there is nothing for you to approve.</p>")
     where, wargs = queue
     q = q or {}
-    aq = allowance_queue(con, u)
     waiting = con.execute(
         "select wk, sum(n) as n from (select date(t.work_date,'weekday 0','-6 days') as wk, count(*) as n from time_entry t join scope s on s.scope_id=t.scope_id "
         "where t.status in ('Submitted','Edited')" + where + " group by wk "
-        "union all select date(a.work_date,'weekday 0','-6 days') as wk, count(*) as n from allowance_entry a join scope s on s.scope_id=a.scope_id "
-        "where a.status='Submitted'" + aq[0] + " group by wk) group by wk order by wk", list(wargs) + list(aq[1])).fetchall()
+        ") group by wk order by wk", list(wargs)).fetchall()
     try:
         w = monday(datetime.date.fromisoformat(q["w"][0]))
     except (KeyError, ValueError, IndexError):
@@ -59,13 +58,6 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
     people = {}
     for e in entries:
         people.setdefault(e["user_id"], []).append(e)
-    allowances = con.execute(
-        "select a.allowance_entry_id, a.user_id, bu.name as booked_by, at.name as allowance, a.work_date, a.status, c.name as client, s.scope_code, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase "
-        "from allowance_entry a join scope s on s.scope_id=a.scope_id join phase ph on ph.phase_id=a.phase_id join client c on c.client_id=s.client_id "
-        "join allowance_type at on at.allowance_id=a.allowance_id join app_user bu on bu.user_id=a.user_id "
-        "where a.status<>'Draft' and a.work_date between ? and ?" + aq[0] + " order by bu.name, a.work_date, a.allowance_id",
-        [d0, days[-1].isoformat()] + list(aq[1])).fetchall()
-
     def link(wk, label):
         return '<a href="/approvals?u=%d&amp;w=%s">%s</a>' % (u, wk.isoformat(), label)
 
@@ -83,7 +75,7 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
             link(datetime.date.fromisoformat(r["wk"]), "%s (%d)" % (datetime.date.fromisoformat(r["wk"]).strftime("%d/%m/%Y"), r["n"])) for r in waiting))
     else:
         body += "<p>Nothing waiting for your approval.</p>"
-    if not people and not allowances:
+    if not people:
         return layout(con, u, "Approvals", body + "<p>No submitted or approved hours in this week from the people you approve.</p>")
 
     head = ('<tr><th><input type="checkbox" title="Select all" onclick="tickAll(this)"></th><th>Person</th>%s<th>Total</th><th>Waiting</th><th>Approved</th></tr>' %
@@ -134,14 +126,6 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
                        drow, ncol - 2, "".join("<th>%s</th>" % d.strftime("%a %d/%m") for d in days), "".join(lines)))
     foot = ('<tr><td></td><td align="right"><b>All people</b></td>%s<td align="right"><b>%s</b></td><td></td><td></td></tr>' % (
         "".join('<td align="center"><b>%s</b></td>' % (fmt(day_tot[d.isoformat()]) if day_tot[d.isoformat()] else "&ndash;") for d in days), fmt(sum(day_tot.values()))))
-    allow_html = ""
-    if allowances:
-        allow_html = ('<p><b>Allowances</b> <small>Claims for the offshore allowance, approved or sent back in the same way as hours.</small></p>'
-                      '<table border="1" cellpadding="3" cellspacing="0"><tr><th></th><th>Person</th><th>Allowance</th><th>Date</th><th>Client</th><th>Scope</th><th>CTR</th><th>Status</th></tr>%s</table>' % "".join(
-                          '<tr><td align="center">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
-                              '<input type="checkbox" name="allowance_entry_id" value="%d">' % a["allowance_entry_id"] if a["status"] == "Submitted" else "",
-                              esc(a["booked_by"]), esc(a["allowance"]), esc(a["work_date"]), esc(a["client"]), esc(a["scope_code"]), esc(a["phase"]), esc(a["status"]))
-                          for a in allowances))
     body += ('<form method="post" action="/approvals/act">%s<p><small>One line per person, with the submitted and approved hours for each day. '
              '<a href="#" class="js" style="display:none" onclick="return openAll(true)">Show all detail</a>'
              '<span class="js" style="display:none"> | </span>'
@@ -149,19 +133,18 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
              'Open a line to see everything booked against that person. Tick the boxes (a person, or single entries in their detail) to action them, '
              'or tick the box in the header to select all and then untick any you have an issue with. Entries left unticked stay in your queue. '
              'Use Previous week to see earlier approved hours.</small></p>'
-             '%s%s%s'
+             '%s%s'
              '<p><input type="submit" name="action" value="Approve selected"></p>'
              '<p>Reason (needed to reject) %s <input type="submit" name="action" value="Reject selected"> '
              '<small>Rejected entries go back to the person as drafts. Edited entries can only be approved.</small></p></form>'
              % (hidden(u=u, w=d0), ('<table border="1" cellpadding="3" cellspacing="0">%s%s%s</table>' % (head, "".join(trs), foot)) if people else "",
-                allow_html, APPROVALS_JS, txt("reason", "", 40)))
+                APPROVALS_JS, txt("reason", "", 40)))
     return layout(con, u, "Approvals", body)
 
 
 def act_approval(con, form):
     u = int(form["u"][0])
     ids = [int(x) for x in form.get("entry_id", [])] + [int(x) for v in form.get("entry_ids", []) for x in v.split(",") if x.strip().isdigit()]
-    aids = [int(x) for x in form.get("allowance_entry_id", [])]
     if form.get("approve_person"):  # the Approve all button on a person's line: everything of theirs waiting this week, no ticking
         try:
             who, wk = int(form["approve_person"][0]), monday(datetime.date.fromisoformat(form["w"][0]))
@@ -169,20 +152,17 @@ def act_approval(con, form):
             who = None
         if who:
             end = (wk + datetime.timedelta(days=6)).isoformat()
-            hq, aq_ = approval_queue(con, u), allowance_queue(con, u)
+            hq = approval_queue(con, u)
             if hq:
                 ids = [r[0] for r in con.execute("select t.entry_id from time_entry t join scope s on s.scope_id=t.scope_id where t.status in ('Submitted','Edited') "
                                                  "and t.user_id=? and t.work_date between ? and ?" + hq[0], [who, wk.isoformat(), end] + list(hq[1]))]
-            if aq_:
-                aids = [r[0] for r in con.execute("select a.allowance_entry_id from allowance_entry a join scope s on s.scope_id=a.scope_id where a.status='Submitted' "
-                                                  "and a.user_id=? and a.work_date between ? and ?" + aq_[0], [who, wk.isoformat(), end] + list(aq_[1]))]
         form = dict(form, action=["Approve selected"])
     action, reason = form["action"][0], form.get("reason", [""])[0].strip()
     approve = action.startswith("Approve")
     q = {"w": form["w"]} if form.get("w") else {}
     if approval_queue(con, u) is None:
         return view_approvals(con, u, q=q)
-    if not ids and not aids:
+    if not ids:
         return view_approvals(con, u, ["Tick at least one entry first."], q=q)
     if not approve and not reason:
         return view_approvals(con, u, ["Give a reason to reject."], q=q)
@@ -206,33 +186,11 @@ def act_approval(con, form):
             done += 1
         except sqlite3.DatabaseError as e:
             msgs.append("Entry %d: %s" % (eid, e))
-    a_done = 0
-    for aid in aids:
-        if not may_action_allowance(con, u, aid):
-            msgs.append("Allowance %d: only an approver of its scope can approve or reject it "
-                        "(a cost controller can, when the booker is the scope's only approver)." % aid)
-            continue
-        cur = con.execute("select status from allowance_entry where allowance_entry_id=?", (aid,)).fetchone()
-        if not cur or cur[0] != "Submitted":
-            msgs.append("Allowance %d: only submitted allowances can be approved or rejected." % aid)
-            continue
-        try:
-            if approve:
-                con.execute("update allowance_entry set status='Approved', approved_by=?, approved_at=?, last_edited_by=?, last_edited_at=? "
-                            "where allowance_entry_id=?", (u, stamp(), u, stamp(), aid))
-            else:
-                con.execute("update allowance_entry set status='Draft', reason=?, last_edited_by=?, last_edited_at=? where allowance_entry_id=?",
-                            (reason, u, stamp(), aid))
-            a_done += 1
-        except sqlite3.DatabaseError as e:
-            msgs.append("Allowance %d: %s" % (aid, e))
     con.commit()
     verb = "approved" if approve else "sent back to draft"
     ok_msgs = []
     if done:
         ok_msgs.append("%d entr%s %s." % (done, "y" if done == 1 else "ies", verb))
-    if a_done:
-        ok_msgs.append("%d allowance day%s %s." % (a_done, "" if a_done == 1 else "s", verb))
     return view_approvals(con, u, ok_msgs + msgs, ok=not msgs, q=q)
 
 
@@ -356,8 +314,7 @@ def view_reopen(con, u, q, msgs=None, ok=False):
         return layout(con, u, "Reopen timesheet", "".join(b))
     name = dict(people)[person]
     wks = [r[0] for r in con.execute("select distinct date(work_date,'weekday 0','-6 days') as wk from time_entry where user_id=? and status<>'Draft' "
-                                     "union select distinct date(work_date,'weekday 0','-6 days') from allowance_entry where user_id=? and status<>'Draft' "
-                                     "order by 1 desc limit 12", (person, person))]
+                                     "order by 1 desc limit 12", (person,))]
     b.append("<p><small>Weeks with submitted or approved hours: %s.</small></p>" % (
         ", ".join('<a href="/reopen?u=%d&amp;person=%d&amp;w=%s">%s</a>' % (u, person, wk, datetime.date.fromisoformat(wk).strftime("%d/%m/%Y")) for wk in wks) or "none"))
     ents = con.execute(
@@ -371,7 +328,7 @@ def view_reopen(con, u, q, msgs=None, ok=False):
         b.append("<p>%s has no hours in this week.</p>" % esc(name))
         return layout(con, u, "Reopen timesheet", "".join(b))
     b.append(table(["Date", "Code", "Skill code", "Location", "Type", "Hours", "Status", "Approved by"],
-                   [[e["work_date"], "%s %s" % (e["scope_code"], e["phase"]), e["skill_code"], e["location_name"],
+                   [[dmy(e["work_date"]), e["phase"], e["skill_code"], e["location_name"],
                      "Overtime" if e["overtime"] else "Normal", fmt(e["hours"]), e["status"], e["approved_name"] or ""] for e in ents]))
     reopenable = [e for e in ents if e["status"] != "Draft"]
     period = con.execute("select status from period where week_start=?", (d0,)).fetchone()
@@ -408,17 +365,9 @@ def reopen_week(con, form):
     d0, d6 = w.isoformat(), (w + datetime.timedelta(days=6)).isoformat()
     ids = [r[0] for r in con.execute("select entry_id from time_entry where user_id=? and status<>'Draft' and work_date between ? and ? "
                                      "order by entry_id", (person, d0, d6))]
-    aids = [r[0] for r in con.execute("select allowance_entry_id from allowance_entry where user_id=? and status<>'Draft' and work_date between ? and ? "
-                                      "order by allowance_entry_id", (person, d0, d6))]
-    if not ids and not aids:
+    if not ids:
         return view_reopen(con, u, q, ["Nothing to reopen: there are no submitted or approved hours in that week."])
     msgs, n = [], 0
-    for aid in aids:  # allowances go back to Draft with the hours
-        try:
-            con.execute("update allowance_entry set status='Draft', approved_by=NULL, approved_at=NULL, reason=?, last_edited_by=?, last_edited_at=? "
-                        "where allowance_entry_id=?", (reason, u, stamp(), aid))
-        except sqlite3.DatabaseError as e:
-            msgs.append("Allowance %d: %s" % (aid, e))
     for eid in ids:
         try:
             con.execute("update time_entry set status='Draft', approved_by=NULL, approved_at=NULL, reject_reason=NULL, reopen_reason=?, "
@@ -427,10 +376,10 @@ def reopen_week(con, form):
         except sqlite3.DatabaseError as e:
             msgs.append("Entry %d: %s" % (eid, e))
     ok_msgs = []
-    if n or aids:
+    if n:
         who = con.execute("select name from app_user where user_id=?", (person,)).fetchone()[0]
         ok_msgs.append("%d entr%s reopened%s. They are drafts again, with your reason, for %s to correct and submit." % (
-            n, "y" if n == 1 else "ies", (" with %d allowance day%s" % (len(aids), "" if len(aids) == 1 else "s")) if aids else "", who))
+            n, "y" if n == 1 else "ies", "", who))
         if "reopen_period" in form:
             con.execute("insert or ignore into period (week_start) values (?)", (d0,))
             con.execute("update period set status='Open', closed_by=NULL, closed_at=NULL where week_start=?", (d0,))

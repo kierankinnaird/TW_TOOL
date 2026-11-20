@@ -7,8 +7,8 @@ from nmc.core import date_input, esc, fmt, layout, locations, me_row, monday, ms
 TIMESHEET_JS = """<script>
 // Keeps the row, day and week totals (normal time, overtime and total) in step with what is typed, before anything is saved.
 function fmtH(x){return String(parseFloat(x.toFixed(2)));}
-function fill(sel, m){var ds=document.querySelectorAll(sel), k; for(k=0;k<ds.length;k++){ds[k].firstChild.textContent=fmtH(m[ds[k].getAttribute('data-day')]||0);}}
-function put(sel, v){var g=document.querySelector(sel); if(g){g.firstChild.textContent=fmtH(v);}}
+function fill(sel, m){var ds=document.querySelectorAll(sel), k, t; for(k=0;k<ds.length;k++){t=fmtH(m[ds[k].getAttribute('data-day')]||0); if(ds[k].firstChild){ds[k].firstChild.textContent=t;}else{ds[k].textContent=t;}}}
+function put(sel, v){var g=document.querySelector(sel); if(g){if(g.firstChild){g.firstChild.textContent=fmtH(v);}else{g.textContent=fmtH(v);}}}
 function recalc(){
   var rows=document.querySelectorAll('tr.row'), dn={}, dO={}, dt={}, gn=0, go=0, i, j;
   for(i=0;i<rows.length;i++){
@@ -26,28 +26,65 @@ function recalc(){
   }
   fill('td.dn', dn); fill('td.do', dO); fill('td.dt', dt);
   put('td.gn', gn); put('td.go', go); put('td.gt', gn+go);
+  flagDays(dt);
+}
+function flagDays(dt){
+  var names=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'], over=[], tds=document.querySelectorAll('td.dt, td.c'), i, d, t;
+  for(i=0;i<tds.length;i++){d=tds[i].getAttribute('data-day'); if(!d){continue;}
+    var bad=(dt[d]||0)>24; tds[i].classList.toggle('over', bad&&tds[i].classList.contains('dt'));
+    var inp=tds[i].querySelector('input[type=text]'); if(inp){var v=inp.value.trim(); inp.classList.toggle('bad', bad||(v!==''&&(isNaN(Number(v))||Number(v)<0)));}
+    if(bad&&tds[i].classList.contains('dt')){t=new Date(d+'T00:00:00'); over.push(names[t.getDay()]+' '+('0'+t.getDate()).slice(-2)+'/'+('0'+(t.getMonth()+1)).slice(-2)+' ('+fmtH(dt[d])+' hours)');}}
+  var box=document.getElementById('dayerr'); if(box){box.style.display=over.length?'block':'none'; box.textContent=over.length?'Too many hours in one day: '+over.join(', ')+'. You cannot book more than 24 hours in a day, so those hours will not be saved.':'';}
 }
 function showOt(a){var tr=a.closest('tr'), nx=tr.nextElementSibling; if(nx){nx.style.display='';var i=nx.querySelector('input[type=text]'); if(i){i.focus();}} a.style.display='none'; return false;}
 function filterCtr(q){q=q.toLowerCase();var s=document.getElementById('addphase'),o=s.options,i,first=null;
   for(i=0;i<o.length;i++){var m=o[i].text.toLowerCase().indexOf(q)>=0;o[i].hidden=!m;o[i].disabled=!m;if(m&&!first){first=o[i];}}
   if(first&&(s.selectedIndex<0||o[s.selectedIndex].disabled)){first.selected=true;}}
 document.addEventListener('input',function(e){if(e.target.name&&e.target.name.indexOf('h_')===0){recalc();}});
+window.addEventListener('load',recalc);
 </script>"""
 
 
-def sheet_locked(con, u, d0, d6):
-    """A week's sheet is locked once it has been submitted: it has hours past Draft and nothing left in Draft. Sent-back or
-    reopened entries go back to Draft, which opens the sheet again."""
+def stretches(d0, d6):
+    """A week as one or two stretches of days. A week that runs over a calendar month end is split there (for example Mon 30 Nov and
+    Tue 1 - Sun 6 Dec), so the month's hours can be submitted and locked while the new month stays open."""
+    a, b = datetime.date.fromisoformat(d0), datetime.date.fromisoformat(d6)
+    if a.month == b.month:
+        return [(d0, d6)]
+    last = b.replace(day=1) - datetime.timedelta(days=1)
+    return [(d0, last.isoformat()), ((last + datetime.timedelta(days=1)).isoformat(), d6)]
+
+
+def stretch_locked(con, u, d0, d6):
+    """A stretch is locked once it has been submitted: it has hours past Draft and nothing left in Draft. Sent-back or
+    reopened entries go back to Draft, which opens it again."""
     non_draft, draft = con.execute(
         "select coalesce(sum(status<>'Draft'),0), coalesce(sum(status='Draft'),0) from time_entry where user_id=? and work_date between ? and ?", (u, d0, d6)).fetchone()
     return non_draft > 0 and draft == 0
 
 
+def locked_days(con, u, d0, d6):
+    """The dates in the week that sit in a submitted stretch: nothing can be added to or changed on them."""
+    days = set()
+    for a, b in stretches(d0, d6):
+        if stretch_locked(con, u, a, b):
+            n = (datetime.date.fromisoformat(b) - datetime.date.fromisoformat(a)).days
+            days.update((datetime.date.fromisoformat(a) + datetime.timedelta(days=i)).isoformat() for i in range(n + 1))
+    return days
+
+
+def sheet_locked(con, u, d0, d6):
+    """The whole sheet is locked when every stretch of the week is submitted. A week that crosses a month end can have its first
+    stretch submitted and locked while the second stays open."""
+    return all(stretch_locked(con, u, a, b) for a, b in stretches(d0, d6))
+
+
 LOCKED_MSG = "This timesheet has been submitted and is locked. Ask a cost controller to reopen it if something needs changing."
 
 
-def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
+def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
     adds = adds or []
+    typed = typed or {}  # what was typed in boxes that could not be saved, so it is not lost
     me = me_row(con, u)
     if not me:
         return layout(con, u, "My Timesheet", "<p>Unknown user.</p>")
@@ -60,6 +97,8 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
     open_week = bool(period and period["status"] == "Open")
     locked = sheet_locked(con, u, d0, d6)
     can_edit = open_week and not locked  # a submitted sheet is locked as a whole: no new hours or rows either
+    lock_days = locked_days(con, u, d0, d6)  # in a week over a month end, the submitted month's days alone are locked
+    parts = stretches(d0, d6)
     start, end = me["start_date"], me["end_date"]  # hours can only be booked on dates from the start date to the end date
 
     def active(iso):
@@ -107,6 +146,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
 
     b = []
     b.append(msgs_html(msgs, ok))
+    b.append('<div id="dayerr" class="msg bad" style="display:none"></div>')
     prev_w, next_w = (w - datetime.timedelta(days=7)).isoformat(), (w + datetime.timedelta(days=7)).isoformat()
     b.append('<div class="wk"><span class="nav"><a href="/timesheet?u=%d&amp;w=%s">&lt;&lt; Previous week</a> '
              '<a href="/timesheet?u=%d&amp;w=%s">Next week &gt;&gt;</a> <a href="/timesheet?u=%d&amp;w=%s">This week</a></span>'
@@ -148,8 +188,8 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
         for e in found:
             a = con.execute(audit_sql, (e["entry_id"],)).fetchone()
             by = " (%s by %s on %s)" % (verb, esc(a["who"] or "someone"), when(a["changed_at"])) if a else ""
-            groups.setdefault((e[reason_key], by), []).append("%s %s, %s: %s hours (%s%s)" % (
-                esc(e["scope_code"]), esc(e["phase"]), datetime.date.fromisoformat(e["work_date"]).strftime("%a %d/%m"), fmt(e["hours"]),
+            groups.setdefault((e[reason_key], by), []).append("%s, %s: %s hours (%s%s)" % (
+                esc(e["phase"]), datetime.date.fromisoformat(e["work_date"]).strftime("%a %d/%m"), fmt(e["hours"]),
                 esc(e["location_name"]), ", overtime" if e["overtime"] else ""))
         lines = ["<li><b>Reason:</b> %s%s<br>%s</li>" % (esc(reason), by, "; ".join(items)) for (reason, by), items in groups.items()]
         b.append('<div class="msg bad"><p><b>%s</b></p><ul>%s</ul><p>%s</p></div>' % (title, "".join(lines), advice))
@@ -209,7 +249,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
             name = "h_%d_%d_%d_%d_%s" % (pid, rid, lid, ot, iso)
             fixed = ""  # hours the person cannot type over (shown as text), so the live totals can still count them
             if e is None:
-                cell = '<input type="text" size="4" name="%s" value="">' % name if can_edit and active(iso) else ("&ndash;" if can_edit else "&nbsp;")
+                cell = '<input type="text" size="4" name="%s" value="%s">' % (name, esc(typed.get(name, ""))) if can_edit and active(iso) and iso not in lock_days else ("&ndash;" if can_edit else "&nbsp;")
             else:
                 rt += e["hours"]
                 day_tot[iso] += e["hours"]
@@ -220,7 +260,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
                 else:
                     why = (' title="Sent back: %s"' % esc(e["reject_reason"]) if e["status"] == "Draft" and e["reject_reason"] else
                            ' title="Reopened: %s"' % esc(e["reopen_reason"]) if e["status"] == "Draft" and e["reopen_reason"] else "")
-                    cell = '<input type="text" size="4" name="%s" value="%s"%s>' % (name, fmt(e["hours"]), why)
+                    cell = '<input type="text" size="4" name="%s" value="%s"%s>' % (name, esc(typed.get(name, fmt(e["hours"]))), why)
             tds.append('<td align="center" class="c%s" data-day="%s"%s>%s</td>' % (" we" if d.weekday() >= 5 else "", iso, fixed, cell))
         tds.append('<td align="right" class="rt">%s</td>' % fmt(rt))
         mine = [rows[(pid, rid, lid, o)]["cells"].values() for o in (0, 1)]
@@ -232,7 +272,8 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
             tds.append('<td class="del"></td>')
         trs.append('<tr class="row%s" data-ot="%d"%s>%s</tr>' % (" otrow" if ot else "", ot, ' style="display:none"' if ot_hidden else "", "".join(tds)))
     if not trs:
-        trs.append('<tr><td colspan="%d">No rows yet. Use the Add timesheet row button above.</td></tr>' % len(head))
+        trs.append('<tr><td colspan="%d"><div class="empty"><b>Nothing booked this week yet.</b>%s</div></td></tr>' % (
+            len(head), " Click <b>+ Add timesheet row</b> above to choose a CTR, then enter your hours." if can_edit else ""))
 
     def sum_row(label, day_cls, week_cls, per_day, row_cls=""):  # Normal time, Overtime and Total lines under the grid
         return '<tr class="%s"><td align="right"><b>%s</b></td>%s<td align="right" class="%s"><b>%s</b></td><td></td></tr>' % (
@@ -248,20 +289,39 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
     b.append('<div class="tools"><!--ADDROW--></div>')
     b.append('<table class="ts" border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s%s</table>' % (hdr, "".join(trs), foot))
     b.append(TIMESHEET_JS)
+    # after Save, Add row, Copy and Submit (posted to /timesheet/...), put the address back to the timesheet itself so a refresh does not re-post the form
+    b.append("<script>if(location.pathname.indexOf('/timesheet/')===0){history.replaceState(null,'','/timesheet?u=%d&w=%s');}</script>" % (u, d0))
     by_status = {"Approved": 0.0, "Edited": 0.0, "Submitted": 0.0, "Draft": 0.0}
     for e in entries:
         by_status[e["status"]] += e["hours"]
     b.append("<p><small><b>Hours this week (all statuses): %s</b> &nbsp; Approved %s, Edited %s, Submitted %s, Draft %s</small></p>" % (
         fmt(sum(by_status.values())), fmt(by_status["Approved"]), fmt(by_status["Edited"]), fmt(by_status["Submitted"]), fmt(by_status["Draft"])))
+    nights = con.execute("select count(*) from v_offshore_night where user_id=? and work_date between ? and ?", (u, d0, d6)).fetchone()[0]
+    if nights:  # worked out from the offshore hours, so nothing is claimed: a night is earned when offshore that day and the next
+        b.append("<p><small><b>Offshore allowance:</b> %d night%s this week (a night is earned when you are offshore that day and the next, so the last offshore day of a trip earns none). "
+                 "It is worked out from your hours, so there is nothing to claim.</small></p>" % (nights, "" if nights == 1 else "s"))
     if not locked:
         b.append("<p><small>To clear a draft entry, empty its box and click Save draft.</small></p>")
+    if len(parts) == 2 and not locked:
+        m = lambda iso: datetime.date.fromisoformat(iso).strftime("%d/%m")
+        month, upto = datetime.date.fromisoformat(parts[0][1]).strftime("%B"), m(parts[0][1])
+        if stretch_locked(con, u, *parts[0]):
+            b.append("<p><small><b>Month end:</b> your hours up to %s are submitted and locked. %s onwards stays open for you to enter.</small></p>" % (upto, m(parts[1][0])))
+        else:
+            b.append("<p><small><b>Month end:</b> this week runs over the end of %s. Use <b>Submit up to %s</b> to submit and lock %s on its own; "
+                     "%s onwards stays open for you to enter.</small></p>" % (month, upto, "the month's hours" if parts[0][0] != parts[0][1] else upto, m(parts[1][0])))
     if any(e["status"] != "Draft" for e in entries):
         b.append("<p><small>Submitted and approved hours are locked. If one needs changing, ask a cost controller to reopen the timesheet.</small></p>")
     if locked:
         b.append('<div class="actions"><b>Locked.</b> <small>This timesheet has been submitted. Ask a cost controller to reopen it if something needs changing.</small></div></form>')
+    elif not can_edit:  # a week that is not open (not started by the admin, or closed): nothing can be saved or submitted
+        b.append("</form>")
     else:
-        b.append('<div class="actions"><input type="submit" name="action" value="Save draft"> '
-                 '<input type="submit" name="action" value="Submit week"> <small>Save draft keeps your hours private; Submit week sends them for approval.</small></div></form>')
+        part_btn = ""
+        if len(parts) == 2 and not stretch_locked(con, u, *parts[0]):
+            part_btn = '<input type="submit" name="submit_part" value="Submit up to %s"> ' % datetime.date.fromisoformat(parts[0][1]).strftime("%d/%m")
+        b.append('<div class="actions"><input type="submit" name="action" value="Save draft"> %s'
+                 '<input type="submit" name="action" value="Submit week"> <small>Save draft keeps your hours private; Submit week sends them for approval.</small></div></form>' % part_btn)
 
     # add a row
     scopes = con.execute(
@@ -297,7 +357,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False):
                '<input type="button" value="Cancel" onclick="this.closest(\'dialog\').close()"></p>' % (so_list, ro, lo)]
         dlg.append("</div></dialog>")
         b.append("".join(dlg))
-        add_button = '<input type="button" value="+ Add timesheet row" onclick="document.getElementById(\'addrow\').showModal()">'
+        add_button = '' if not can_edit else '<input type="button" value="+ Add timesheet row" onclick="document.getElementById(\'addrow\').showModal()">'
     else:
         b.append("<p>There are no open booking codes you can book to.</p>")
     return layout(con, u, "My Timesheet", "".join(b).replace("<!--ADDROW-->", add_button))
@@ -329,14 +389,20 @@ def book_entry(con, u, pid, rid, lid, ot, date, hours):
     return None
 
 
+def friendly(problem):
+    """The database's booking-rule messages, put the way a person would say them."""
+    return str(problem).replace("A person cannot book more than 24 hours in one day", "you cannot book more than 24 hours in one day")
+
+
 def save_timesheet(con, form):
     u, w = int(form["u"][0]), datetime.date.fromisoformat(form["w"][0])
     action = form.get("action", ["Save draft"])[0]
     adds = parse_adds(form.get("add", []))
-    msgs, saved, cleared = [], 0, 0
+    msgs, saved, cleared, typed = [], 0, 0, {}
     d0, d6 = w.isoformat(), (w + datetime.timedelta(days=6)).isoformat()
     if sheet_locked(con, u, d0, d6):  # nothing at all can be added to or changed on a submitted sheet
         return view_timesheet(con, u, w, [LOCKED_MSG])
+    frozen = locked_days(con, u, d0, d6)  # days in an already submitted stretch (a month end inside the week)
     delete = form.get("delrow", [""])[0].split(":")  # "h:phase:role:location"
     try:
         del_h = tuple(int(x) for x in delete[1:4]) if delete[0] == "h" and len(delete) == 4 else None
@@ -357,7 +423,7 @@ def save_timesheet(con, form):
                            "where ph.phase_id=?", (pid,)).fetchone()
         if not info:
             continue
-        label = "%s %s, %s" % (info["scope_code"], info["phase"], date)
+        label = "%s on %s" % (datetime.date.fromisoformat(date).strftime("%a %d/%m"), info["phase"])
         existing = con.execute("select * from time_entry where user_id=? and phase_id=? and worked_role_id=? and work_date=? "
                                "and location_id=? and overtime=?", (u, pid, rid, date, lid, ot)).fetchone()
         if raw == "":
@@ -376,6 +442,7 @@ def save_timesheet(con, form):
             hours = float(raw)
         except ValueError:
             msgs.append("%s: '%s' is not a number." % (label, raw))
+            typed[key] = raw
             continue
         try:
             if existing:
@@ -387,13 +454,21 @@ def save_timesheet(con, form):
                 con.execute("update time_entry set hours=?, last_edited_by=?, last_edited_at=? where entry_id=?",
                             (hours, u, stamp(), existing["entry_id"]))
             else:
+                if date in frozen:
+                    msgs.append("%s: that day has been submitted and is locked. Ask a cost controller to reopen it." % label)
+                    continue
                 problem = book_entry(con, u, pid, rid, lid, ot, date, hours)
                 if problem:
-                    msgs.append("%s: %s" % (label, problem))
+                    msgs.append("%s: %s" % (label, friendly(problem)))
+                    typed[key] = raw
                     continue
             saved += 1
         except sqlite3.DatabaseError as e:
-            msgs.append("%s: %s" % (label, e))
+            msgs.append("%s: %s" % (label, friendly(e)))
+            typed[key] = raw
+    for key in typed:  # a row whose hours could not be saved stays on the grid so what was typed can be corrected
+        _, pid, rid, lid, ot, _date = key.split("_", 5)
+        adds += parse_adds(["%s:%s:%s:%s" % (pid, rid, lid, ot)])
     if action == "Add row" and form.get("add_phase") and form.get("add_role"):  # saved above; now show the new empty row
         adds += parse_adds(["%s:%s:%s:%s" % (form["add_phase"][0], form["add_role"][0], form.get("add_loc", ["1"])[0], "1" if "add_ot" in form else "0")])
     ok_msgs = []
@@ -415,19 +490,25 @@ def save_timesheet(con, form):
         ok_msgs.append("%d entr%s saved." % (saved, "y" if saved == 1 else "ies"))
     if cleared:
         ok_msgs.append("%d draft entr%s cleared." % (cleared, "y" if cleared == 1 else "ies"))
-    if action == "Submit week":
+    part = form.get("submit_part", [""])[0]
+    if part:
+        action = "Submit up to"
+    if action in ("Submit week", "Submit up to"):
+        a, b = d0, d6
+        if action == "Submit up to":
+            a, b = stretches(d0, d6)[0]  # the days up to the month end; the days after it stay open
         try:
             n = con.execute("update time_entry set status='Submitted', last_edited_by=?, last_edited_at=? "
-                            "where user_id=? and status='Draft' and work_date between ? and ?", (u, stamp(), u, d0, d6)).rowcount
+                            "where user_id=? and status='Draft' and work_date between ? and ?", (u, stamp(), u, a, b)).rowcount
             if n:
                 ok_msgs.append("%d entr%s submitted for approval." % (n, "y" if n == 1 else "ies"))
             if not n:
-                msgs.append("Nothing to submit: there are no draft hours in this week.")
+                msgs.append("Nothing to submit: there are no draft hours in %s." % ("this week" if (a, b) == (d0, d6) else "the days up to %s" % datetime.date.fromisoformat(b).strftime("%d/%m")))
         except sqlite3.DatabaseError as e:
             msgs.append("Submit failed: %s" % e)
     con.commit()
     body_msgs = ok_msgs if not msgs else msgs + ok_msgs
-    return view_timesheet(con, u, w, body_msgs, adds, ok=not msgs)
+    return view_timesheet(con, u, w, body_msgs, adds, ok=not msgs, typed=typed)
 
 
 def copy_week(con, form):

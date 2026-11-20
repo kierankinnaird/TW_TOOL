@@ -12,11 +12,21 @@ DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
 
 
 # Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
-REQUIRED_SCHEMA = 20
+REQUIRED_SCHEMA = 22
 
 
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
-ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "TASAOrbiterVF.woff2"), "font/woff2")}
+def asset_url(path):
+    """A static file's address with its last-changed time on the end, so a browser fetches the new file when it changes instead of using a cached one."""
+    try:
+        return "%s?v=%d" % (path, os.path.getmtime(ASSETS[path][0]))
+    except (KeyError, OSError):
+        return path
+
+
+ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "TASAOrbiterVF.woff2"), "font/woff2"),
+          "/static/nmc-logo.png": (os.path.join(ROOT, "app", "static", "nmc-logo.png"), "image/png"),
+          "/static/nmc-tab-icon.png": (os.path.join(ROOT, "app", "static", "nmc-tab-icon.png"), "image/png")}
 
 
 # ---------- helpers ----------
@@ -39,8 +49,17 @@ def stamp():
 
 
 def fmt_time(v):
-    """A stored timestamp as yyyy-mm-dd HH:MM:SS (no fractions of a second)."""
-    return "" if v is None else str(v)[:19]
+    """A stored timestamp as dd/mm/yyyy HH:MM:SS (the way dates read everywhere on screen, no fractions of a second)."""
+    v = "" if v is None else str(v)[:19]
+    return "%s %s" % (dmy(v[:10]), v[11:]) if len(v) >= 16 else dmy(v)
+
+
+def dmy(v, short=False):
+    """A stored date (yyyy-mm-dd) as dd/mm/yyyy, or dd/mm when short. Anything that is not a date comes back as it was."""
+    v = "" if v is None else str(v)
+    if len(v) >= 10 and v[4] == "-" and v[7] == "-":
+        return "%s/%s" % (v[8:10], v[5:7]) if short else "%s/%s/%s" % (v[8:10], v[5:7], v[0:4])
+    return v
 
 
 def fmt(h):
@@ -83,7 +102,7 @@ def permission_of(con, u):
 
 
 # Who approves hours on a scope: the client's main approver and the scope's secondary approvers (view v_scope_approver).
-# SQL fragments for hours (entry t on scope s) and for allowances (entry a on scope s). "I may approve it" means: I am an approver of the
+# SQL fragments for hours (entry t on scope s). "I may approve it" means: I am an approver of the
 # scope and it is not mine. A cost controller approves entries whose booker is the scope's only approver (nobody else could).
 def _may(alias):
     return ("exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=?) and %s.user_id<>?" % alias)
@@ -126,15 +145,12 @@ def pending_for(con, u):
         return 0
     n = con.execute("select count(*) from time_entry t join scope s on s.scope_id=t.scope_id "
                     "where t.status in ('Submitted','Edited')" + queue[0], queue[1]).fetchone()[0]
-    aq = allowance_queue(con, u)
-    if aq:
-        n += con.execute("select count(*) from allowance_entry a join scope s on s.scope_id=a.scope_id where a.status='Submitted'" + aq[0], aq[1]).fetchone()[0]
     return n
 
 
 STYLE = """
 @font-face{font-family:"TASA Orbiter";font-style:normal;font-weight:400 600;font-display:swap;
-  src:local("TASA Orbiter"),local("TASAOrbiter"),url(/static/TASAOrbiterVF.woff2) format("woff2")}
+  src:local("TASA Orbiter"),local("TASAOrbiter"),url(__FONT__) format("woff2")}
 :root{--black:#0f0f12;--ink:#1e1e24;--grey-dark:#4b4b50;--grey-mid:#8f8f92;--grey-light:#bcbcbd;--line:#e5e5e6;
   --bg:#f5f5f6;--white:#fff;--orange:#fe6700;--tint:rgba(254,103,0,.07)}
 *{box-sizing:border-box}
@@ -145,13 +161,13 @@ a{color:var(--black);text-decoration:none}
 a:hover{color:var(--orange)}
 .top{background:var(--black);color:var(--white);display:flex;align-items:center;justify-content:space-between;gap:1rem;
   padding:.7rem 1.5rem;border-bottom:3px solid var(--orange)}
-.brand{font-size:1.1rem;font-weight:500;letter-spacing:-.02em}
-.brand .tag{font-size:.7rem;font-weight:400;color:var(--grey-light);border:1px solid rgba(255,255,255,.3);padding:.1rem .5rem;margin-left:.5rem}
+.brand{display:flex;align-items:center;font-size:1.1rem;font-weight:500;letter-spacing:-.02em}
+.brand img{height:34px;width:auto;display:block;margin-right:.9rem}
 .who{display:flex;align-items:center;gap:.6rem;font-size:.85rem;color:var(--grey-light);margin:0}
 .top select{background:var(--ink);color:var(--white);border:1px solid rgba(255,255,255,.25)}
 .top input[type=submit]{background:transparent;color:var(--white);border:1px solid rgba(255,255,255,.3)}
 .top input[type=submit]:hover{background:var(--orange);border-color:var(--orange);color:var(--white)}
-.shell{display:flex;align-items:flex-start;gap:1.5rem;padding:1.5rem}
+.shell{display:flex;align-items:flex-start;gap:1.5rem;padding:1.5rem;max-width:1480px;margin:0 auto}
 .side{flex:0 0 200px;position:sticky;top:1rem}
 .side a{display:block;position:relative;padding:.5rem .8rem .5rem 1rem;color:var(--grey-dark)}
 .side a:hover{background:var(--white);color:var(--black)}
@@ -219,9 +235,26 @@ table[border] td{padding:.35rem .65rem;border:0;border-bottom:1px solid var(--li
 table[border] tr:hover td{background:var(--tint)}
 table[border] td[align=right],table[border] td[align=center]{font-variant-numeric:tabular-nums}
 table[border="0"] th,table[border="0"] td,table[border="0"] tr:hover td{background:none;color:inherit;border:0;padding:.15rem .6rem .15rem 0}
-input[type=text],input[type=date],select{font:inherit;font-size:.9rem;height:2rem;padding:0 .6rem;color:var(--black);background:var(--white);
+input[type=text],input[type=date],input[type=month],select{font:inherit;font-size:.9rem;height:2rem;padding:0 .6rem;color:var(--black);background:var(--white);
   border:1px solid var(--grey-light);}
-input[type=text]:focus,input[type=date]:focus,select:focus{outline:2px solid var(--orange);outline-offset:1px;border-color:var(--orange)}
+input[type=text]:focus,input[type=date]:focus,input[type=month]:focus,select:focus{outline:2px solid var(--orange);outline-offset:1px;border-color:var(--orange)}
+input.bad{border-color:#b3261e;background:#fdecea}
+td.over{color:#b3261e}
+p.xl{margin:.3rem 0 .4rem}
+p.xl a{display:inline-block;padding:.2rem .7rem;font-size:.8rem;color:var(--grey-dark);border:1px solid var(--line);background:var(--white);text-decoration:none}
+p.xl a:hover{color:var(--orange);border-color:var(--orange)}
+button[name=approve_person]{display:block;margin:.3rem 0 0;font:inherit;font-size:.78rem;padding:.15rem .6rem;border:1px solid rgba(30,30,36,.3);background:transparent;cursor:pointer;white-space:nowrap}
+button[name=approve_person]:hover{border-color:var(--orange);color:var(--orange)}
+.rgroup{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;margin:.3rem 0}
+.rgroup .gl{flex:0 0 9rem;font-size:.8rem;color:var(--grey-dark)}
+.mnav{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1.1rem;margin:0 0 .6rem}
+.mnav form{display:flex;align-items:center;gap:.4rem;margin:0}
+.mnav .cur-month{font-size:1.05rem;font-weight:500}
+details.note{margin:.4rem 0 .8rem}
+details.note summary{cursor:pointer;font-size:.8rem;color:var(--grey-dark)}
+details.note summary:hover{color:var(--orange)}
+details.note p{margin:.3rem 0}
+.empty{padding:1rem 1.2rem;background:var(--bg);border:1px dashed var(--grey-light);color:var(--grey-dark)}
 table[border] input[type=text]{height:1.8rem;text-align:center;padding:0 .3rem}
 input[type=submit],input[type=button]{font:inherit;font-size:.85rem;font-weight:450;height:2.2rem;padding:0 1.1rem;cursor:pointer;
   transition:color .3s,border-color .3s,background-color .3s}
@@ -241,6 +274,42 @@ input[type=checkbox]{accent-color:var(--orange);width:1rem;height:1rem}
 
 NAV_KEY = {"My": "timesheet", "Approvals": "approvals", "Missing": "missing", "Reopen": "reopen", "Reports": "reports", "CTR": "reports",
            "Admin": "admin", "Edit": "admin", "Audit": "audit", "Dashboard": "dashboard"}
+
+
+# Long grey explanations (more than a couple of lines) fold away behind "What is this?", so a page leads with its figures. Nothing is removed.
+NOTES_JS = r"""<script>
+(function(){var main=document.querySelector('main');if(!main)return;
+main.querySelectorAll('p').forEach(function(p){var sm=p.children.length===1&&p.firstElementChild.tagName==='SMALL'?p.firstElementChild:null;
+if(!sm||p.textContent.trim().length<170||p.closest('.msg,.addbox,dialog,td,th,details'))return;
+var d=document.createElement('details'),s=document.createElement('summary');d.className='note';s.textContent='What is this?';d.appendChild(s);
+p.parentNode.insertBefore(d,p);d.appendChild(p);});})();
+</script>"""
+
+
+# Puts a "Download table as Excel" link above every table of figures on a page (not tables you type into, or one-line layout tables).
+# The browser sends the table's text to /export/table.xlsx and gets a spreadsheet back, so what is downloaded is what is on screen.
+EXPORT_JS = r"""<script>
+(function(){
+var main=document.querySelector('main');if(!main)return;
+function text(c){var k=c.cloneNode(true);k.querySelectorAll('.tg,select,input,textarea,button,script').forEach(function(e){e.remove()});
+return k.textContent.replace(/\s+/g,' ').trim().replace(/ Open CTR$/,'');}
+function editable(t){var f=t.querySelectorAll('input,select,textarea');for(var i=0;i<f.length;i++){
+if(f[i].tagName!=='INPUT'||!/^(hidden|submit|button|checkbox|radio)$/.test(f[i].type))return true;}return false;}
+function title(t){var e=t;while(e&&e!==main){var p=e.previousElementSibling;while(p){if(/^H[1-4]$/.test(p.tagName))return p.textContent.trim();p=p.previousElementSibling;}e=e.parentElement;}
+var h=main.querySelector('h1');return h?h.textContent.trim():'Table';}
+main.querySelectorAll('table').forEach(function(t){
+if(t.getAttribute('border')==='0'||t.classList.contains('ts')||t.querySelector('table')||t.rows.length<2||!t.querySelector('th')||t.rows[0].cells.length<2||editable(t))return;
+var panel=t.closest('.rpt');if(panel&&panel.querySelector('a[href*="/reports/export.xlsx"],a[href*="period.xlsx"]')&&panel.querySelectorAll('table').length===1)return;
+var name=title(t),p=document.createElement('p'),a=document.createElement('a');
+a.href='#';a.textContent='Download table as Excel';p.className='xl';p.appendChild(a);
+a.onclick=function(ev){ev.preventDefault();var rows=[];
+for(var i=0;i<t.rows.length;i++){var r=[],cs=t.rows[i].cells;for(var j=0;j<cs.length;j++){r.push(text(cs[j]));for(var k=1;k<(cs[j].colSpan||1);k++)r.push('');}rows.push(r);}
+fetch('/export/table.xlsx',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,rows:rows})})
+.then(function(r){return r.blob();}).then(function(b){var u=URL.createObjectURL(b),d=document.createElement('a');
+d.href=u;d.download=(name.replace(/[^A-Za-z0-9]+/g,'-').replace(/^-|-$/g,'')||'table')+'.xlsx';document.body.appendChild(d);d.click();d.remove();setTimeout(function(){URL.revokeObjectURL(u);},1000);});};
+t.parentNode.insertBefore(p,t);});
+})();
+</script>"""
 
 
 def layout(con, u, title, body):
@@ -272,13 +341,27 @@ def layout(con, u, title, body):
     who = "<b>%s</b>%s (%s)<br>%s, %s" % (esc(me["name"]), esc(me["role_name"]), esc(me["skill_code"]), esc(me["family"]), esc(me["permission"])) if me else ""
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
-        "<title>%s - NMC Timewriting</title><style>%s</style></head><body>"
-        '<header class="top"><div class="brand">NMC Timewriting<span class="tag">mock</span></div>'
+        "<title>%s - NMC Timewriting</title><link rel='icon' type='image/png' href='%s'><style>%s</style></head><body>"
+        '<header class="top"><div class="brand"><img src="%s" alt="NMC Energy"></div>'
         '<form class="who" method="get" action="/timesheet">Signed in as '
         '<select name="u">%s</select><input type="submit" value="Switch user"></form></header>'
         '<div class="shell"><nav class="side">%s<div class="me">%s</div></nav>'
-        '<main><h1>%s</h1><div class="card">%s</div></main></div></body></html>'
-    ) % (esc(title), STYLE, opts, menu, who, esc(title), body)
+        '<main><h1>%s</h1><div class="card">%s</div></main></div>%s</body></html>'
+    ) % (esc(title), asset_url("/static/nmc-tab-icon.png"), page_style(), asset_url("/static/nmc-logo.png"), opts, menu, who, esc(title), body, NOTES_JS + EXPORT_JS)
+
+
+def page_style():
+    return STYLE.replace("__FONT__", asset_url("/static/TASAOrbiterVF.woff2"))
+
+
+def missing_page(what="That page"):
+    """The page for an address that does not exist: the same header, with a way back, instead of a bare line of text."""
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+            "<title>Page not found - NMC Timewriting</title><link rel='icon' type='image/png' href='%s'><style>%s</style></head><body>"
+            '<header class="top"><div class="brand"><img src="%s" alt="NMC Energy"></div></header>'
+            '<div class="shell"><main><h1>Page not found</h1><div class="card"><p>%s does not exist, or the address has changed.</p>'
+            '<p><a href="/timesheet">Go to My Timesheet</a></p></div></main></div></body></html>'
+            ) % (asset_url("/static/nmc-tab-icon.png"), page_style(), asset_url("/static/nmc-logo.png"), esc(what))
 
 
 def no_access(con, u, title):
@@ -296,34 +379,6 @@ def msgs_html(msgs, ok=False):
 def locations(con, active_only=True):
     """Where hours can be worked (On site, Offshore, ...): the hour types managed by the IT admin."""
     return [tuple(r) for r in con.execute("select location_id, name from location %s order by location_id" % ("where active=1" if active_only else ""))]
-
-
-def parse_pairs(vals):
-    """Allowance rows added but not saved yet, as (phase, allowance) pairs from 'phase:allowance' values."""
-    out = []
-    for v in vals:
-        try:
-            p, a = [int(x) for x in v.split(":")]
-        except ValueError:
-            continue
-        out.append((p, a))
-    return list(dict.fromkeys(out))
-
-
-def allowance_queue(con, u):
-    """The allowances (a, on scopes s) this person approves, as SQL and arguments, or None. Same rules as approval_queue for hours."""
-    if permission_of(con, u) == "controller":
-        return " and " + _only_approver("a"), ()
-    if is_approver(con, u):
-        return " and " + _may("a"), (u, u)
-    return None
-
-
-def may_action_allowance(con, u, aid):
-    q = allowance_queue(con, u)
-    if q is None:
-        return False
-    return con.execute("select 1 from allowance_entry a join scope s on s.scope_id=a.scope_id where a.allowance_entry_id=?" + q[0], (aid,) + tuple(q[1])).fetchone() is not None
 
 
 def parse_adds(vals):
@@ -376,7 +431,7 @@ def opts_roles(con, active_only=True):
 
 
 def opts_clients(con, billable_only=False):
-    """billable_only leaves out the Internal client, which has no rate card and needs no PAAFs."""
+    """billable_only leaves out the Internal client, which has no rate card."""
     return [tuple(r) for r in con.execute("select client_id, name from client %s order by name" % ("where is_internal=0" if billable_only else ""))]
 
 
@@ -392,14 +447,6 @@ def opts_scopes(con):
 
 def opts_users(con):
     return [tuple(r) for r in con.execute("select user_id, name from app_user order by name")]
-
-
-def rate_options(con, client_id=None):
-    """Rates on the client rate cards, for choosing the rate on a PAAF: (rate_id, 'Client - PM-04 Planner - 85 (from 2026-01-01)')."""
-    return [(r["rate_id"], "%s - %s %s - %g (from %s)" % (r["client"], r["skill_code"], r["role"], r["sales_rate"], r["effective_from"]))
-            for r in con.execute("select rt.rate_id, c.name as client, ro.skill_code, ro.name as role, rt.sales_rate, rt.effective_from from rate rt "
-                                 "join client c on c.client_id=rt.client_id join role ro on ro.role_id=rt.role_id "
-                                 "where (? is null or rt.client_id=?) order by c.name, ro.skill_code, rt.effective_from desc", (client_id, client_id))]
 
 
 def opts_approvers(con):

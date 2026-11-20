@@ -17,13 +17,14 @@ from urllib.parse import parse_qs
 from werkzeug.serving import make_server as make_wsgi_server
 from nmc.core import ASSETS, REQUIRED_SCHEMA, db, ensure_current_period, monday, no_access, parse_adds, permission_of
 from nmc.timesheet import copy_week, save_timesheet, view_timesheet
+from nmc.monthend import month_bounds, month_sheet, view_monthend
 from nmc.approvals import act_approval, reopen_week, view_approvals, view_missing, view_reopen
 from nmc.reports import (
-    grid_data, grid_sheet, manhour_data, manhour_sheet,
-    period_sheet, report_view, view_ctr, view_grid,
+    ctr_sheet, grid_data, grid_sheet, manhour_data, manhour_sheet,
+    period_sheet, report_sheet, report_view, view_ctr, view_grid,
     view_manhours, view_reports, xlsx_bytes)
 from nmc.dashboard import view_dashboard
-from nmc.admin import act_allowance_rates, act_budgets, act_paaf, act_period, admin_add, admin_save, view_admin, view_admin_edit, view_audit
+from nmc.admin import act_allowance_rates, act_budgets, act_period, admin_add, admin_save, view_admin, view_admin_edit, view_audit
 from nmc import core
 from nmc.core import REQUIRED_SCHEMA, db, fmt, monday  # noqa: F401  (kept importable from here: the tests and scripts use app.db, app.fmt and so on)
 from nmc.reports import ctr_tree_rows, xlsx_bytes  # noqa: F401
@@ -106,7 +107,7 @@ def security_headers(resp):
 @flask_app.errorhandler(404)
 @flask_app.errorhandler(405)
 def not_found(_):
-    return html_response("<p>Not found</p>", 404)
+    return html_response(core.missing_page(), 404)
 
 
 def _serve_asset(path):
@@ -115,7 +116,7 @@ def _serve_asset(path):
             with open(ASSETS[path][0], "rb") as f:
                 data = f.read()
         except OSError:
-            return html_response("<p>Not found</p>", 404)
+            return html_response(core.missing_page("That file"), 404)
         return Response(data, mimetype=ASSETS[path][1], headers={"Cache-Control": "public, max-age=86400"})
     view.__name__ = "asset_" + path.strip("/").replace("/", "_").replace(".", "_")
     return view
@@ -150,6 +151,9 @@ page("/missing")(lambda con, u, q: view_missing(con, u, q))
 page("/reopen")(lambda con, u, q: view_reopen(con, u, q))
 
 
+page("/monthend")(lambda con, u, q: view_monthend(con, u, q))
+
+
 page("/dashboard")(lambda con, u, q: view_dashboard(con, u, q))
 
 
@@ -172,6 +176,70 @@ page("/admin/edit")(lambda con, u, q: view_admin_edit(con, u, q.get("t", [""])[0
 
 
 page("/audit")(lambda con, u, q: view_audit(con, u, q))
+
+
+@flask_app.route("/monthend.xlsx")
+@with_db
+def monthend_download(con):
+    q = query()
+    if permission_of(con, user_id(con, q)) != "controller":
+        return html_response(no_access(con, user_id(con, q), "Month end"), 403)
+    rows, sheet = month_sheet(con, q)
+    return Response(xlsx_bytes(sheet, rows, (1, len(rows)) if len(rows) > 1 else (1,)), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="month-%s.xlsx"' % month_bounds(q)[0].strftime("%Y-%m")})
+
+
+@flask_app.route("/reports/export.xlsx")
+@with_db
+def report_export(con):
+    """Excel download of any one report on the Reports page (k = ctr, period, internal, allow, loc, budget, month)."""
+    q = query()
+    u = user_id(con, q)
+    key = q.get("k", [""])[0]
+    if key == "month":
+        return monthend_download()
+    if permission_of(con, u) == "admin":
+        return html_response(no_access(con, u, "Reports"), 403)
+    got = report_sheet(con, u, q, key)
+    if got is None:
+        return html_response(no_access(con, u, "Reports"), 404)
+    rows, sheet = got
+    bold = (1, len(rows)) if len(rows) > 1 else (1,)
+    return Response(xlsx_bytes(sheet, rows, bold), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="report-%s.xlsx"' % key})
+
+
+@flask_app.route("/export/table.xlsx", methods=("POST",))
+def table_download():
+    """Excel file from a table the browser sends as rows of text (the 'Download table as Excel' link above each table). Nothing is read from the database."""
+    data = request.get_json(silent=True) or {}
+    rows = data.get("rows")
+    if not isinstance(rows, list) or len(rows) > 50000:
+        return html_response("<p>Nothing to export.</p>", 400)
+    num = re.compile(r"^-?(0|[1-9]\d*)(\.\d+)?$")
+    out = []
+    for r in rows:
+        if not isinstance(r, list):
+            return html_response("<p>Nothing to export.</p>", 400)
+        out.append([float(c.replace(",", "")) if isinstance(c, str) and num.match(c.replace(",", "")) else c for c in r])
+    name = str(data.get("name") or "Table")
+    return Response(xlsx_bytes(name, out, (1,)), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="%s.xlsx"' % (re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-") or "table")})
+
+
+@flask_app.route("/ctr.xlsx")
+@with_db
+def ctr_download(con):
+    q = query()
+    u = user_id(con, q)
+    if permission_of(con, u) == "admin":
+        return html_response(no_access(con, u, "CTR"), 403)
+    got = ctr_sheet(con, u, q)
+    if got is None:
+        return html_response(no_access(con, u, "CTR"), 404)
+    rows, sheet = got
+    return Response(xlsx_bytes(sheet, rows, (1,)), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="ctr-%s.xlsx"' % re.sub(r"[^A-Za-z0-9]+", "-", sheet).strip("-")})
 
 
 @flask_app.route("/reports/grid.xlsx")
@@ -223,7 +291,6 @@ page("/admin/add", methods=("POST",))(lambda con, form: admin_add(con, form))
 page("/admin/save", methods=("POST",))(lambda con, form: admin_save(con, form))
 
 
-page("/admin/paaf", methods=("POST",))(lambda con, form: act_paaf(con, form))
 
 
 page("/admin/allowance_rates", methods=("POST",))(lambda con, form: act_allowance_rates(con, form))

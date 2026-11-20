@@ -1,11 +1,11 @@
-"""Admin tabs (periods, users, roles, clients, rates, PAAFs, scopes, internal codes, locations, allowance rates, budgets) and the audit trail."""
+"""Admin tabs (periods, users, roles, clients, rates, scopes, internal codes, locations, allowance rates, budgets) and the audit trail."""
 import csv
 import datetime
 import re
 import sqlite3
 from urllib.parse import quote
 from nmc.core import (
-    date_input, edit_link, esc, fmt,
+    date_input, dmy, edit_link, esc, fmt,
     fmt_time, hidden, layout, msgs_html,
     need_date, need_text, no_access, opts_approvers,
     opts_clients, opts_projects, opts_roles, opts_scopes,
@@ -15,15 +15,15 @@ from nmc.core import (
 
 # ---------- Admin ----------
 ADMIN_TABS = [("periods", "Weekly periods"), ("users", "Users"), ("roles", "Job families / titles"),
-              ("clients", "Clients"), ("rates", "Client rate cards"), ("paafs", "PAAFs"), ("scopes", "Projects / scopes / CTRs"),
+              ("clients", "Clients"), ("rates", "Client rate cards"), ("scopes", "Projects / scopes / CTRs"),
               ("internal", "Internal codes"), ("locations", "Locations (hour types)"), ("allowance_rates", "Allowance rates"),
               ("budgets", "Budgets (from P6)")]
 
 
-# Who may use each Admin tab. IT manages users and job roles; cost controllers manage clients, rate cards, PAAFs, scopes and internal codes.
+# Who may use each Admin tab. IT manages users and job roles; cost controllers manage clients, rate cards, scopes and internal codes.
 # Weekly periods is open to both controllers and admins until the cost team confirms who owns it (the audit trail is handled the same way).
 TAB_ACCESS = {"periods": ("controller", "admin"), "users": ("admin",), "roles": ("admin",), "clients": ("controller",),
-              "rates": ("controller",), "paafs": ("controller",), "scopes": ("controller",), "internal": ("controller",),
+              "rates": ("controller",), "scopes": ("controller",), "internal": ("controller",),
               "locations": ("admin",), "allowance_rates": ("controller",), "budgets": ("admin",)}  # budgets (P6) are parked for v1: IT only
 
 
@@ -61,49 +61,17 @@ def allowed_tabs(con, u):
     return [(k, v) for k, v in ADMIN_TABS if can_use_tab(con, u, k)]
 
 
-PAAF_STATES = [("current", "On the list"), ("ended", "Ended")]
-
-
-PAAF_SORTS = {"id": ("p.paaf_id", "p.paaf_id desc"),
-              "name": ("u.name, p.paaf_id", "u.name desc, p.paaf_id desc"),
-              "client": ("c.name, u.name, p.paaf_id", "c.name desc, u.name desc, p.paaf_id desc"),
-              "expiry": ("p.expiry_date is null, p.expiry_date, p.paaf_id", "p.expiry_date is not null, p.expiry_date desc, p.paaf_id desc")}
-
-
-def paaf_filters(q):
-    """The PAAF list's filters and order, from a query or a posted form (values are lists): person, client, status, sort (a leading - is descending)."""
-    def one(k):
-        return (q.get(k) or [""])[0].strip()
-
-    def num(k):
-        try:
-            return int(one(k))
-        except ValueError:
-            return None
-    sort = one("f_sort") or "id"
-    desc = sort.startswith("-")
-    if sort.lstrip("-") not in PAAF_SORTS:
-        sort, desc = "id", False
-    status = one("f_status")
-    return {"person": num("f_person"), "client": num("f_client"), "status": status if status in dict(PAAF_STATES) else "", "sort": sort.lstrip("-"), "desc": desc}
-
-
-def paaf_hidden(f):
-    """The list's filters and order carried through a form, so an action leaves you looking at the same list."""
-    return hidden(f_person=f["person"] or "", f_client=f["client"] or "", f_status=f["status"], f_sort=("-" if f["desc"] else "") + f["sort"])
-
-
 def admin_body(con, u, t, q=None):
     b = []
     if t == "periods":
         rows = [list(r) for r in con.execute("select week_start, status, closed_by, closed_at from period order by week_start")]
-        b.append(table(["week_start", "status", "closed_by", "closed_at"], [r[:3] + [fmt_time(r[3])] for r in rows]))
+        b.append(table(["Week start", "Status", "Closed by", "Closed at"], [r[:3] + [fmt_time(r[3])] for r in rows]))
         closes = "".join('<form method="post" action="/admin/period" style="display:inline">%s'
-                         '<input type="submit" value="Close week %s"></form> ' % (hidden(u=u, week_start=r[0], action="close"), r[0])
+                         '<input type="submit" value="Close week %s"></form> ' % (hidden(u=u, week_start=r[0], action="close"), dmy(r[0]))
                          for r in rows if r[1] == "Open")
         b.append("<p>%s</p>" % closes)
         reopens = "".join('<form method="post" action="/admin/period" style="display:inline">%s'
-                          '<input type="submit" value="Reopen week %s"></form> ' % (hidden(u=u, week_start=r[0], action="reopen"), r[0])
+                          '<input type="submit" value="Reopen week %s"></form> ' % (hidden(u=u, week_start=r[0], action="reopen"), dmy(r[0]))
                           for r in rows if r[1] == "Closed")
         if reopens:
             b.append("<p>%s</p>" % reopens)
@@ -115,8 +83,8 @@ def admin_body(con, u, t, q=None):
         b.append('<form method="get" action="/admin">%s<p>Find a person (name or NMC ID) <input type="text" name="f_q" size="20" value="%s"> '
                  '<input type="submit" value="Search"> <input type="button" value="Clear" onclick="location.href=\'/admin?u=%d&amp;t=users\'"></p></form>' % (
                      hidden(u=u, t="users"), esc(needle), u))
-        rows = [[r["nmc_id"], r["name"], r["employment_type"], r["skill_code"] + " " + r["role"], r["manager"] or "", r["permission"], r["start_date"],
-                 r["end_date"], edit_link(u, "users", r["user_id"])]
+        rows = [[r["nmc_id"], r["name"], r["employment_type"], r["skill_code"] + " " + r["role"], r["manager"] or "", r["permission"], dmy(r["start_date"]),
+                 dmy(r["end_date"]), edit_link(u, "users", r["user_id"])]
                 for r in con.execute("select u.*, r.skill_code, r.name as role, m.name as manager from app_user u join role r on r.role_id=u.role_id "
                                      "left join app_user m on m.user_id=u.line_manager_id "
                                      "where (? = '' or u.name like '%' || ? || '%' or u.nmc_id like '%' || ? || '%') order by u.nmc_id", (needle, needle, needle))]
@@ -176,7 +144,7 @@ def admin_body(con, u, t, q=None):
         b.append('<form method="get" action="/admin">%s<p>Client %s <input type="submit" value="Filter"> '
                  '<small>Current is the rate in force today; Superseded rates stay so past hours keep their price; Future starts later.</small></p></form>' % (
                      hidden(u=u, t="rates"), sel("f_client", opts_clients(con, True), f_client, True, "All clients")))
-        rows = [[r["client"], r["skill_code"], r["role"], "%.2f" % r["sales_rate"], r["effective_from"], r["state"]]
+        rows = [[r["client"], r["skill_code"], r["role"], "%.2f" % r["sales_rate"], dmy(r["effective_from"]), r["state"]]
                 for r in con.execute("select c.name as client, ro.skill_code, ro.name as role, rt.sales_rate, rt.effective_from, "
                                      "case when rt.effective_from > ? then 'Future' when rt.effective_from = (select max(r2.effective_from) from rate r2 "
                                      "where r2.client_id=rt.client_id and r2.role_id=rt.role_id and r2.effective_from <= ?) then 'Current' else 'Superseded' end as state "
@@ -189,72 +157,21 @@ def admin_body(con, u, t, q=None):
                  '<input type="submit" value="Add rate"></form>'
                  % (hidden(u=u, t="rates"), sel("client_id", opts_clients(con, True)), sel("role_id", opts_roles(con)),
                     txt("sales_rate", "", 8), date_input("effective_from", datetime.date.today().isoformat())))
-    elif t == "paafs":
-        flt = paaf_filters(q or {})
-        today = datetime.date.today().isoformat()
-        where, wargs = "", []
-        for key, col in (("person", "p.user_id"), ("client", "p.client_id")):
-            if flt[key]:
-                where += " and %s=?" % col
-                wargs.append(flt[key])
-        if flt["status"] == "current":
-            where += " and (p.expiry_date is null or p.expiry_date >= ?)"
-            wargs.append(today)
-        elif flt["status"] == "ended":
-            where += " and p.expiry_date < ?"
-            wargs.append(today)
-        total = con.execute("select count(*) from paaf").fetchone()[0]
-        order = PAAF_SORTS[flt["sort"]][1 if flt["desc"] else 0]
-        rows = []
-        found = con.execute("select p.*, u.name as uname, c.name as client, ro.skill_code "
-                            "from paaf p join app_user u on u.user_id=p.user_id join client c on c.client_id=p.client_id "
-                            "join role ro on ro.role_id=u.role_id where 1=1" + where + " order by " + order, wargs).fetchall()
-        b.append("<p><small>The people who work on each client's projects: the list that goes to the client. None of our clients approve individuals, so a person is "
-                 "on a client's list as soon as they are added. The list does not limit who can book: anyone can book to any open CTR, "
-                 "priced at the client's rate for the skill code they book.</small></p>")
-        b.append('<form method="get" action="/admin">%s<p>Person %s Client %s Show %s <input type="submit" value="Filter"> '
-                 '<input type="button" value="Clear filters" onclick="location.href=\'/admin?u=%d&amp;t=paafs\'"> '
-                 '<small>Showing %d of %d entries, in order of the # column. Click a column heading to sort by it, and again to reverse it.</small></p></form>' % (
-                     hidden(u=u, t="paafs", f_sort=("-" if flt["desc"] else "") + flt["sort"]),
-                     sel("f_person", [(r["user_id"], r["name"]) for r in con.execute(
-                         "select distinct a.user_id, a.name from app_user a join paaf p on p.user_id=a.user_id order by a.name")], flt["person"], True, "Everyone"),
-                     sel("f_client", [tuple(r) for r in con.execute(
-                         "select distinct c.client_id, c.name from client c join paaf p on p.client_id=c.client_id order by c.name")], flt["client"], True, "All clients"),
-                     sel("f_status", PAAF_STATES, flt["status"], True, "Everyone listed"), u, len(found), total))
-
-        def head(label, key):
-            flip = "-" + key if (flt["sort"] == key and not flt["desc"]) else key
-            arrow = (" &#9650;" if not flt["desc"] else " &#9660;") if flt["sort"] == key else ""
-            return '<a href="/admin?u=%d&amp;t=paafs&amp;f_person=%s&amp;f_client=%s&amp;f_status=%s&amp;f_sort=%s" style="color:inherit">%s%s</a>' % (
-                u, flt["person"] or "", flt["client"] or "", quote(flt["status"]), quote(flip), label, arrow)
-        for r in found:
-            ended = bool(r["expiry_date"] and r["expiry_date"] < today)
-            f = '<form method="post" action="/admin/paaf" style="display:inline">%s%s' % (hidden(u=u, paaf_id=r["paaf_id"]), paaf_hidden(flt))
-            f += ('End date %s <input type="submit" name="action" value="Save end date"> '
-                  '<small>(empty = no end)</small></form>' % date_input("expiry_date", r["expiry_date"] or ""))
-            rows.append([r["paaf_id"], r["uname"], r["client"], r["skill_code"], ("Ended %s" % r["expiry_date"]) if ended else (r["expiry_date"] or ""), f])
-        heads = [head("#", "id"), head("Name", "name"), head("Client", "client"), "Skill code", head("Ends", "expiry"), "Action"]  # raw: the headings hold sort links
-        if rows:
-            b.append(table(heads, rows, raw_cols=(5,), raw_heads=True))
-        else:
-            b.append("<p>Nobody matches these filters.</p>")
-        b.append('<h4>Add a person to a client</h4><p><small>One entry per person per client. Set an end date when someone leaves the client\'s projects.</small></p>'
-                 '<form method="post" action="/admin/add">%s Person %s Client %s <input type="submit" value="Add person"></form>'
-                 % (hidden(u=u, t="paafs"), sel("user_id", opts_users(con)), sel("client_id", opts_clients(con, True))))
     elif t == "allowance_rates":
         today = datetime.date.today().isoformat()
         grid = []
         for al in con.execute("select allowance_id, name from allowance_type where active=1 order by allowance_id"):
             cur = con.execute("select amount from allowance_rate where allowance_id=? and effective_from<=? order by effective_from desc limit 1", (al["allowance_id"], today)).fetchone()
             grid.append('<tr><td>%s</td><td><input type="text" size="8" name="r_%d" value="%s"></td></tr>' % (esc(al["name"]), al["allowance_id"], fmt(cur[0] if cur else 0)))
-        b.append("<p><small>What one day of each allowance is worth. Allowances are for staff only (contractors cannot claim them). Rates are never edited: change the figure "
-                 "here and it is saved as a new rate from the date you give, so earlier claims keep the value they had.</small></p>")
-        b.append('<form method="post" action="/admin/allowance_rates">%s<table border="1" cellpadding="3" cellspacing="0"><tr><th>Allowance</th><th>&pound; per day</th></tr>%s</table>'
+        b.append("<p><small>What one night of the offshore allowance is worth. It is paid per night spent offshore, to staff only (contractors have it in their rate), and it is "
+                 "worked out from the hours, so nobody claims it. Rates are never edited: change the figure here and it is saved as a new rate from the date you give, "
+                 "so earlier nights keep the value they had.</small></p>")
+        b.append('<form method="post" action="/admin/allowance_rates">%s<table border="1" cellpadding="3" cellspacing="0"><tr><th>Allowance</th><th>&pound; per night</th></tr>%s</table>'
                  '<p>New rate applies from %s <input type="submit" value="Save rate"></p></form>' % (hidden(u=u), "".join(grid), date_input("effective_from", today)))
-        hist = [[r["name"], "%.2f" % r["amount"], r["effective_from"]]
+        hist = [[r["name"], "%.2f" % r["amount"], dmy(r["effective_from"])]
                 for r in con.execute("select at.name, ar.amount, ar.effective_from from allowance_rate ar join allowance_type at on at.allowance_id=ar.allowance_id "
                                      "order by at.allowance_id, ar.effective_from desc")]
-        b.append("<h4>Every rate, newest first</h4>" + table(["Allowance", "Per day", "From"], hist))
+        b.append("<h4>Every rate, newest first</h4>" + table(["Allowance", "Per night", "From"], hist))
     elif t == "budgets":
         b.append("<p><small>Budget hours per CTR come from P6, which holds hours only. Paste either (1) a P6 export copied from SSMS or saved as CSV, with the columns "
                  "<b>project, WBS name, activity code, budget hours, actual hours, remaining hours, % complete</b> (the CTR No is read from the end of the WBS name, "
@@ -264,20 +181,21 @@ def admin_body(con, u, t, q=None):
                  "A CTR whose figures have not changed is left alone.</small></p>")
         b.append('<form method="post" action="/admin/budgets">%s<p>As of %s</p><p><textarea name="data" rows="8" cols="80" placeholder="BB0001-PM-D-001,160"></textarea></p>'
                  '<input type="submit" value="Load budgets"></form>' % (hidden(u=u), date_input("as_of", datetime.date.today().isoformat())))
-        rows = [[r["phase"], r["client"], fmt(r["budget_hours"]), r["as_of"], fmt(r["actual_hours"])]
+        rows = [[r["phase"], r["client"], fmt(r["budget_hours"]), dmy(r["as_of"]), fmt(r["actual_hours"])]
                 for r in con.execute("select * from v_ctr_budget where budget_hours is not null order by phase")]
         b.append("<h4>Budgets now held</h4>" + (table(["CTR No", "Client", "Budget hrs", "As of", "Actual hrs (approved)"], rows) if rows else "<p>None loaded yet.</p>"))
     elif t == "locations":
         b.append("<p><small>Where hours are worked. People pick one on each timesheet row (and tick Overtime for overtime). "
-                 "Rename a location or switch it off to stop new bookings to it; hours already booked keep it. At least one must stay active.</small></p>")
-        rows = [[r["name"], "Yes" if r["active"] else "No", edit_link(u, "locations", r["location_id"])]
+                 "Rename a location or switch it off to stop new bookings to it; hours already booked keep it. At least one must stay active. "
+                 "A location that <b>earns the allowance</b> (Offshore) pays the allowance for each night spent there: a night is earned when a member of staff has hours there that day and the next.</small></p>")
+        rows = [[r["name"], "Yes" if r["active"] else "No", "Yes" if r["earns_allowance"] else "No", edit_link(u, "locations", r["location_id"])]
                 for r in con.execute("select * from location order by location_id")]
-        b.append(table(["Location", "Active", ""], rows, raw_cols=(2,)))
+        b.append(table(["Location", "Active", "Earns the allowance", ""], rows, raw_cols=(3,)))
         b.append('<h4>Add a location</h4><form method="post" action="/admin/add">%s Name %s <input type="submit" value="Add location"></form>'
                  % (hidden(u=u, t="locations"), txt("name", "", 24)))
     elif t == "internal":
         b.append("<p><small>Internal codes are for hours NMC pays for itself, such as Business Services or Training. People pick one in their "
-                 "timesheet (shown as Internal - name). They need no PAAF and have no rate, and they are kept out of the client reports. "
+                 "timesheet (shown as Internal - name). They have no rate, and they are kept out of the client reports. "
                  "Each code has an approver, who approves the hours booked to it. Close a code to stop new bookings to it.</small></p>")
         rows = [[r["scope_code"], r["description"], r["status"], r["approvers"] or "", edit_link(u, "internal", r["scope_id"])]
                 for r in con.execute("select s.scope_id, s.scope_code, s.description, s.status, "
@@ -325,7 +243,7 @@ def admin_body(con, u, t, q=None):
             if r["restricted"]:
                 controls.append("%d named %s only" % (r["n_people"], "person" if r["n_people"] == 1 else "people"))
             if r["book_from"] or r["book_to"]:
-                controls.append("%s to %s" % (r["book_from"] or "any date", r["book_to"] or "any date"))
+                controls.append("%s to %s" % (dmy(r["book_from"]) or "any date", dmy(r["book_to"]) or "any date"))
             rows.append([r["client"], r["scope_code"], r["scope_desc"], r["name"], r["description"] or "", r["status"],
                          "; ".join(controls) or "open to all", edit_link(u, "phases", r["phase_id"])])
         b.append(table(["Client", "Scope", "Scope description", "CTR (booking code)", "CTR description", "Status", "Who and when can book", ""], rows, raw_cols=(7,)))
@@ -360,8 +278,8 @@ def view_admin_edit(con, u, t, i, msgs=None):
                     esc(r["nmc_id"]), txt("name", r["name"], 30), sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")], r["employment_type"]),
                     sel("role_id", opts_roles(con, active_only=False), r["role_id"]),
                     sel("line_manager_id", [x for x in opts_users(con) if x[0] != i], r["line_manager_id"], True, "None"),
-                    sel("permission", PERMISSION_OPTIONS, r["permission"]), esc(r["start_date"]), date_input("end_date", r["end_date"] or "")))
-        note = "<p><small>Changing someone's role does not change their existing PAAFs or booked hours.</small></p>"
+                    sel("permission", PERMISSION_OPTIONS, r["permission"]), esc(dmy(r["start_date"])), date_input("end_date", r["end_date"] or "")))
+        note = "<p><small>Changing someone's role does not change their booked hours.</small></p>"
     elif t == "roles":
         r = con.execute("select * from role where role_id=?", (i,)).fetchone()
         if not r:
@@ -373,8 +291,8 @@ def view_admin_edit(con, u, t, i, msgs=None):
         r = con.execute("select * from location where location_id=?", (i,)).fetchone()
         if not r:
             return layout(con, u, "Admin", "<p>Not found.</p>")
-        form = ("<tr><td>Name</td><td>%s</td></tr><tr><td>Active</td><td>%s</td></tr>" % (
-            txt("name", r["name"], 24), sel("active", [("1", "Yes"), ("0", "No")], str(r["active"]))))
+        form = ("<tr><td>Name</td><td>%s</td></tr><tr><td>Active</td><td>%s</td></tr><tr><td>Earns the allowance</td><td>%s</td></tr>" % (
+            txt("name", r["name"], 24), sel("active", [("1", "Yes"), ("0", "No")], str(r["active"])), sel("earns_allowance", [("1", "Yes"), ("0", "No")], str(r["earns_allowance"]))))
         note = "<p><small>Switching a location off stops new bookings to it. Hours already booked keep it.</small></p>"
     elif t == "clients":
         r = con.execute("select c.*, a.name as approver from client c left join app_user a on a.user_id=c.approver_user_id where c.client_id=?", (i,)).fetchone()
@@ -513,13 +431,6 @@ def admin_add(con, form):
                               (code, pr["client_id"], pr["project_id"], need_text(g("description"), "Name")))
             con.execute("insert into phase (scope_id, name) values (?, 'General')", (cur.lastrowid,))
             msg = "Internal code %s added." % code
-        elif t == "paafs":
-            user_id, client_id = int(g("user_id")), int(g("client_id"))
-            if not con.execute("select 1 from rate rt join app_user u on u.role_id=rt.role_id where u.user_id=? and rt.client_id=?", (user_id, client_id)).fetchone():
-                raise ValueError("That client's rate card has no rate for this person's role. Add the rate first.")
-            con.execute("insert into paaf (user_id, client_id, status, decided_date) values (?,?,'Approved',?)",
-                        (user_id, client_id, datetime.date.today().isoformat()))
-            msg = "Person added to the client's list."
         else:
             raise ValueError("Unknown form.")
         con.commit()
@@ -530,8 +441,6 @@ def admin_add(con, form):
         text = str(e)
         if "UNIQUE" in text:
             text = "That already exists (it must be unique)."
-            if t == "paafs":
-                text = "That person is already on this client's list."
         return view_admin(con, u, t, [text])
     except sqlite3.DatabaseError as e:
         return view_admin(con, u, t, [str(e)])
@@ -566,7 +475,8 @@ def admin_save(con, form):
             others = con.execute("select count(*) from location where active=1 and location_id<>?", (i,)).fetchone()[0]
             if int(g("active")) == 0 and others == 0:
                 raise ValueError("At least one location must stay active.")
-            con.execute("update location set name=?, active=? where location_id=?", (need_text(g("name"), "Location name"), int(g("active")), i))
+            con.execute("update location set name=?, active=?, earns_allowance=? where location_id=?",
+                        (need_text(g("name"), "Location name"), int(g("active")), 1 if g("earns_allowance") == "1" else 0, i))
         elif t == "clients":
             con.execute("update client set approver_user_id=?, framework_ref=? where client_id=?",
                         (int(g("approver_user_id")) if g("approver_user_id") else None, g("framework_ref") or None, i))
@@ -634,30 +544,6 @@ def act_allowance_rates(con, form):
     except sqlite3.IntegrityError:
         con.rollback()
         return view_admin(con, u, "allowance_rates", ["A rate already exists from that date. Rates are never edited: choose a later date."])
-
-
-def act_paaf(con, form):
-    u, pid, action = int(form["u"][0]), int(form["paaf_id"][0]), form["action"][0]
-    if not can_use_tab(con, u, "paafs"):
-        return view_admin(con, u, "paafs")
-    q = form  # the list's filters and order come back with the form
-    g = lambda k: form.get(k, [""])[0].strip()
-    try:
-        p = con.execute("select * from paaf where paaf_id=?", (pid,)).fetchone()
-        if not p:
-            raise ValueError("That entry was not found.")
-        if action == "Save end date":
-            end = need_date(g("expiry_date"), "End date", False)
-            con.execute("update paaf set expiry_date=? where paaf_id=?", (end, pid))
-            msg = "Entry %d now ends on %s." % (pid, end) if end else "Entry %d has no end date." % pid
-        else:
-            raise ValueError("Unknown action.")
-        con.commit()
-        return view_admin(con, u, "paafs", [msg], ok=True, q=q)
-    except ValueError as e:
-        return view_admin(con, u, "paafs", [str(e)], q=q)
-    except sqlite3.DatabaseError as e:
-        return view_admin(con, u, "paafs", [str(e)], q=q)
 
 
 P6_CTR_RE = re.compile(r"([A-Z]{1,3}\d{3,5}-[A-Z]{2,3}-[A-Z]{1,3}-\d{3})\s*$", re.I)
@@ -835,6 +721,10 @@ def act_period(con, form):
         return view_admin(con, u, "periods", ["%s" % e])
 
 
+def nowrap(v):
+    return '<span style="white-space:nowrap">%s</span>' % esc(v if v is not None else "")
+
+
 def view_audit(con, u, q=None):
     if permission_of(con, u) not in ("controller", "admin"):  # who owns the audit trail is still to be confirmed with the cost team
         return no_access(con, u, "Audit trail")
@@ -849,13 +739,8 @@ def view_audit(con, u, q=None):
         "left join app_user ch on ch.user_id=a.changed_by join scope s on s.scope_id=t.scope_id "
         "where (? is null or t.user_id=?) order by a.audit_id desc limit 200", (person, person)).fetchall()
     heads = ["#", "When", "Changed by", "Action", "Booked by", "Scope", "Date", "Old status", "New status", "Old hours", "New hours", "Reason"]
-    arows = con.execute(
-        "select a.audit_id, a.changed_at, ch.name as changed_by, a.action, bu.name as person, at.name as allowance, a.work_date, a.old_status, a.new_status, a.reason "
-        "from allowance_audit a left join app_user ch on ch.user_id=a.changed_by join app_user bu on bu.user_id=a.user_id "
-        "join allowance_type at on at.allowance_id=a.allowance_id where (? is null or a.user_id=?) order by a.audit_id desc limit 200", (person, person)).fetchall()
     body = ('<form method="get" action="/audit">%s<p>Person whose hours changed %s <input type="submit" value="Filter"> '
             '<small>Showing the latest 200 changes%s.</small></p></form>' % (
-                hidden(u=u), sel("person", opts_users(con), person, True, "Everyone"), " for this person" if person else "")) +         table(heads, [[fmt(v) if i in (9, 10) else fmt_time(v) if i == 1 else v for i, v in enumerate(r)] for r in rows])
-    body += "<h4>Allowances</h4>" + table(["#", "When", "Changed by", "Action", "Booked by", "Allowance", "Date", "Old status", "New status", "Reason"],
-                                           [[fmt_time(v) if i == 1 else v for i, v in enumerate(r)] for r in arows])
-    return layout(con, u, "Audit trail (latest 200)", body)
+                hidden(u=u), sel("person", opts_users(con), person, True, "Everyone"), " for this person" if person else "")) +         table(heads, [[fmt(v) if i in (9, 10) else nowrap(fmt_time(v)) if i == 1 else nowrap(dmy(v)) if i == 6 else str(v).capitalize() if i == 3 else v
+                                                                                   for i, v in enumerate(r)] for r in rows], raw_cols=(1, 6))
+    return layout(con, u, "Audit trail", body)

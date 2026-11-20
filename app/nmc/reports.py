@@ -2,7 +2,8 @@
 import datetime
 import io
 from urllib.parse import quote, urlencode
-from nmc.core import date_input, esc, fmt, hidden, layout, monday, no_access, permission_of, sel, sub_row
+from nmc.core import date_input, dmy, esc, fmt, hidden, layout, monday, no_access, permission_of, sel, sub_row
+from nmc.monthend import monthend_body
 
 
 REPORT_JS = """<script>
@@ -100,7 +101,7 @@ def ctr_tree_rows(con, u=None, rv=ALL_REPORTS):
         pe = node(sk["kids"], e["person"], e["person"], "Person")
         pe["skill"], pe["rate"] = e["skill_code"], e["sales_rate"]
         path.append(pe)
-        en = mk(e["work_date"], "Entry")
+        en = mk(dmy(e["work_date"]), "Entry")
         en["skill"], en["rate"], en["status"] = e["skill_code"], e["sales_rate"], e["status"]
         pe["kids"]["%s-%d" % (e["work_date"], e["entry_id"])] = en
         path.append(en)
@@ -220,6 +221,93 @@ def period_data(con, u, q, rv):
     return per, d_from, d_to, filters
 
 
+def internal_data(con, u, rv, d_from, d_to):
+    """Internal hours (paid by NMC, not billed): by week, code, person and skill code, approved and pending."""
+    ivis, iargs = visible_to(rv, u)
+    return con.execute(
+        "select date(t.work_date,'weekday 0','-6 days') as week_start, s.scope_code, s.description, u.name as person, ro.skill_code, "
+        "sum(case when t.status='Approved' then t.hours else 0 end) as approved, "
+        "sum(case when t.status in ('Submitted','Edited') then t.hours else 0 end) as pending "
+        "from time_entry t join scope s on s.scope_id=t.scope_id join client c on c.client_id=s.client_id "
+        "join app_user u on u.user_id=t.user_id join role ro on ro.role_id=t.worked_role_id "
+        "where c.is_internal=1 and t.status<>'Draft' and date(t.work_date,'weekday 0','-6 days') between ? and ?" + ivis +
+        " group by week_start, s.scope_id, u.user_id, ro.role_id order by week_start, s.scope_code, u.name", (d_from, d_to) + iargs).fetchall()
+
+
+def allowance_data(con, u, rv, d_from, d_to):
+    """Offshore nights in the date range, per person: approved and waiting (and the approved value)."""
+    avis, aargs = ("", ()) if rv["all"] else (" and (a.user_id=? or exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=?))", (u, u))
+    return con.execute(
+        "select bu.name as person, at.name as allowance, sum(a.status='Approved') as approved, sum(a.status='Submitted') as waiting, "
+        "sum(case when a.status='Approved' then a.amount else 0 end) as value "
+        "from v_allowance_value a join scope s on s.scope_id=a.scope_id join app_user bu on bu.user_id=a.user_id join allowance_type at on at.allowance_id=a.allowance_id "
+        "where a.status<>'Draft' and date(a.work_date,'weekday 0','-6 days') between ? and ?" + avis +
+        " group by a.user_id, a.allowance_id order by bu.name, a.allowance_id", (d_from, d_to) + aargs).fetchall()
+
+
+def location_data(con, u, rv, d_from, d_to):
+    """Approved hours by where they were worked, normal and overtime."""
+    lvis, largs = visible_to(rv, u)
+    return con.execute(
+        "select lo.name as location, sum(case when t.overtime=0 then t.hours else 0 end) as normal, "
+        "sum(case when t.overtime=1 then t.hours else 0 end) as ot "
+        "from time_entry t join scope s on s.scope_id=t.scope_id join location lo on lo.location_id=t.location_id "
+        "where t.status='Approved' and date(t.work_date,'weekday 0','-6 days') between ? and ?" + lvis +
+        " group by lo.location_id order by lo.location_id", (d_from, d_to) + largs).fetchall()
+
+
+def budget_data(con):
+    return con.execute("select * from v_ctr_budget where budget_hours is not null or actual_hours>0 or pending_hours>0 order by client, phase").fetchall()
+
+
+def ctr_lines(con, u, rv):
+    """Every submitted, edited or approved entry on client work, one line each, so the CTR report can be filtered and pivoted in Excel."""
+    vis, vargs = visible_to(rv, u)
+    return con.execute(
+        "select c.name as client, pr.name as project, s.scope_code, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, "
+        "ro.skill_code, ro.name as role, rt.sales_rate, u.name as person, t.work_date, t.hours, t.status "
+        "from time_entry t join phase ph on ph.phase_id=t.phase_id join scope s on s.scope_id=ph.scope_id "
+        "join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
+        "join rate rt on rt.rate_id=t.rate_id join role ro on ro.role_id=rt.role_id join app_user u on u.user_id=t.user_id "
+        "where t.status<>'Draft'" + vis + " order by c.name, pr.name, s.scope_code, ph.name, ro.skill_code, u.name, t.work_date", vargs).fetchall()
+
+
+def report_sheet(con, u, q, key):
+    """Rows and sheet name for the Excel export of one report on the Reports page (key as on its button), or None if there is no such report for this person."""
+    rv = report_view(con, u)
+    money = rv["money"]
+    d_from = q.get("from", [""])[0] or "%d-01-01" % datetime.date.today().year
+    d_to = q.get("to", [""])[0] or "%d-12-31" % datetime.date.today().year
+    if key == "ctr":
+        rows = [["Client", "Project", "Scope", "CTR", "Skill code", "Role", "Person", "Date", "Hours", "Status"] + (["Sales rate", "Value (approved)"] if money else [])]
+        for r in ctr_lines(con, u, rv):
+            rows.append([r["client"], r["project"], r["scope_code"], r["phase"], r["skill_code"], r["role"], r["person"], dmy(r["work_date"]), r["hours"], r["status"]]
+                        + ([r["sales_rate"], round(r["hours"] * r["sales_rate"], 2) if r["status"] == "Approved" else 0] if money else []))
+        return rows, "CTR hours"
+    if key == "period":
+        return period_sheet(con, u, q, rv)
+    if key == "internal":
+        rows = [["Week commencing", "Internal code", "Person", "Skill code", "Approved hrs", "Pending hrs"]]
+        rows += [[dmy(r["week_start"]), "%s %s" % (r["scope_code"], r["description"]), r["person"], r["skill_code"], r["approved"], r["pending"]] for r in internal_data(con, u, rv, d_from, d_to)]
+        return rows, "Internal %s to %s" % (d_from, d_to)
+    if key == "allow":
+        rows = [["Person", "Allowance", "Approved nights", "Waiting nights"] + (["Approved value"] if money else [])]
+        rows += [[r["person"], r["allowance"], r["approved"], r["waiting"]] + ([round(r["value"], 2)] if money else []) for r in allowance_data(con, u, rv, d_from, d_to)]
+        return rows, "Offshore nights %s to %s" % (d_from, d_to)
+    if key == "loc":
+        rows = [["Location", "Normal hrs", "Overtime hrs", "Total hrs"]]
+        rows += [[r["location"], r["normal"], r["ot"], r["normal"] + r["ot"]] for r in location_data(con, u, rv, d_from, d_to)]
+        return rows, "Location %s to %s" % (d_from, d_to)
+    if key == "budget" and permission_of(con, u) == "controller":
+        rows = [["Client", "CTR No", "Budget hrs", "As of", "Actual hrs", "Pending hrs", "Remaining hrs", "Used %"]]
+        for r in budget_data(con):
+            bh = r["budget_hours"]
+            rows.append([r["client"], r["phase"], bh, dmy(r["as_of"]), r["actual_hours"], r["pending_hours"],
+                         (bh - r["actual_hours"]) if bh is not None else None, round(100 * r["actual_hours"] / bh, 1) if bh else None])
+        return rows, "Budget against actual"
+    return None
+
+
 def view_reports(con, u, q):
     if permission_of(con, u) == "admin":  # Admin (IT) has no reports
         return no_access(con, u, "Reports")
@@ -246,10 +334,10 @@ def view_reports(con, u, q):
         wh = wt = 0.0
         for r in lines:
             t2.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td align=\"right\">%s</td>%s</tr>" % (
-                esc(r["week_start"]), esc(r["client"]), esc(r["project"]), esc(r["scope_code"]), esc(r["phase"]),
+                esc(dmy(r["week_start"])), esc(r["client"]), esc(r["project"]), esc(r["scope_code"]), esc(r["phase"]),
                 esc(r["skill_code"]), esc(r["role"]), fmt(r["hours"]), ('<td align="right">%.2f</td>' % r["total"]) if money else ""))
             wh += r["hours"]; wt += r["total"]
-        t2.append(sub_row(["", "Subtotal week commencing %s" % wk, "", "", "", "", "", fmt(wh)] + (["%.2f" % wt] if money else []), right_from=7))
+        t2.append(sub_row(["", "Subtotal week commencing %s" % dmy(wk), "", "", "", "", "", fmt(wh)] + (["%.2f" % wt] if money else []), right_from=7))
         r_h += wh; r_t += wt
     t2.append(sub_row(["", "Total for range", "", "", "", "", "", fmt(r_h)] + (["%.2f" % r_t] if money else []), right_from=7))
 
@@ -269,9 +357,8 @@ def view_reports(con, u, q):
         filtered_note = "Filtered to the client, project, scope or CTR chosen above, so the total for range is only part of your hours."
 
     period_q = urlencode([("u", u), ("from", d_from), ("to", d_to)] + [(k, v) for k, v in (("client", client), ("project", project), ("scope", scope), ("phase", phase)) if v is not None])
-    b = ['<p><a href="/reports/grid?u=%d">Timesheet grid: hours by person, code and day</a> (ready-made layouts you can tailor) &nbsp; '
-         '<a href="/reports/period.xlsx?%s">Download the period report as Excel</a>%s</p>' % (
-             u, esc(period_q), (' &nbsp; <a href="/reports/manhours?u=%d">Manhour report by client (people and roles, Excel)</a>' % u) if manhour_clients(con, u) else ""),
+    rng = "&amp;from=%s&amp;to=%s" % (esc(d_from), esc(d_to))
+    b = [sect("ctr", "CTR hours and value"), xl(u, "ctr"),
          "<h4>CTR (Cost Time Resource) - by client, project, scope and CTR</h4>",
          "<p><small>%s</small></p>" % tree_note,
          '<p><input type="button" value="Expand all" onclick="openTo(9)"> <input type="button" value="Collapse all" onclick="openTo(0)"> '
@@ -279,12 +366,14 @@ def view_reports(con, u, q):
          '<input type="button" value="Show to person" onclick="openTo(5)"> <input type="button" value="Show to entries" onclick="openTo(6)"></p>',
          '<table id="ctr" border="1" cellpadding="3" cellspacing="0">%s%s%s</table>' % (head, tree_rows, foot),
          REPORT_JS,
+         sect("period", "Weekly period report"),
+         '<p class="xl"><a href="/reports/period.xlsx?%s">Download the period report as Excel</a></p>' % esc(period_q),
          "<h4>Period reports (weekly) - approved hours</h4>",
          "<p><small>%s</small></p>" % period_note,
          '<form method="get" action="/reports">%s<p>Client %s Project %s Scope %s CTR %s</p>'
          '<p>From %s To %s '
-         '<input type="submit" value="Show"> <input type="button" value="Reset" onclick="location.href=\'/reports?u=%d\'"></p></form>' % (
-             hidden(u=u),
+         '<input type="submit" value="Show"> <input type="button" value="Reset" onclick="location.href=\'/reports?u=%d&r=period\'"></p></form>' % (
+             hidden(u=u, r="period"),
              sel("client", clients, client, True, "All clients", auto), sel("project", projects, project, True, "All projects", auto),
              sel("scope", scopes, scope, True, "All scopes", auto), sel("phase", phases, phase, True, "All CTRs", auto),
              date_input("from", d_from), date_input("to", d_to), u),
@@ -292,15 +381,9 @@ def view_reports(con, u, q):
          '<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(t2)]
 
     # Internal hours: paid by NMC, not billed, so no rate and no total. Same date range, not affected by the client filters above.
-    ivis, iargs = visible_to(rv, u)
-    internal = con.execute(
-        "select date(t.work_date,'weekday 0','-6 days') as week_start, s.scope_code, s.description, u.name as person, ro.skill_code, "
-        "sum(case when t.status='Approved' then t.hours else 0 end) as approved, "
-        "sum(case when t.status in ('Submitted','Edited') then t.hours else 0 end) as pending "
-        "from time_entry t join scope s on s.scope_id=t.scope_id join client c on c.client_id=s.client_id "
-        "join app_user u on u.user_id=t.user_id join role ro on ro.role_id=t.worked_role_id "
-        "where c.is_internal=1 and t.status<>'Draft' and date(t.work_date,'weekday 0','-6 days') between ? and ?" + ivis +
-        " group by week_start, s.scope_id, u.user_id, ro.role_id order by week_start, s.scope_code, u.name", (d_from, d_to) + iargs).fetchall()
+    internal = internal_data(con, u, rv, d_from, d_to)
+    b.append(sect("internal", "Internal hours"))
+    b.append(xl(u, "internal", rng))
     b.append("<h4>Internal hours (paid by NMC, not billed to a client)</h4>")
     b.append("<p><small>Hours booked to Internal codes, for the date range above. They have no sales rate, so there is no total value, "
              "and they are not part of the CTR or the period report. Approved hrs are approved; pending hrs are submitted or edited and waiting for approval.</small></p>")
@@ -308,38 +391,35 @@ def view_reports(con, u, q):
         t3 = ["<tr><th>Week commencing</th><th>Internal code</th><th>Person</th><th>Skill code</th><th>Approved hrs</th><th>Pending hrs</th></tr>"]
         for r in internal:
             t3.append('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td align="right">%s</td><td align="right">%s</td></tr>' % (
-                esc(r["week_start"]), esc("%s %s" % (r["scope_code"], r["description"])), esc(r["person"]), esc(r["skill_code"]),
+                esc(dmy(r["week_start"])), esc("%s %s" % (r["scope_code"], r["description"])), esc(r["person"]), esc(r["skill_code"]),
                 fmt(r["approved"]), fmt(r["pending"])))
         t3.append(sub_row(["", "Total for range", "", "", fmt(sum(r["approved"] for r in internal)), fmt(sum(r["pending"] for r in internal))], right_from=4))
         b.append('<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(t3))
     else:
         b.append("<p>No internal hours in this date range.</p>")
 
-    # Allowances claimed in the date range: days per person and allowance, approved and waiting
-    avis, aargs = ("", ()) if rv["all"] else (" and (a.user_id=? or exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=?))", (u, u))
-    allow_rows = con.execute(
-        "select bu.name as person, at.name as allowance, sum(a.status='Approved') as approved, sum(a.status='Submitted') as waiting "
-        "from allowance_entry a join scope s on s.scope_id=a.scope_id join app_user bu on bu.user_id=a.user_id join allowance_type at on at.allowance_id=a.allowance_id "
-        "where a.status<>'Draft' and date(a.work_date,'weekday 0','-6 days') between ? and ?" + avis +
-        " group by a.user_id, a.allowance_id order by bu.name, a.allowance_id", (d_from, d_to) + aargs).fetchall()
+    # Offshore nights in the date range: per person, approved and waiting (worked out from the hours, staff only)
+    money = rv["money"]
+    allow_rows = allowance_data(con, u, rv, d_from, d_to)
+    b.append(sect("allow", "Offshore allowance"))
+    b.append(xl(u, "allow", rng))
     b.append("<h4>Allowances (offshore allowance)</h4>")
-    b.append("<p><small>Days claimed in the date range above, by person and allowance. Approved days are signed off; waiting days are submitted and not yet approved. "
-             "No amounts are held yet.</small></p>")
+    b.append("<p><small>Nights spent offshore in the date range above, by person. A night is earned when a member of staff is offshore that day and the next, so a trip "
+             "of N days is N-1 nights, counted across weeks. Contractors earn none. Approved nights follow the approved hours; waiting nights are on submitted hours.</small></p>")
     if allow_rows:
-        b.append('<table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>Allowance</th><th>Approved days</th><th>Waiting days</th></tr>%s%s</table>' % (
-            "".join('<tr><td>%s</td><td>%s</td><td align="right">%d</td><td align="right">%d</td></tr>' % (esc(r["person"]), esc(r["allowance"]), r["approved"], r["waiting"]) for r in allow_rows),
-            sub_row(["Total", "", str(sum(r["approved"] for r in allow_rows)), str(sum(r["waiting"] for r in allow_rows))], right_from=2)))
+        b.append('<table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>Allowance</th><th>Approved nights</th><th>Waiting nights</th>%s</tr>%s%s</table>' % (
+            "<th>Approved value</th>" if money else "",
+            "".join('<tr><td>%s</td><td>%s</td><td align="right">%d</td><td align="right">%d</td>%s</tr>' % (
+                esc(r["person"]), esc(r["allowance"]), r["approved"], r["waiting"], ('<td align="right">%.2f</td>' % r["value"]) if money else "") for r in allow_rows),
+            sub_row(["Total", "", str(sum(r["approved"] for r in allow_rows)), str(sum(r["waiting"] for r in allow_rows))]
+                    + (["%.2f" % sum(r["value"] for r in allow_rows)] if money else []), right_from=2)))
     else:
-        b.append("<p>No allowances in this date range.</p>")
+        b.append("<p>No offshore nights in this date range.</p>")
 
     # Hours by where they were worked and whether they were overtime (hours only). Client and internal hours, approved, same date range.
-    lvis, largs = visible_to(rv, u)
-    by_loc = con.execute(
-        "select lo.name as location, sum(case when t.overtime=0 then t.hours else 0 end) as normal, "
-        "sum(case when t.overtime=1 then t.hours else 0 end) as ot "
-        "from time_entry t join scope s on s.scope_id=t.scope_id join location lo on lo.location_id=t.location_id "
-        "where t.status='Approved' and date(t.work_date,'weekday 0','-6 days') between ? and ?" + lvis +
-        " group by lo.location_id order by lo.location_id", (d_from, d_to) + largs).fetchall()
+    by_loc = location_data(con, u, rv, d_from, d_to)
+    b.append(sect("loc", "Location and overtime"))
+    b.append(xl(u, "loc", rng))
     b.append("<h4>Hours by location and overtime (approved)</h4>")
     b.append("<p><small>All approved hours in the date range above, client and internal, by where they were worked and whether they were overtime.%s</small></p>" % (
         " Overtime has no separate rate yet, so overtime hours are valued at the normal rate in the totals earlier on this page." if money else ""))
@@ -354,7 +434,9 @@ def view_reports(con, u, q):
     else:
         b.append("<p>No approved hours in this date range.</p>")
     if permission_of(con, u) == "controller":
-        brows = con.execute("select * from v_ctr_budget where budget_hours is not null or actual_hours>0 or pending_hours>0 order by client, phase").fetchall()
+        brows = budget_data(con)
+        b.append(sect("budget", "Budget against actual"))
+        b.append(xl(u, "budget"))
         b.append("<h4>Budget against actual hours (from P6)</h4>")
         b.append("<p><small>Budget hours are the latest load from P6 (Admin, Budgets). Actual is approved hours to date, all weeks; pending is submitted hours waiting for approval. "
                  "Remaining is budget less actual; used is actual as a percentage of budget. A CTR with hours but no budget is shown as not budgeted.</small></p>")
@@ -363,7 +445,7 @@ def view_reports(con, u, q):
             for r in brows:
                 bh = r["budget_hours"]
                 t4.append('<tr><td>%s</td><td>%s</td><td align="right">%s</td><td>%s</td><td align="right">%s</td><td align="right">%s</td><td align="right">%s</td><td align="right">%s</td></tr>' % (
-                    esc(r["client"]), esc(r["phase"]), fmt(bh) if bh is not None else "not budgeted", esc(r["as_of"] or ""), fmt(r["actual_hours"]), fmt(r["pending_hours"]),
+                    esc(r["client"]), esc(r["phase"]), fmt(bh) if bh is not None else "not budgeted", esc(dmy(r["as_of"])), fmt(r["actual_hours"]), fmt(r["pending_hours"]),
                     fmt(bh - r["actual_hours"]) if bh is not None else "", ("%.0f%%" % (100 * r["actual_hours"] / bh)) if bh else ""))
             tb = sum(r["budget_hours"] or 0 for r in brows)
             ta = sum(r["actual_hours"] for r in brows if r["budget_hours"] is not None)
@@ -372,7 +454,64 @@ def view_reports(con, u, q):
         else:
             b.append("<p>No budgets loaded and no client hours yet.</p>")
 
-    return layout(con, u, "Reports", "".join(b))
+    if permission_of(con, u) == "controller":
+        b.append(sect("month", "Month end"))
+        b.append(monthend_body(con, u, q, "/reports", "month"))
+    return layout(con, u, "Reports", report_menu(con, u, b, q.get("r", [""])[0]))
+
+
+def sect(key, title):
+    """Marks where a report starts in the page, so the Reports page can offer each one as a button."""
+    return (key, title)
+
+
+def xl(u, key, q=""):
+    return '<p class="xl"><a href="/reports/export.xlsx?u=%d&amp;k=%s%s">Download this report as Excel</a></p>' % (u, key, q)
+
+
+REPORT_GROUPS = [("Billing", ("ctr", "period", "budget")), ("Hours", ("internal", "loc")), ("People and payroll", ("allow", "month"))]
+REPORT_HELP = {
+    "ctr": "Approved and pending hours and value for every client, project, scope and CTR, down to each person's entries",
+    "period": "Approved hours and value week by week, filtered by client, project, scope or CTR",
+    "budget": "Hours against the P6 budget for each CTR",
+    "internal": "Hours booked to internal codes (paid by NMC, not billed to a client)",
+    "loc": "Approved hours by where they were worked, normal and overtime",
+    "allow": "Offshore nights per person and what they are worth",
+    "month": "Who still has to enter or submit time for a calendar month, and the month's hours by CTR",
+    "grid": "Hours by person, code and day, in ready-made layouts you can tailor",
+    "manhours": "People and roles on a client's work, as an Excel file"}
+
+
+def report_menu(con, u, parts, opened):
+    """A row of buttons, one per report, and only the report you pick is shown. Sections arrive as (key, title) marks followed by their html."""
+    panels, cur = [], None
+    for x in parts:
+        if isinstance(x, tuple):
+            cur = [x[0], x[1], []]
+            panels.append(cur)
+        else:
+            cur[2].append(x)
+    keys = [p[0] for p in panels]
+    opened = opened if opened in keys else ""
+    by_key = {k: t for k, t, _ in panels}
+    rows = []
+    for label, group in REPORT_GROUPS:
+        bs = "".join('<input type="button" class="rbtn" id="rb-%s" value="%s" title="%s" onclick="showReport(&quot;%s&quot;)"> ' % (k, esc(by_key[k]), esc(REPORT_HELP[k]), k)
+                     for k in group if k in by_key)
+        if bs:
+            rows.append('<div class="rgroup"><span class="gl">%s</span>%s</div>' % (esc(label), bs))
+    pages = '<input type="button" value="Timesheet grid" title="%s" onclick="location.href=&quot;/reports/grid?u=%d&quot;"> ' % (esc(REPORT_HELP["grid"]), u)
+    if manhour_clients(con, u):
+        pages += '<input type="button" value="Manhours by client" title="%s" onclick="location.href=&quot;/reports/manhours?u=%d&quot;"> ' % (esc(REPORT_HELP["manhours"]), u)
+    rows.append('<div class="rgroup"><span class="gl">Other pages</span>%s</div>' % pages)
+    btns = "".join(rows)
+    body = "".join('<div class="rpt" id="rp-%s" style="display:%s">%s</div>' % (k, "block" if k == opened else "none", "".join(h)) for k, _, h in panels)
+    js = ("<script>function showReport(k){var o=document.getElementById('rp-'+k),open=o.style.display!=='none';"
+          "document.querySelectorAll('.rpt').forEach(function(e){e.style.display='none'});"
+          "document.querySelectorAll('.rbtn').forEach(function(e){e.style.fontWeight='normal'});"
+          "if(!open){o.style.display='block';document.getElementById('rb-'+k).style.fontWeight='bold'}}"
+          "%s</script>" % (("var b=document.getElementById('rb-%s');if(b)b.style.fontWeight='bold';" % opened) if opened else ""))
+    return "<p>Pick a report to open it.</p>%s%s%s" % (btns, body, js)
 
 
 # ---------- Timesheet grid report, layouts and Excel downloads (R27, R29, R30) ----------
@@ -747,11 +886,43 @@ def period_sheet(con, u, q, rv):
     money = rv["money"]
     rows = [["Week commencing", "Client", "Project", "Scope", "CTR", "Skill code", "Role", "Hours"] + (["Total"] if money else [])]
     for r in per:
-        rows.append([r["week_start"], r["client"], r["project"], r["scope_code"], r["phase"], r["skill_code"], r["role"], r["hours"]]
+        rows.append([dmy(r["week_start"]), r["client"], r["project"], r["scope_code"], r["phase"], r["skill_code"], r["role"], r["hours"]]
                     + ([round(r["total"], 2)] if money else []))
     if per:
         rows.append(["Total for range"] + [None] * 6 + [sum(r["hours"] for r in per)] + ([round(sum(r["total"] for r in per), 2)] if money else []))
     return rows, ("Period %s to %s" % (d_from, d_to))
+
+
+def ctr_sheet(con, u, q):
+    """One CTR as an Excel sheet: each entry and each offshore night, with the same visibility rules as the CTR page. None if there is nothing to see."""
+    rv = report_view(con, u)
+    money = rv["money"]
+    vis, vargs = visible_to(rv, u)
+    try:
+        pid = int(q.get("phase", ["0"])[0])
+    except ValueError:
+        pid = 0
+    ph = con.execute("select (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase from phase ph join scope s on s.scope_id=ph.scope_id where ph.phase_id=?", (pid,)).fetchone()
+    if not ph:
+        return None
+    ents = con.execute(
+        "select r.family, r.skill_code, r.name as title, u.name as person, t.work_date, t.hours, lo.name as location, t.overtime, t.status, ap.name as approved_by, rt.sales_rate "
+        "from time_entry t join scope s on s.scope_id=t.scope_id join rate rt on rt.rate_id=t.rate_id join role r on r.role_id=rt.role_id "
+        "join location lo on lo.location_id=t.location_id join app_user u on u.user_id=t.user_id left join app_user ap on ap.user_id=t.approved_by "
+        "where t.phase_id=? and t.status<>'Draft'" + vis + " order by r.family, r.skill_code, u.name, t.work_date", (pid,) + vargs).fetchall()
+    rows = [["Family", "Skill code", "Role", "Person", "Date", "Hours", "Location", "Overtime", "Status", "Approved by"] + (["Sales rate", "Value (approved)"] if money else [])]
+    for e in ents:
+        rows.append([e["family"], e["skill_code"], e["title"], e["person"], dmy(e["work_date"]), e["hours"], e["location"], "Yes" if e["overtime"] else "No", e["status"], e["approved_by"]]
+                    + ([e["sales_rate"], round(e["hours"] * e["sales_rate"], 2) if e["status"] == "Approved" else 0] if money else []))
+    avis, aargs = ("", ()) if rv["all"] else (" and (a.user_id=? or exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=?))", (u, u))
+    nights = con.execute(
+        "select bu.name as person, a.work_date, a.status, a.amount from v_allowance_value a join scope s on s.scope_id=a.scope_id join app_user bu on bu.user_id=a.user_id "
+        "where a.phase_id=? and a.status<>'Draft'" + avis + " order by bu.name, a.work_date", (pid,) + aargs).fetchall()
+    for n in nights:
+        rows.append(["Offshore allowance", "", "Night", n["person"], dmy(n["work_date"]), 1, "", "", n["status"], ""] + (["", round(n["amount"], 2) if n["status"] == "Approved" else 0] if money else []))
+    if not ents and not nights and not rv["all"]:
+        return None
+    return rows, "CTR %s" % ph["phase"]
 
 
 def view_ctr(con, u, q):
@@ -822,16 +993,18 @@ def view_ctr(con, u, q):
     a_value = sum(r["value"] for r in arows if r["status"] == "Approved")
     tabs.append(("<b>[Allowances]</b>" if fam == "Allowances" else '<a href="%s&amp;family=Allowances">Allowances</a>' % base) if arows else "")
     tabs = [x for x in tabs if x]
+    dl = '<a href="/ctr.xlsx?u=%d&amp;phase=%d">Download this CTR as Excel</a>' % (u, pid)
     if fam == "Summary":  # the CTR sheet carries its own header, so only the way back is shown above it
         head = '<p><a href="/reports?u=%d">&lt;&lt; Back to Reports</a></p>' % u
+    head += "<p>%s</p>" % dl
     b = [head, "<p>CTR tabs: %s</p>" % " | ".join(tabs)]
     if not ents and not arows:
         b.append("<p>No hours have been submitted to this CTR yet.</p>")
         return layout(con, u, "CTR", "".join(b))
     allow_table = ""
     if arows:
-        allow_table = ('<p><b>Allowances</b> <small>(offshore allowance: staff only; only Approved days count)%s</small></p>'
-                       '<table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>Allowance</th><th>Days</th>%s<th>Status</th></tr>%s%s</table>' % (
+        allow_table = ('<p><b>Allowances</b> <small>(offshore allowance: a night spent offshore, staff only; only Approved nights count)%s</small></p>'
+                       '<table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>Allowance</th><th>Nights</th>%s<th>Status</th></tr>%s%s</table>' % (
                            "" if rv["money"] else "",
                            "<th>Value</th>" if rv["money"] else "",
                            "".join("<tr>%s</tr>" % "".join((
@@ -843,7 +1016,7 @@ def view_ctr(con, u, q):
     tcol = "<th>Total</th>" if money else ""
     if fam == "Allowances":
         b.append("<h4>Allowances - %s %s, %s</h4>" % (esc(ph["scope_code"]), esc(ph["scope_desc"]), esc(ph["phase"])) + allow_table)
-        return layout(con, u, "CTR - %s %s - %s" % (ph["scope_code"], ph["scope_desc"], ph["phase"]), "".join(b))
+        return layout(con, u, "CTR %s" % ph["phase"], "".join(b))
     if fam == "Summary":
         def para(v):
             return esc(v).replace("\n", "<br>") if v else "&ndash;"
@@ -868,8 +1041,8 @@ def view_ctr(con, u, q):
             b.append('<table border="1" cellpadding="3" cellspacing="0" style="width:100%%;margin-top:.4rem"><tr><th align="left">%s</th></tr><tr><td>%s</td></tr></table>' % (
                 title, para(ph[key])))
         b.append('<table border="1" cellpadding="3" cellspacing="0" style="margin-top:.4rem"><tr>%s<td>%s</td>%s<td>%s</td></tr><tr>%s<td>%s</td>%s<td>%s</td></tr></table>' % (
-            label("Commencement Date"), esc(ph["book_from"] or "ref plan"), label("Duration"), "ref plan",
-            label("Completion Date"), esc(ph["book_to"] or "ref plan"), label("Expenses"), esc(ph["expenses"])))
+            label("Commencement Date"), esc(dmy(ph["book_from"]) or "ref plan"), label("Duration"), "ref plan",
+            label("Completion Date"), esc(dmy(ph["book_to"]) or "ref plan"), label("Expenses"), esc(ph["expenses"])))
         if ph["wbs"] or ph["cbs"] or ph["abs_code"]:
             b.append('<table border="1" cellpadding="3" cellspacing="0" style="margin-top:.4rem"><tr>%s<td>%s</td></tr></table>' % (
                 label("WBS / CBS / ABS"), esc(" / ".join(x or "-" for x in (ph["wbs"], ph["cbs"], ph["abs_code"])))))
@@ -902,7 +1075,7 @@ def view_ctr(con, u, q):
             esc(r["allowance"]),
             ('<td align="right">%.2f</td>' % r["amount"]) if money else "", r["units"],
             ('<td align="right">%.2f</td>' % (r["amount"] * r["units"])) if money else "") for r in adds)
-        b.append('<table border="1" cellpadding="3" cellspacing="0" style="margin-top:.4rem"><tr><th>Addition</th>%s<th>Unit (days)</th>%s</tr>%s</table>' % (
+        b.append('<table border="1" cellpadding="3" cellspacing="0" style="margin-top:.4rem"><tr><th>Addition</th>%s<th>Unit (nights)</th>%s</tr>%s</table>' % (
             "<th>Cost &pound; / Unit</th>" if money else "", "<th>Total</th>" if money else "",
             add_rows or "<tr><td colspan=\"%d\">No approved allowances.</td></tr>" % (4 if money else 2)))
         if money:
@@ -923,7 +1096,7 @@ def view_ctr(con, u, q):
         bud = con.execute("select * from v_ctr_budget where phase_id=?", (pid,)).fetchone() if money else None
         if bud and bud["budget_hours"] is not None:
             b.append("<p><b>Budget %s hrs</b> (P6, as of %s) &nbsp; actual %s hrs &nbsp; remaining %s hrs &nbsp; used %.0f%%</p>" % (
-                fmt(bud["budget_hours"]), esc(bud["as_of"]), fmt(bud["actual_hours"]), fmt(bud["budget_hours"] - bud["actual_hours"]),
+                fmt(bud["budget_hours"]), esc(dmy(bud["as_of"])), fmt(bud["actual_hours"]), fmt(bud["budget_hours"] - bud["actual_hours"]),
                 100 * bud["actual_hours"] / bud["budget_hours"] if bud["budget_hours"] else 0))
         elif bud:
             b.append("<p><small>No budget has been loaded for this CTR (Admin, Budgets).</small></p>")
@@ -961,10 +1134,10 @@ def view_ctr(con, u, q):
         rows = []
         for e in sorted(fe, key=lambda x: (x["work_date"], x["person"])):
             rows.append("<tr>%s%s%s%s%s%s%s%s%s</tr>" % (
-                td(esc(e["work_date"])), td(esc(e["person"])), td(esc("%s %s" % (e["skill_code"], e["title"]))),
+                td(esc(dmy(e["work_date"]))), td(esc(e["person"])), td(esc("%s %s" % (e["skill_code"], e["title"]))),
                 td(esc(e["location"])), td("<b>Overtime</b>" if e["overtime"] else "Normal"), td(fmt(e["hours"]), True),
                 td("%.2f" % (e["hours"] * e["sales_rate"]), True) if money else "", td(esc(e["status"])), td(esc(e["approved_by"] or ""))))
         b.append('<p><b>Timesheet entries</b> <small>(%sonly Approved entries count towards the CTR)</small></p>'
                  '<table border="1" cellpadding="3" cellspacing="0"><tr><th>Date</th><th>Person</th><th>Booked as</th><th>Location</th><th>Type</th><th>Hours</th>%s'
                  '<th>Status</th><th>Approved by</th></tr>%s</table>' % ("value = hours x sales rate; " if money else "", "<th>Value</th>" if money else "", "".join(rows)))
-    return layout(con, u, "CTR - %s %s - %s" % (ph["scope_code"], ph["scope_desc"], ph["phase"]), "".join(b))
+    return layout(con, u, "CTR %s" % ph["phase"], "".join(b))

@@ -2,7 +2,9 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 20;  -- 2: a cost controller approves the hours a scope approver books to their own scope
+PRAGMA user_version = 22;  -- 22: the offshore allowance is per night spent offshore and worked out from the hours (no claims, no allowance approvals)
+                          -- 21: the PAAF table is gone (the client's list of people is kept outside the app)
+                          -- 2: a cost controller approves the hours a scope approver books to their own scope
                           -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
                           -- 4: every entry has a location (On site / Offshore / Standard) and an overtime flag
                           -- 5: a cost controller can reopen submitted or approved hours (reopen_reason)
@@ -33,7 +35,7 @@ CREATE TABLE role (
 );
 
 -- is_internal = 1 marks NMC's own "Internal" client: hours booked to its codes are paid by NMC, not billed to a client.
--- They need no PAAF and have no rate, and are left out of the client CTR and period reports.
+-- They have no rate, and are left out of the client CTR and period reports.
 CREATE TABLE client (
     client_id   INTEGER PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
@@ -63,23 +65,6 @@ CREATE TABLE app_user (
     start_date      TEXT NOT NULL,
     end_date        TEXT,
     line_manager_id INTEGER REFERENCES app_user(user_id) CHECK (line_manager_id IS NULL OR line_manager_id <> user_id)
-);
-
--- PAAF: the list of people who work on a client's projects, one row per person per client. It is the list that goes to the client and it
--- does not limit who can book or what they are priced at: hours are priced at the client's rate for the skill code booked. rate_id is no
--- longer used (kept nullable for older data). None of the clients approve individuals, so a row is active as soon as it is added (status
--- Approved) and ends on its expiry date. The Draft / Sent / Rejected statuses and the signed form reference are kept for a client that asks later.
-CREATE TABLE paaf (
-    paaf_id     INTEGER PRIMARY KEY,
-    user_id     INTEGER NOT NULL REFERENCES app_user(user_id),
-    client_id   INTEGER NOT NULL REFERENCES client(client_id),
-    rate_id     INTEGER REFERENCES rate(rate_id),
-    status      TEXT NOT NULL DEFAULT 'Approved' CHECK (status IN ('Draft','Sent','Approved','Rejected')),
-    sent_date   TEXT,
-    decided_date TEXT,
-    document_ref TEXT,                               -- link/path to signed client form
-    expiry_date  TEXT,                               -- NULL = open-ended
-    UNIQUE (user_id, client_id)
 );
 
 -- Hierarchy: client > project > scope > phase. Hours are booked to a phase (the lowest level).
@@ -191,7 +176,7 @@ BEGIN
     WHERE (SELECT client_id FROM project WHERE project_id = NEW.project_id) <> NEW.client_id;
 END;
 
--- The internal client has no rate card and needs no PAAFs.
+-- The internal client has no rate card.
 -- Rates are append-only so past billing stays reproducible: a change is a new row with a later effective date.
 CREATE TRIGGER trg_rate_no_update BEFORE UPDATE ON rate
 BEGIN
@@ -205,11 +190,6 @@ END;
 CREATE TRIGGER trg_rate_not_internal BEFORE INSERT ON rate
 BEGIN
     SELECT RAISE(ABORT, 'Internal codes have no rate card')
-    WHERE (SELECT is_internal FROM client WHERE client_id = NEW.client_id) = 1;
-END;
-CREATE TRIGGER trg_paaf_not_internal BEFORE INSERT ON paaf
-BEGIN
-    SELECT RAISE(ABORT, 'Internal codes do not need a PAAF')
     WHERE (SELECT is_internal FROM client WHERE client_id = NEW.client_id) = 1;
 END;
 
@@ -226,7 +206,8 @@ CREATE TABLE period (
 CREATE TABLE location (
     location_id INTEGER PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
-    active      INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1))
+    active      INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+    earns_allowance INTEGER NOT NULL DEFAULT 0 CHECK (earns_allowance IN (0,1))  -- 1 = a night here earns the allowance (Offshore)
 );
 
 -- Lifecycle: Draft -> Submitted -> Approved. Reject sends Submitted back to Draft (reason stored).
@@ -236,7 +217,6 @@ CREATE TABLE time_entry (
     user_id     INTEGER NOT NULL REFERENCES app_user(user_id),
     scope_id    INTEGER NOT NULL REFERENCES scope(scope_id),
     phase_id    INTEGER NOT NULL REFERENCES phase(phase_id), -- lowest booking level; must belong to scope_id
-    paaf_id     INTEGER REFERENCES paaf(paaf_id),            -- no longer used (always NULL on new entries)
     worked_role_id INTEGER NOT NULL REFERENCES role(role_id), -- skill code booked under (defaults to user's role)
     rate_id     INTEGER REFERENCES rate(rate_id),            -- client sales rate for worked role, snapshot at booking; NULL for internal hours
     work_date   TEXT NOT NULL,
@@ -468,137 +448,14 @@ JOIN app_user u ON u.user_id = t.user_id
 WHERE t.status IN ('Submitted','Edited');
 
 -- ---------------------------------------------------------------------------------------------------------------------------
--- Allowances: the offshore allowance. A person claims one of each allowance per day, against a booking code (so it is
--- approved by that code's approver and follows the same rules as hours). Flat claims: no amount is stored yet.
+-- Allowances: the offshore allowance is paid per night spent offshore, to staff only (contractors have it in their rate). Nothing is
+-- claimed or stored: the nights are worked out from the hours (see v_offshore_night), so they follow the hours' status and approval.
 -- ---------------------------------------------------------------------------------------------------------------------------
 CREATE TABLE allowance_type (
     allowance_id INTEGER PRIMARY KEY,
     name         TEXT NOT NULL UNIQUE,
     active       INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1))
 );
-
-CREATE TABLE allowance_entry (
-    allowance_entry_id INTEGER PRIMARY KEY,
-    user_id        INTEGER NOT NULL REFERENCES app_user(user_id),
-    scope_id       INTEGER NOT NULL REFERENCES scope(scope_id),
-    phase_id       INTEGER NOT NULL REFERENCES phase(phase_id),
-    allowance_id   INTEGER NOT NULL REFERENCES allowance_type(allowance_id),
-    work_date      TEXT NOT NULL,
-    status         TEXT NOT NULL DEFAULT 'Draft' CHECK (status IN ('Draft','Submitted','Approved')),
-    reason         TEXT,                                  -- why it was sent back or reopened
-    approved_by    INTEGER REFERENCES app_user(user_id),
-    approved_at    TEXT,
-    created_by     INTEGER NOT NULL REFERENCES app_user(user_id),
-    last_edited_by INTEGER REFERENCES app_user(user_id),
-    last_edited_at TEXT,
-    UNIQUE (user_id, allowance_id, work_date)             -- one of each allowance per person per day
-);
-
-CREATE TRIGGER trg_allowance_valid
-BEFORE INSERT ON allowance_entry
-BEGIN
-    SELECT RAISE(ABORT, 'New allowances must be Draft') WHERE NEW.status <> 'Draft';
-    SELECT RAISE(ABORT, 'That allowance is not available') WHERE NOT EXISTS (SELECT 1 FROM allowance_type WHERE allowance_id = NEW.allowance_id AND active = 1);
-    SELECT RAISE(ABORT, 'Allowances are only for staff, not contractors')
-    WHERE (SELECT employment_type FROM app_user WHERE user_id = NEW.user_id) <> 'Staff';
-    SELECT RAISE(ABORT, 'This person is not active on that date (check their start and end dates)')
-    WHERE EXISTS (SELECT 1 FROM app_user WHERE user_id = NEW.user_id AND (NEW.work_date < start_date OR (end_date IS NOT NULL AND NEW.work_date > end_date)));
-    SELECT RAISE(ABORT, 'Scope is not Open') WHERE (SELECT status FROM scope WHERE scope_id = NEW.scope_id) <> 'Open';
-    SELECT RAISE(ABORT, 'CTR does not belong to this scope') WHERE NOT EXISTS (SELECT 1 FROM phase WHERE phase_id = NEW.phase_id AND scope_id = NEW.scope_id);
-    SELECT RAISE(ABORT, 'Project is not Open')
-    WHERE (SELECT pr.status FROM scope sc JOIN project pr ON pr.project_id = sc.project_id WHERE sc.scope_id = NEW.scope_id) <> 'Open';
-    SELECT RAISE(ABORT, 'CTR is not Open') WHERE (SELECT status FROM phase WHERE phase_id = NEW.phase_id) <> 'Open';
-    SELECT RAISE(ABORT, 'This booking code is restricted and this person is not on its list of people')
-    WHERE (SELECT restricted FROM phase WHERE phase_id = NEW.phase_id) = 1
-      AND NOT EXISTS (SELECT 1 FROM phase_person WHERE phase_id = NEW.phase_id AND user_id = NEW.user_id);
-    SELECT RAISE(ABORT, 'This booking code cannot be booked on that date (outside its booking dates)')
-    WHERE EXISTS (SELECT 1 FROM phase WHERE phase_id = NEW.phase_id
-                  AND ((book_from IS NOT NULL AND NEW.work_date < book_from) OR (book_to IS NOT NULL AND NEW.work_date > book_to)));
-    SELECT RAISE(ABORT, 'Weekly period is not open')
-    WHERE NOT EXISTS (SELECT 1 FROM period WHERE week_start = date(NEW.work_date, 'weekday 0', '-6 days') AND status = 'Open');
-END;
-
-CREATE TRIGGER trg_allowance_edit_rules
-BEFORE UPDATE ON allowance_entry
-BEGIN
-    SELECT RAISE(ABORT, 'Edits must set last_edited_by and last_edited_at')
-    WHERE NEW.last_edited_by IS NULL OR NEW.last_edited_at IS NULL
-       OR (NEW.last_edited_by IS OLD.last_edited_by AND NEW.last_edited_at IS OLD.last_edited_at);
-    SELECT RAISE(ABORT, 'Only the status of an allowance can change')
-    WHERE NEW.user_id <> OLD.user_id OR NEW.scope_id <> OLD.scope_id OR NEW.phase_id <> OLD.phase_id
-       OR NEW.allowance_id <> OLD.allowance_id OR NEW.work_date <> OLD.work_date;
-    -- the person submits their own drafts
-    SELECT RAISE(ABORT, 'Only the person can submit their own allowances')
-    WHERE OLD.status = 'Draft' AND NEW.status <> 'Draft' AND (NEW.status <> 'Submitted' OR NEW.last_edited_by <> NEW.user_id);
-    -- approval: an approver of the scope (never the owner); allowances booked by the only approver are approved by a cost controller
-    SELECT RAISE(ABORT, 'Only an approver of the scope can approve (and not their own entry); a cost controller approves allowances when the booker is the only approver')
-    WHERE OLD.status = 'Submitted' AND NEW.status = 'Approved'
-      AND (NEW.approved_by IS NULL OR NEW.approved_by = NEW.user_id OR NOT (
-            (EXISTS (SELECT 1 FROM v_scope_approver WHERE scope_id = NEW.scope_id AND user_id = NEW.approved_by)
-             AND (SELECT permission FROM app_user WHERE user_id = NEW.approved_by) = 'user')
-            OR ((SELECT permission FROM app_user WHERE user_id = NEW.approved_by) = 'controller'
-                AND EXISTS (SELECT 1 FROM v_scope_approver WHERE scope_id = NEW.scope_id AND user_id = NEW.user_id)
-                AND NOT EXISTS (SELECT 1 FROM v_scope_approver WHERE scope_id = NEW.scope_id AND user_id <> NEW.user_id))));
-    -- sending back (Submitted -> Draft) needs a reason, from an approver of the scope or a cost controller, never the owner
-    SELECT RAISE(ABORT, 'Sending an allowance back needs a reason, from an approver or a cost controller')
-    WHERE OLD.status = 'Submitted' AND NEW.status = 'Draft'
-      AND (NEW.reason IS NULL OR NEW.reason = '' OR NEW.reason IS OLD.reason OR NEW.last_edited_by = NEW.user_id
-           OR NOT (EXISTS (SELECT 1 FROM v_scope_approver WHERE scope_id = NEW.scope_id AND user_id = NEW.last_edited_by)
-                   OR (SELECT permission FROM app_user WHERE user_id = NEW.last_edited_by) = 'controller'));
-    -- reopening (Approved -> Draft): only a cost controller, with a reason, never their own
-    SELECT RAISE(ABORT, 'Only a cost controller can reopen an approved allowance, with a reason, and not their own')
-    WHERE OLD.status = 'Approved' AND NEW.status = 'Draft'
-      AND (NEW.reason IS NULL OR NEW.reason = '' OR NEW.reason IS OLD.reason OR NEW.last_edited_by = NEW.user_id
-           OR (SELECT permission FROM app_user WHERE user_id = NEW.last_edited_by) <> 'controller');
-    SELECT RAISE(ABORT, 'That change of status is not allowed')
-    WHERE (OLD.status = 'Draft' AND NEW.status = 'Approved') OR (OLD.status = 'Approved' AND NEW.status = 'Submitted');
-END;
-
-CREATE TRIGGER trg_allowance_delete_draft_only
-BEFORE DELETE ON allowance_entry
-BEGIN
-    SELECT RAISE(ABORT, 'Only Draft allowances can be deleted') WHERE OLD.status <> 'Draft';
-END;
-
--- Audit trail for allowances: append-only, like the one for hours.
-CREATE TABLE allowance_audit (
-    audit_id           INTEGER PRIMARY KEY,
-    allowance_entry_id INTEGER NOT NULL,
-    action             TEXT NOT NULL CHECK (action IN ('CREATE','STATUS','DELETE')),
-    changed_by         INTEGER REFERENCES app_user(user_id),
-    changed_at         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    old_status         TEXT,
-    new_status         TEXT,
-    reason             TEXT,
-    user_id            INTEGER NOT NULL,
-    allowance_id       INTEGER NOT NULL,
-    work_date          TEXT NOT NULL
-);
-CREATE TRIGGER trg_allowance_audit_insert AFTER INSERT ON allowance_entry
-BEGIN
-    INSERT INTO allowance_audit (allowance_entry_id, action, changed_by, new_status, user_id, allowance_id, work_date)
-    VALUES (NEW.allowance_entry_id, 'CREATE', NEW.created_by, NEW.status, NEW.user_id, NEW.allowance_id, NEW.work_date);
-END;
-CREATE TRIGGER trg_allowance_audit_update AFTER UPDATE ON allowance_entry
-WHEN NEW.status <> OLD.status
-BEGIN
-    INSERT INTO allowance_audit (allowance_entry_id, action, changed_by, old_status, new_status, reason, user_id, allowance_id, work_date)
-    VALUES (NEW.allowance_entry_id, 'STATUS', NEW.last_edited_by, OLD.status, NEW.status,
-            CASE WHEN NEW.status = 'Draft' THEN NEW.reason END, NEW.user_id, NEW.allowance_id, NEW.work_date);
-END;
-CREATE TRIGGER trg_allowance_audit_delete BEFORE DELETE ON allowance_entry
-BEGIN
-    INSERT INTO allowance_audit (allowance_entry_id, action, changed_by, old_status, user_id, allowance_id, work_date)
-    VALUES (OLD.allowance_entry_id, 'DELETE', COALESCE(OLD.last_edited_by, OLD.user_id), OLD.status, OLD.user_id, OLD.allowance_id, OLD.work_date);
-END;
-CREATE TRIGGER trg_allowance_audit_no_update BEFORE UPDATE ON allowance_audit
-BEGIN
-    SELECT RAISE(ABORT, 'The audit trail cannot be changed');
-END;
-CREATE TRIGGER trg_allowance_audit_no_delete BEFORE DELETE ON allowance_audit
-BEGIN
-    SELECT RAISE(ABORT, 'The audit trail cannot be deleted');
-END;
 
 -- One person cannot book more than 24 hours on one day, however many rows (codes, locations, overtime) the hours are spread over.
 CREATE TRIGGER trg_time_entry_day_cap_insert
@@ -632,12 +489,30 @@ BEGIN
     SELECT RAISE(ABORT, 'Allowance rates are never deleted: add a new row with a later effective date');
 END;
 
--- Each allowance claim with the value of that day: the rate in force on the day. No rate means 0.
+-- The nights spent offshore, worked out from the hours. A night belongs to the day before it (the night after Monday is Monday's) and
+-- is earned when a member of staff has hours at a location that earns the allowance (Offshore) on that day AND on the next day, in this
+-- week or the next: the last offshore day of a trip earns no night, so Monday to Sunday offshore is 6 nights and a single offshore day is none.
+-- It is charged to the CTR with most offshore hours that day, and is Approved only when those hours are approved, Submitted when they
+-- have been submitted, and Draft before that. Contractors earn none.
+CREATE VIEW v_offshore_night AS
+WITH day_ctr AS (
+    SELECT t.user_id, t.work_date, t.scope_id, t.phase_id, SUM(t.hours) AS hours,
+           MIN(CASE t.status WHEN 'Draft' THEN 0 WHEN 'Approved' THEN 2 ELSE 1 END) AS lvl
+    FROM time_entry t JOIN location l ON l.location_id = t.location_id AND l.earns_allowance = 1
+    GROUP BY t.user_id, t.work_date, t.scope_id, t.phase_id),
+ranked AS (
+    SELECT d.*, ROW_NUMBER() OVER (PARTITION BY d.user_id, d.work_date ORDER BY d.hours DESC, d.phase_id) AS rn FROM day_ctr d)
+SELECT r.user_id, r.work_date, r.scope_id, r.phase_id,
+       CASE r.lvl WHEN 0 THEN 'Draft' WHEN 1 THEN 'Submitted' ELSE 'Approved' END AS status
+FROM ranked r JOIN app_user u ON u.user_id = r.user_id AND u.employment_type = 'Staff'
+WHERE r.rn = 1 AND EXISTS (SELECT 1 FROM day_ctr n WHERE n.user_id = r.user_id AND n.work_date = date(r.work_date, '+1 day'));
+
+-- Each night with its value: the allowance rate in force on that night (the first active allowance, the offshore allowance). No rate means 0.
 CREATE VIEW v_allowance_value AS
-SELECT a.allowance_entry_id, a.user_id, a.scope_id, a.phase_id, a.allowance_id, a.work_date, a.status,
-       COALESCE((SELECT r.amount FROM allowance_rate r WHERE r.allowance_id = a.allowance_id AND r.effective_from <= a.work_date
+SELECT n.user_id, n.scope_id, n.phase_id, a.allowance_id, n.work_date, n.status,
+       COALESCE((SELECT r.amount FROM allowance_rate r WHERE r.allowance_id = a.allowance_id AND r.effective_from <= n.work_date
                  ORDER BY r.effective_from DESC LIMIT 1), 0) AS amount
-FROM allowance_entry a;
+FROM v_offshore_night n JOIN (SELECT allowance_id FROM allowance_type WHERE active = 1 ORDER BY allowance_id LIMIT 1) a;
 
 -- Budget hours per CTR, as held in P6 (P6 holds hours only, no money). Cost controllers load them from a P6 export; each load is a snapshot
 -- with an as-of date and is never edited or deleted, so you can see how a budget moved. The latest snapshot is the one compared.
