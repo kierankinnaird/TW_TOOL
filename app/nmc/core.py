@@ -344,8 +344,8 @@ def layout(con, u, title, body):
     n_back, n_open = con.execute("select count(*) filter (where reject_reason is not null), count(*) filter (where reopen_reason is not null) from time_entry "
                                  "where user_id=? and status='Draft'", (u,)).fetchone()
     note = ", ".join(x for x in ("%d sent back" % n_back if n_back else "", "%d reopened" % n_open if n_open else "") if x)
-    items = [] if perm == "admin" or not me["books_time"] else [("timesheet", "My Timesheet%s" % (" (%s)" % note if note else ""), "/timesheet?u=%d" % u),
-                                        ("history", "Timesheet history", "/history?u=%d" % u)]  # the IT admin's account books no time
+    items = [] if not me["books_time"] else [("timesheet", "My Timesheet%s" % (" (%s)" % note if note else ""), "/timesheet?u=%d" % u),
+                                        ("history", "Timesheet history", "/history?u=%d" % u)]  # only people set up to write time have a timesheet (the shared IT account is not)
     if approval_queue(con, u) is not None:
         items.append(("approvals", "Approvals (%d)" % pending_for(con, u), "/approvals?u=%d" % u))
     if perm == "controller" or is_approver(con, u):  # who has not completed a timesheet: everyone for cost controllers, their own people for approvers

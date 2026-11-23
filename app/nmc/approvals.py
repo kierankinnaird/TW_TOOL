@@ -236,7 +236,7 @@ def view_missing(con, u, q):
     # everyone who is active at some point in the week (start and end dates)
     people = con.execute(
         "select p.user_id, p.nmc_id, p.name, p.employment_type, r.name as title from app_user p join role r on r.role_id=p.role_id "
-        "where p.permission<>'admin' and p.books_time=1 and p.start_date<=? and (p.end_date is null or p.end_date>=?)" + scope_sql + " order by p.name", [d6, d0] + scope_args).fetchall()
+        "where p.books_time=1 and p.start_date<=? and (p.end_date is null or p.end_date>=?)" + scope_sql + " order by p.name", [d6, d0] + scope_args).fetchall()
     week = {r["user_id"]: r for r in con.execute(
         "select user_id, count(*) filter (where status<>'Draft') as n_sub, count(*) filter (where status='Draft') as n_draft, "
         "sum(case when status<>'Draft' then hours else 0 end) as h_sub, sum(case when status='Draft' then hours else 0 end) as h_draft, "

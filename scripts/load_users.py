@@ -25,6 +25,7 @@ from nmc.core import audit_user_added, audit_user_changes, person_row  # noqa: E
 
 CONTROLLERS = ("Abbi Murray", "Emma Noble", "Stephanie Apedaile", "Amanda Hogg")   # cost controllers (the cost team, the commercial lead, the business lead)
 ADMINS = ("NMC Admin", "Kieran Kinnaird")                                                    # IT: the shared account for now, and a personal one
+SHARED = ("NMC Admin",)                                                                      # the shared account writes no time; a person's own admin account does
 ALSO = ("Graeme Hogg", "NMC Admin", "Daniel Evans", "Peter McConnachie", "Arran Bastable", "Craig Matthew")   # real people whose address is not firstname.lastname
 YEAR_START = "2026-01-01"
 
@@ -66,13 +67,14 @@ def read_accounts(path):
 
 
 def set_permissions(con, out):
-    """Cost controllers and the IT admins, by name. An admin books no time. Each change is recorded, by the system."""
+    """Cost controllers and the IT admins, by name. The shared IT account books no time; a person's own admin account still does. Each change is recorded, by the system."""
     for names, permission in ((CONTROLLERS, "controller"), (ADMINS, "admin")):
         for name in names:
             found = con.execute("select user_id from app_user where name=?", (name,)).fetchone()
             row = person_row(con, found[0]) if found else None
-            if row and (row["permission"] != permission or (permission == "admin" and row["books_time"])):
-                con.execute("update app_user set permission=?, books_time=case when ?='admin' then 0 else books_time end where user_id=?", (permission, permission, row["user_id"]))
+            no_time = name in SHARED and row is not None and row["books_time"]
+            if row and (row["permission"] != permission or no_time):
+                con.execute("update app_user set permission=?, books_time=? where user_id=?", (permission, 0 if name in SHARED else row["books_time"], row["user_id"]))
                 audit_user_changes(con, None, row["user_id"], row)
                 out.setdefault("permissions", []).append("%s: %s" % (name, permission))
 

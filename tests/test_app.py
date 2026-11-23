@@ -1795,6 +1795,65 @@ class TestApp(unittest.TestCase):
         self.admin_post("/admin/save", dict(save, email="link.me2@nmcenergy.com"))
         self.assertIsNone(self.one("select entra_object_id from app_user where user_id=?", uid)[0])
 
+    def test_the_cmap_user_grid_sets_the_people_their_ids_types_dates_managers_and_roles(self):
+        import load_cmap
+        con = build()
+        # everyone the seed has stays in the grid (as a Project Engineer under Kenneth Nicolson) except the three people CMAP does not list and the shared account
+        left_out = ("Gary Martin", "Janis Watt", "Lloyd Quinn", "NMC Admin", "Ewan Shaw", "Kenneth Nicolson")
+        rest = "".join("%s,%s,Project Engineer,Project Management,Employee,1-Jan-26,,40,Kenneth Nicolson,Active,S9%02d\n" % (n.split(" ", 1)[0], n.split(" ", 1)[1], i)
+                       for i, (n,) in enumerate(con.execute("select name from app_user order by user_id").fetchall()) if n not in left_out)
+        grid = ("First Name,Last Name,Default Role,Team,Employment Status,Start Date,End Date,Working Hours Per Week,Line Manager,Profile Status,NMC User ID\n"
+                + rest +
+                "Kenneth,Nicolson,Project Manager,Project Management,Employee,2-Jun-25,,40,Graeme Hogg,Active,S009\n"
+                "Ewan,Shaw,Planning Lead Engineer,Project Services,Contractor,6-Apr-26,,40,Kenneth Nicolson,Active,C071\n"       # in the seed (user 5)
+                "Alastair,McNair,Process Senior Engineer,Engineering,Employee,5-Jan-26,,40,Kenneth Nicolson,Active,S013\n"       # new, found in Microsoft as Ally McNair
+                "Sam,Offshore,Offshore Rep,Project Management,Contractor,2-Nov-26,30-Apr-27,40,Kenneth Nicolson,Active,c121 PAYE\n"
+                "Barry,Dup,Site Rep,Project Management,Contractor,1-Mar-26,,40,Kenneth Nicolson,Invite Expired,C121\n"
+                "Mystery,Role,Wrangler,Project Management,Contractor,1-Mar-26,,40,Nobody Known,Active,C130\n"
+                "Total Users,,0,,,,,,,,\n")
+        tenant = ("Display name,User principal name,Object Id,First name,Last name,Block credential,Licenses\n"
+                  "Ally McNair,ally.mcnair@nmcenergy.com,59ee74cc-ed26-4c52-8e04-682b31a942db,Alastair,McNair,False,Microsoft 365 Business Standard\n"
+                  "Ewan Shaw,ewan.shaw@nmcenergy.com,381140bd-2a72-41de-991e-4d5d984a98ca,Ewan,Shaw,False,Microsoft 365 Business Standard\n"
+                  "Old Account.,sam.offshore@nmcenergy.com,11111111-2222-3333-4444-555555555555,Sam,Offshore,True,Unlicensed\n")   # blocked: not used
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            g, t = os.path.join(d, "grid.csv"), os.path.join(d, "tenant.csv")
+            for path, text in ((g, grid), (t, tenant)):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+            try:
+                out = load_cmap.load_cmap(con, g, t)
+                self.assertEqual((out["people"], len(out["added"])), (len(rest.splitlines()) + 6, 4))
+                self.assertIn("Ewan Shaw", out["updated"])
+                self.assertEqual(len(out["updated"]), len(rest.splitlines()) + 2)                          # every seed person who is in the grid
+                row = lambda name: con.execute("select nmc_id, employment_type, start_date, end_date, email, books_time from app_user where name=?", (name,)).fetchone()
+                self.assertEqual(tuple(row("Ewan Shaw")), ("C071", "Contract", "2026-04-06", None, "ewan.shaw@nmcenergy.com", 1))   # the seed person, updated in place
+                self.assertEqual(con.execute("select user_id from app_user where name='Ewan Shaw'").fetchone()[0], 5)           # same person, so their hours stay
+                self.assertEqual(row("Alastair McNair")[4], "ally.mcnair@nmcenergy.com")                  # matched on first and last name
+                self.assertEqual(tuple(row("Sam Offshore"))[:4], ("C121", "Contract", "2026-11-02", "2027-04-30"))    # " PAYE" and lower case tidied
+                self.assertIsNone(row("Sam Offshore")[4])                                                 # a blocked account is never linked
+                self.assertEqual(row("Barry Dup")[0], "C121-2")                                           # a repeated id: the Active person keeps it
+                self.assertIn("Barry Dup", out["duplicate_ids"])
+                self.assertEqual(con.execute("select r.skill_code from app_user u join role r using(role_id) where u.name='Sam Offshore'").fetchone()[0], "OP-02")
+                self.assertEqual(con.execute("select count(*) from rate where role_id=(select role_id from role where skill_code='OP-02')").fetchone()[0], 0)   # no rates: internal time only
+                self.assertEqual(con.execute("select r.skill_code from app_user u join role r using(role_id) where u.name='Ewan Shaw'").fetchone()[0], "PM-04")
+                self.assertIn("Ewan Shaw: Planning Lead Engineer -> PM-04", out["loose"])                  # the nearest match is listed to check
+                self.assertEqual(out["unmapped"], ["Mystery Role: Wrangler"])
+                self.assertEqual(con.execute("select m.name from app_user u join app_user m on m.user_id=u.line_manager_id where u.name='Ewan Shaw'").fetchone()[0], "Kenneth Nicolson")
+                self.assertIn("Sam Offshore", out["no_account"])
+                self.assertNotIn("Ewan Shaw", out["no_account"])
+                self.assertGreater(con.execute("select count(*) from user_audit where changed_by is null").fetchone()[0], 5)    # recorded, by the system
+                self.assertEqual(sorted(out["removed"]), ["Gary Martin", "Janis Watt", "Lloyd Quinn"])    # seed people who are not in CMAP are left out ...
+                names = {r[0] for r in con.execute("select name from app_user")}
+                self.assertIn("NMC Admin", names)                                                         # ... apart from the shared IT account
+                self.assertFalse(names & {"Gary Martin", "Janis Watt", "Lloyd Quinn"})
+                self.assertEqual(con.execute("select count(*) from time_entry where user_id in (12, 18, 19)").fetchone()[0], 0)    # and so are their hours
+                self.assertEqual(con.execute("select count(*) from time_entry_audit a where not exists (select 1 from time_entry t where t.entry_id = a.entry_id)").fetchone()[0], 0)
+                self.assertEqual(con.execute("select count(*) from pg_trigger where tgname like 'trg_%' and tgenabled <> 'O'").fetchone()[0], 0)   # the rules are back on
+                self.assertEqual(load_cmap.load_cmap(con, g, t)["added"], [])                              # running it again adds nobody
+            finally:
+                con.close()
+
     def test_the_user_import_links_real_people_by_name_and_leaves_the_rest(self):
         import csv
         import import_users
@@ -1966,7 +2025,7 @@ class TestApp(unittest.TestCase):
             out = {}
             load_users.set_permissions(con, out)
             self.assertEqual(sorted(out["permissions"]), ["Amanda Hogg: controller", "Kieran Kinnaird: admin"])
-            self.assertEqual(con.execute("select permission, books_time from app_user where name='Kieran Kinnaird'").fetchone(), ("admin", 0))   # an admin writes no time
+            self.assertEqual(con.execute("select permission, books_time from app_user where name='Kieran Kinnaird'").fetchone(), ("admin", 1))   # a person's own admin account still writes time
             self.assertEqual(con.execute("select permission, books_time from app_user where name='Amanda Hogg'").fetchone(), ("controller", 1))
             self.assertEqual(con.execute("select count(*) from user_audit where changed_by is null and field='Permission'").fetchone()[0], 2)   # recorded, by the system
             out = {}
@@ -2111,6 +2170,19 @@ class TestApp(unittest.TestCase):
     def test_the_it_admin_account_is_not_expected_to_submit_a_timesheet(self):
         page = self.get("/missing?u=29&w=2026-11-02&s=all")
         self.assertNotIn(">NMC Admin</td>", page)
+
+    def test_an_admin_who_writes_time_has_a_timesheet_and_the_shared_it_account_does_not(self):
+        self.assertIn("not set up to write time", self.get("/timesheet?u=30&w=2026-11-02"))           # the seeded shared account (30) writes none
+        con = app.db()
+        con.execute("update app_user set books_time=1 where user_id=?", (self.IT_ADMIN,))             # but an admin account set to write time does
+        con.commit()
+        con.close()
+        page = self.get("/timesheet?u=%s&w=2026-11-02" % self.IT_ADMIN)
+        self.assertNotIn("does not write time", page)
+        self.assertIn('href="/admin?u=%s' % self.IT_ADMIN, page)                                       # still an admin
+        self.assertIn("/timesheet?u=%s" % self.IT_ADMIN, page.split("<main>")[0])                      # with My Timesheet in the menu
+        self.assertIn("Timesheet history", page)
+        self.assertIn(">%s<" % self.one("select name from app_user where user_id=?", self.IT_ADMIN)[0], self.get("/missing?u=29&w=2026-11-02&s=all"))   # and is chased for it
 
     def test_a_new_client_needs_a_main_approver_chosen_and_the_scope_wording_is_clear(self):
         page = self.get("/admin?u=1&t=clients")

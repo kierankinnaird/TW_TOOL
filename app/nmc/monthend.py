@@ -28,7 +28,7 @@ def month_people(con, first, last):
         "(select count(*) from v_offshore_night n where n.user_id=p.user_id and n.work_date between ? and ?) as nights "
         "from app_user p join role r on r.role_id=p.role_id "
         "left join time_entry t on t.user_id=p.user_id and t.work_date between ? and ? "
-        "where p.permission<>'admin' and p.books_time=1 and p.start_date<=? and (p.end_date is null or p.end_date>=?) "
+        "where p.books_time=1 and p.start_date<=? and (p.end_date is null or p.end_date>=?) "
         "group by p.user_id, r.role_id order by p.name", (first.isoformat(), last.isoformat(), first.isoformat(), last.isoformat(), last.isoformat(), first.isoformat())).fetchall()
     out = []
     for r in rows:

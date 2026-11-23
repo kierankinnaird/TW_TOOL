@@ -20,7 +20,8 @@ app/
 scripts/
   build.py        fills the PostgreSQL database in DATABASE_URL from schema + seed (emptying it first)
   export_schema_tables.py   writes build/schema_tables.csv (columns as a table)
-  import_users.py, load_users.py   link and load people from the Microsoft 365 user export
+  load_cmap.py    loads the people from CMAP's user grid (build.py --cmap grid.csv --users tenant-export.csv): ids, Staff or Contract, dates, line managers, roles; anyone not in the grid is left out
+  import_users.py, load_users.py   link and load people from the Microsoft 365 user export alone
   seed_history.py demo timesheet history (used by build.py --history)
 tests/
   test_schema.py  unittest suite for the rules and views

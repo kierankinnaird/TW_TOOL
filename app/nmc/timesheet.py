@@ -88,9 +88,6 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
     me = me_row(con, u)
     if not me:
         return layout(con, u, "My Timesheet", "<p>Unknown user.</p>")
-    if me["permission"] == "admin":
-        return layout(con, u, "My Timesheet", '<p>The IT admin account is a system account and does not book time. '
-                      'Use <a href="/admin?u=%d">Admin</a> to manage users, job titles and locations.</p>' % u)
     if not me["books_time"]:
         return layout(con, u, "My Timesheet", '<div class="empty"><p><b>You are not set up to write time</b>, so there is no timesheet for you and nobody will chase you for one.</p>'
                       "<p>If that is wrong, ask the cost team to change it on your user record.</p></div>")
@@ -565,7 +562,7 @@ def view_history(con, u, q=None):
     """My past timesheets: a month calendar of the hours booked each day (the default), or a list of weeks. Either way each day or week opens that week's timesheet."""
     q = q or {}
     me = me_row(con, u)
-    if not me or me["permission"] == "admin" or not me["books_time"]:
+    if not me or not me["books_time"]:
         return layout(con, u, "Timesheet history", "<p>This account does not write time, so there is no history.</p>")
     if q.get("view", ["calendar"])[0] != "list":
         return history_calendar(con, u, q)
