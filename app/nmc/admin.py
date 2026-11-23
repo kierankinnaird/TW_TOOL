@@ -7,7 +7,7 @@ from urllib.parse import quote
 from nmc.core import (
     date_input, dmy, edit_link, esc, fmt,
     fmt_time, hidden, layout, msgs_html,
-    need_date, need_text, no_access, opts_approvers,
+    need_date, need_email, need_text, no_access, opts_approvers,
     opts_clients, opts_projects, opts_roles, opts_scopes,
     opts_users, permission_of, sel,
     stamp, table, txt)
@@ -80,21 +80,21 @@ def admin_body(con, u, t, q=None):
                  '<input type="submit" value="Open week"></form>' % (hidden(u=u, action="open"), date_input("week_start")))
     elif t == "users":
         needle = ((q or {}).get("f_q", [""])[0]).strip()
-        b.append('<form method="get" action="/admin">%s<p>Find a person (name or NMC ID) <input type="text" name="f_q" size="20" value="%s"> '
+        b.append('<form method="get" action="/admin">%s<p>Find a person (name, email or NMC ID) <input type="text" name="f_q" size="20" value="%s"> '
                  '<input type="submit" value="Search"> <input type="button" value="Clear" onclick="location.href=\'/admin?u=%d&amp;t=users\'"></p></form>' % (
                      hidden(u=u, t="users"), esc(needle), u))
-        rows = [[r["nmc_id"], r["name"], r["employment_type"], r["skill_code"] + " " + r["role"], r["manager"] or "", r["permission"], dmy(r["start_date"]),
+        rows = [[r["nmc_id"], r["name"], r["email"] or "", r["employment_type"], r["skill_code"] + " " + r["role"], r["manager"] or "", r["permission"], dmy(r["start_date"]),
                  dmy(r["end_date"]), edit_link(u, "users", r["user_id"])]
                 for r in con.execute("select u.*, r.skill_code, r.name as role, m.name as manager from app_user u join role r on r.role_id=u.role_id "
                                      "left join app_user m on m.user_id=u.line_manager_id "
-                                     "where (? = '' or u.name like '%' || ? || '%' or u.nmc_id like '%' || ? || '%') order by u.nmc_id", (needle, needle, needle))]
-        b.append(table(["NMC ID", "Name", "Employment", "Role", "Line manager", "Permission", "Start", "End", ""], rows, raw_cols=(8,)))
+                                     "where (? = '' or u.name like '%' || ? || '%' or u.nmc_id like '%' || ? || '%' or u.email like '%' || ? || '%') order by u.nmc_id", (needle, needle, needle, needle))]
+        b.append(table(["NMC ID", "Name", "Email", "Employment", "Role", "Line manager", "Permission", "Start", "End", ""], rows, raw_cols=(9,)))
         b.append('<h4>Add a user</h4><form method="post" action="/admin/add">%s<table border="0" cellpadding="2">'
-                 "<tr><td>NMC ID</td><td>%s</td></tr><tr><td>Name</td><td>%s</td></tr>"
+                 "<tr><td>NMC ID</td><td>%s</td></tr><tr><td>Name</td><td>%s</td></tr><tr><td>Work email (the Microsoft account they sign in with)</td><td>%s</td></tr>"
                  "<tr><td>Employment</td><td>%s</td></tr><tr><td>Role</td><td>%s</td></tr><tr><td>Line manager</td><td>%s</td></tr>"
                  "<tr><td>Permission</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr>"
                  "<tr><td>End date (optional)</td><td>%s</td></tr></table><input type=\"submit\" value=\"Add user\"></form>"
-                 % (hidden(u=u, t="users"), txt("nmc_id", "", 8), txt("name", "", 30),
+                 % (hidden(u=u, t="users"), txt("nmc_id", "", 8), txt("name", "", 30), txt("email", "", 34),
                     sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")]), sel("role_id", opts_roles(con)),
                     sel("line_manager_id", opts_users(con), None, True, "None"),
                     sel("permission", PERMISSION_OPTIONS), date_input("start_date", datetime.date.today().isoformat()),
@@ -272,10 +272,13 @@ def view_admin_edit(con, u, t, i, msgs=None):
         r = con.execute("select * from app_user where user_id=?", (i,)).fetchone()
         if not r:
             return layout(con, u, "Admin", "<p>Not found.</p>")
-        form = ("<tr><td>NMC ID</td><td>%s</td></tr><tr><td>Name</td><td>%s</td></tr><tr><td>Employment</td><td>%s</td></tr>"
+        form = ("<tr><td>NMC ID</td><td>%s</td></tr><tr><td>Name</td><td>%s</td></tr><tr><td>Work email</td><td>%s</td></tr>"
+                "<tr><td>Microsoft account</td><td>%s</td></tr><tr><td>Last signed in</td><td>%s</td></tr><tr><td>Employment</td><td>%s</td></tr>"
                 "<tr><td>Role</td><td>%s</td></tr><tr><td>Line manager</td><td>%s</td></tr><tr><td>Permission</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr>"
                 "<tr><td>End date</td><td>%s</td></tr>" % (
-                    esc(r["nmc_id"]), txt("name", r["name"], 30), sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")], r["employment_type"]),
+                    esc(r["nmc_id"]), txt("name", r["name"], 30), txt("email", r["email"] or "", 34),
+                    "Linked" if r["entra_object_id"] else "Not linked yet (linked on first sign-in, or by the user import)", esc(dmy(r["last_login_at"]) or "Never"),
+                    sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")], r["employment_type"]),
                     sel("role_id", opts_roles(con, active_only=False), r["role_id"]),
                     sel("line_manager_id", [x for x in opts_users(con) if x[0] != i], r["line_manager_id"], True, "None"),
                     sel("permission", PERMISSION_OPTIONS, r["permission"]), esc(dmy(r["start_date"])), date_input("end_date", r["end_date"] or "")))
@@ -374,10 +377,10 @@ def admin_add(con, form):
     g = lambda k: form.get(k, [""])[0].strip()
     try:
         if t == "users":
-            con.execute("insert into app_user (nmc_id, employment_type, name, role_id, permission, start_date, end_date, line_manager_id) values (?,?,?,?,?,?,?,?)",
+            con.execute("insert into app_user (nmc_id, employment_type, name, role_id, permission, start_date, end_date, line_manager_id, email) values (?,?,?,?,?,?,?,?,?)",
                         (need_text(g("nmc_id"), "NMC ID"), g("employment_type"), need_text(g("name"), "Name"), int(g("role_id")),
                          g("permission"), need_date(g("start_date"), "Start date"), need_date(g("end_date"), "End date", False),
-                         int(g("line_manager_id")) if g("line_manager_id") else None))
+                         int(g("line_manager_id")) if g("line_manager_id") else None, need_email(g("email"))))
             msg = "User added."
         elif t == "roles":
             con.execute("insert into role (skill_code, name, family) values (?,?,?)",
@@ -456,9 +459,11 @@ def admin_save(con, form):
             manager = int(g("line_manager_id")) if g("line_manager_id") else None
             if manager == i:
                 raise ValueError("A person cannot be their own line manager.")
-            con.execute("update app_user set name=?, employment_type=?, role_id=?, permission=?, end_date=?, line_manager_id=? where user_id=?",
+            email = need_email(g("email"))
+            con.execute("update app_user set name=?, employment_type=?, role_id=?, permission=?, end_date=?, line_manager_id=?, email=?, "
+                        "entra_object_id=case when email is not ? then null else entra_object_id end where user_id=?",
                         (need_text(g("name"), "Name"), g("employment_type"), int(g("role_id")), g("permission"),
-                         need_date(g("end_date"), "End date", False), manager, i))
+                         need_date(g("end_date"), "End date", False), manager, email, email, i))
         elif t == "roles" and g("old_family"):
             if not g("new_family"):
                 return view_admin(con, u, t, ["Give the family a name."], q={"f_family": [g("old_family")]})

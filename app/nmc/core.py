@@ -12,7 +12,7 @@ DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
 
 
 # Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
-REQUIRED_SCHEMA = 22
+REQUIRED_SCHEMA = 23
 
 
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
@@ -117,6 +117,11 @@ def is_approver(con, u):
     """Approver is not a permission: it means being a client's main approver or a secondary approver on at least one scope."""
     return con.execute("select 1 from client where approver_user_id=? union all select 1 from scope_approver where user_id=? limit 1",
                        (u, u)).fetchone() is not None
+
+
+def can_see_reports(con, u):
+    """Reports are for cost controllers and for approvers (their own scopes, hours only). A standard user has the timesheet and its history."""
+    return permission_of(con, u) == "controller" or is_approver(con, u)
 
 
 def approval_queue(con, u):
@@ -263,6 +268,25 @@ input[type=submit]:hover{background:var(--orange);border-color:var(--orange)}
 input[type=button]{background:transparent;color:var(--black);border:1px solid rgba(30,30,36,.3)}
 input[type=button]:hover{border-color:var(--black);color:var(--orange)}
 input[type=checkbox]{accent-color:var(--orange);width:1rem;height:1rem}
+table.cal{width:100%;border-collapse:collapse;table-layout:fixed;margin:.4rem 0}
+table.cal th{background:var(--black);color:var(--white);font-weight:450;text-align:left;padding:.4rem .6rem;font-size:.8rem}
+table.cal td{height:4.6rem;padding:0;border:1px solid var(--line);vertical-align:top;background:var(--white)}
+table.cal td a{display:block;height:100%;padding:.3rem .5rem;text-decoration:none;color:var(--black)}
+table.cal td a:hover{background:var(--tint)}
+table.cal td i{font-style:normal;font-size:.72rem;color:var(--grey-mid);display:block}
+table.cal td b{font-size:1.15rem;font-weight:500}
+table.cal td span{font-size:.7rem;color:var(--grey-dark)}
+table.cal td.we{background:#f6f6f7}
+table.cal td.out{opacity:.45}
+table.cal td.today{outline:2px solid var(--orange);outline-offset:-2px}
+table.cal td.ok,.legend span.ok{background:#e8f3e8}
+table.cal td.sub,.legend span.sub{background:var(--tint)}
+table.cal td.draft,.legend span.draft{background:repeating-linear-gradient(135deg,#fff,#fff 5px,#ececee 5px,#ececee 8px)}
+table.cal td.back,.legend span.back{background:#fdecea}
+table.cal td.wt{background:var(--bg);font-size:.8rem;text-align:center;padding:.3rem;color:var(--grey-dark)}
+table.cal td.wt a{display:inline;padding:0;text-decoration:underline}
+.legend{display:flex;flex-wrap:wrap;gap:.5rem;font-size:.8rem}
+.legend span{padding:.15rem .6rem;border:1px solid var(--line)}
 .msg{margin:0 0 1rem;padding:.7rem 1rem;background:var(--bg);border-left:4px solid var(--black)}
 .msg.bad{border-left-color:var(--orange);background:var(--tint)}
 .msg p{margin:0 0 .3rem}
@@ -272,7 +296,7 @@ input[type=checkbox]{accent-color:var(--orange);width:1rem;height:1rem}
 """
 
 
-NAV_KEY = {"My": "timesheet", "Approvals": "approvals", "Missing": "missing", "Reopen": "reopen", "Reports": "reports", "CTR": "reports",
+NAV_KEY = {"My": "timesheet", "Timesheet": "history", "Approvals": "approvals", "Missing": "missing", "Reopen": "reopen", "Reports": "reports", "CTR": "reports",
            "Admin": "admin", "Edit": "admin", "Audit": "audit", "Dashboard": "dashboard"}
 
 
@@ -323,7 +347,8 @@ def layout(con, u, title, body):
     n_back, n_open = con.execute("select sum(reject_reason is not null), sum(reopen_reason is not null) from time_entry "
                                  "where user_id=? and status='Draft'", (u,)).fetchone()
     note = ", ".join(x for x in ("%d sent back" % n_back if n_back else "", "%d reopened" % n_open if n_open else "") if x)
-    items = [] if perm == "admin" else [("timesheet", "My Timesheet%s" % (" (%s)" % note if note else ""), "/timesheet?u=%d" % u)]  # the IT admin's account books no time
+    items = [] if perm == "admin" else [("timesheet", "My Timesheet%s" % (" (%s)" % note if note else ""), "/timesheet?u=%d" % u),
+                                        ("history", "Timesheet history", "/history?u=%d" % u)]  # the IT admin's account books no time
     if approval_queue(con, u) is not None:
         items.append(("approvals", "Approvals (%d)" % pending_for(con, u), "/approvals?u=%d" % u))
     if perm == "controller" or is_approver(con, u):  # who has not completed a timesheet: everyone for cost controllers, their own people for approvers
@@ -332,7 +357,7 @@ def layout(con, u, title, body):
         items.append(("reopen", "Reopen timesheet", "/reopen?u=%d" % u))
     if perm == "controller":  # budget against actual hours, charts
         items.append(("dashboard", "Dashboard", "/dashboard?u=%d" % u))
-    if perm != "admin":  # Admin (IT) manages users and job roles only: no reports
+    if can_see_reports(con, u):  # cost controllers and approvers; standard users have the timesheet and its history, the IT admin neither
         items.append(("reports", "Reports", "/reports?u=%d" % u))
     if perm in ("controller", "admin"):
         items += [("admin", "Admin", "/admin?u=%d" % u), ("audit", "Audit trail", "/audit?u=%d" % u)]
@@ -471,6 +496,16 @@ def need_text(value, label):
     value = (value or "").strip()
     if not value:
         raise ValueError("%s is required." % label)
+    return value
+
+
+def need_email(value):
+    """A work email, lower case, or None when left empty (the person cannot sign in with Microsoft until it is set)."""
+    value = (value or "").strip().lower()
+    if not value:
+        return None
+    if " " in value or value.count("@") != 1 or value.startswith("@") or value.endswith("@") or "." not in value.split("@")[1]:
+        raise ValueError("%s is not a valid email address." % value)
     return value
 
 

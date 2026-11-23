@@ -1,8 +1,9 @@
 """Reports: the CTR page and tree, period reports, timesheet grid, manhour report and the Excel downloads."""
 import datetime
 import io
+import os
 from urllib.parse import quote, urlencode
-from nmc.core import date_input, dmy, esc, fmt, hidden, layout, monday, no_access, permission_of, sel, sub_row
+from nmc.core import ROOT, can_see_reports, date_input, dmy, esc, fmt, hidden, layout, monday, no_access, permission_of, sel, sub_row
 from nmc.monthend import monthend_body
 
 
@@ -309,7 +310,7 @@ def report_sheet(con, u, q, key):
 
 
 def view_reports(con, u, q):
-    if permission_of(con, u) == "admin":  # Admin (IT) has no reports
+    if not can_see_reports(con, u):  # reports are for cost controllers and approvers
         return no_access(con, u, "Reports")
     rv = report_view(con, u)
     money = rv["money"]
@@ -455,6 +456,8 @@ def view_reports(con, u, q):
             b.append("<p>No budgets loaded and no client hours yet.</p>")
 
     if permission_of(con, u) == "controller":
+        b.append(sect("aaa", "AAA Consulting"))
+        b.append(aaa_panel(u, q))
         b.append(sect("month", "Month end"))
         b.append(monthend_body(con, u, q, "/reports", "month"))
     return layout(con, u, "Reports", report_menu(con, u, b, q.get("r", [""])[0]))
@@ -469,11 +472,12 @@ def xl(u, key, q=""):
     return '<p class="xl"><a href="/reports/export.xlsx?u=%d&amp;k=%s%s">Download this report as Excel</a></p>' % (u, key, q)
 
 
-REPORT_GROUPS = [("Billing", ("ctr", "period", "budget")), ("Hours", ("internal", "loc")), ("People and payroll", ("allow", "month"))]
+REPORT_GROUPS = [("Billing", ("ctr", "period", "budget", "aaa")), ("Hours", ("internal", "loc")), ("People and payroll", ("allow", "month"))]
 REPORT_HELP = {
     "ctr": "Approved and pending hours and value for every client, project, scope and CTR, down to each person's entries",
     "period": "Approved hours and value week by week, filtered by client, project, scope or CTR",
     "budget": "Hours against the P6 budget for each CTR",
+    "aaa": "Hours between two dates for AAA Consulting: contractors, staff or both, as an Excel file",
     "internal": "Hours booked to internal codes (paid by NMC, not billed to a client)",
     "loc": "Approved hours by where they were worked, normal and overtime",
     "allow": "Offshore nights per person and what they are worth",
@@ -757,7 +761,7 @@ def manhour_sheet(data):
 
 def view_grid(con, u, q):
     """Hours by person, code and day (or week, or total) with ready-made layouts that can be tailored, and an Excel download."""
-    if permission_of(con, u) == "admin":  # Admin (IT) has no reports
+    if not can_see_reports(con, u):  # reports are for cost controllers and approvers
         return no_access(con, u, "Reports")
     g = grid_data(con, u, q, report_view(con, u))
     auto = ' onchange="this.form.submit()"'
@@ -820,9 +824,14 @@ def col_letter(i):
     return out
 
 
-def xlsx_bytes(sheet_name, rows, bold_rows=(1,)):
+LOGO_FILE = os.path.join(ROOT, "app", "static", "nmc-logo-black.png")  # the black logo: spreadsheets are white, the page header is black
+BANNER_ROWS = 4  # logo, title, subtitle, a blank row: the table starts on the row after these
+
+
+def xlsx_bytes(sheet_name, rows, bold_rows=(1,), title=None, subtitle=""):
     """A one-sheet Excel file (.xlsx) from rows of text and numbers, built with the standard library only. Rows in bold_rows (counting from 1)
-    are bold. Text is stored as text, so nothing typed into the system can be read as a formula."""
+    are bold, and the first row is the table's header, in the NMC orange. Every file opens with the NMC logo, the report's title and when it was
+    produced; the table follows from row 5. Text is stored as text, so nothing typed into the system can be read as a formula."""
     import io
     import zipfile
     from xml.sax.saxutils import escape
@@ -830,13 +839,23 @@ def xlsx_bytes(sheet_name, rows, bold_rows=(1,)):
     def clean(v):
         return escape("".join(ch for ch in str(v) if ch in "\t\n\r" or ord(ch) >= 32))
 
+    try:
+        with open(LOGO_FILE, "rb") as f:
+            logo = f.read()
+    except OSError:
+        logo = None
+    made = "Produced %s" % datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
     lines, widths = [], []
+    lines.append('<row r="1" ht="36" customHeight="1"/>')
+    lines.append('<row r="2" ht="22" customHeight="1"><c r="A2" s="3" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c></row>' % clean(title or sheet_name))
+    lines.append('<row r="3"><c r="A3" s="4" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c></row>' % clean(" | ".join(x for x in (subtitle, made) if x)))
     for ri, row in enumerate(rows, 1):
         cells = []
+        ri_out = ri + BANNER_ROWS
         for ci, v in enumerate(row):
             if v is None or v == "":
                 continue
-            ref, style = "%s%d" % (col_letter(ci), ri), ' s="1"' if ri in bold_rows else ""
+            ref, style = "%s%d" % (col_letter(ci), ri_out), (' s="2"' if ri == 1 else ' s="1"' if ri in bold_rows else "")
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 cells.append('<c r="%s"%s><v>%s</v></c>' % (ref, style, repr(round(float(v), 6))))
                 text = fmt(v)
@@ -846,19 +865,23 @@ def xlsx_bytes(sheet_name, rows, bold_rows=(1,)):
             while len(widths) <= ci:
                 widths.append(8)
             widths[ci] = max(widths[ci], min(len(text) + 2, 50))
-        lines.append('<row r="%d">%s</row>' % (ri, "".join(cells)))
+        lines.append('<row r="%d">%s</row>' % (ri_out, "".join(cells)))
     name = "".join(ch for ch in sheet_name if ch not in "[]:*?/\\")[:31] or "Report"
     sheet = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-             '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
-             '<cols>%s</cols><sheetData>%s</sheetData></worksheet>' % (
-                 "".join('<col min="%d" max="%d" width="%d" customWidth="1"/>' % (i + 1, i + 1, w) for i, w in enumerate(widths)), "".join(lines)))
+             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+             '<sheetViews><sheetView workbookViewId="0" showGridLines="0"><pane ySplit="%d" topLeftCell="A%d" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+             '<cols>%s</cols><sheetData>%s</sheetData>%s</worksheet>' % (
+                 BANNER_ROWS + 1, BANNER_ROWS + 2,
+                 "".join('<col min="%d" max="%d" width="%d" customWidth="1"/>' % (i + 1, i + 1, w) for i, w in enumerate(widths)), "".join(lines),
+                 '<drawing r:id="rId1"/>' if logo else ""))
     parts = {
         "[Content_Types].xml": '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
         '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>'
+        '<Default Extension="png" ContentType="image/png"/>'
         '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
         '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>',
+        + ('<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>' if logo else "")
+        + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>',
         "_rels/.rels": '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
         '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
         "xl/workbook.xml": '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
@@ -867,18 +890,120 @@ def xlsx_bytes(sheet_name, rows, bold_rows=(1,)):
         '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
         '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>',
         "xl/styles.xml": '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
-        '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>'
+        '<fonts count="5"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font><font><b/><sz val="16"/><name val="Calibri"/></font>'
+        '<font><sz val="10"/><color rgb="FF4B4B50"/><name val="Calibri"/></font></fonts>'
+        '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFFE6700"/><bgColor indexed="64"/></patternFill></fill></fills>'
         '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
         '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
+        '<cellXfs count="5"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="2" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
+        '<xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="4" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
         '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>',
         "xl/worksheets/sheet1.xml": sheet}
+    if logo:
+        w, h = 92 * 9525, 40 * 9525  # the logo is 92 x 40 pixels
+        parts["xl/worksheets/_rels/sheet1.xml.rels"] = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>')
+        parts["xl/drawings/_rels/drawing1.xml.rels"] = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/nmc-logo.png"/></Relationships>')
+        parts["xl/drawings/drawing1.xml"] = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<xdr:oneCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>38100</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>38100</xdr:rowOff></xdr:from>'
+            '<xdr:ext cx="%d" cy="%d"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="NMC Energy logo" descr="NMC Energy"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>'
+            '<xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+            '<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="%d" cy="%d"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic>'
+            '<xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>' % (w, h, w, h))
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for part, text in parts.items():
             z.writestr(part, text.encode("utf-8"))
+        if logo:
+            z.writestr("xl/media/nmc-logo.png", logo)
     return buf.getvalue()
+
+
+AAA_WHO = (("contract", "Contractors"), ("staff", "Staff"), ("all", "Staff and contractors"))
+
+
+def aaa_parse(q):
+    """(from, to, who) of the AAA Consulting export from the query: ISO dates, and contract / staff / all. Bad or missing values fall back to last month, contractors."""
+    def day(k):
+        try:
+            return datetime.date.fromisoformat(q.get(k, [""])[0])
+        except ValueError:
+            return None
+    first, last = day("from"), day("to")
+    if not first or not last:
+        last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
+        first = last.replace(day=1)
+    if last < first:
+        first, last = last, first
+    who = q.get("who", ["contract"])[0]
+    return first, last, who if who in dict(AAA_WHO) else "contract"
+
+
+AAA_LAYOUTS = (("days", "Days across the page (a timesheet)"), ("lines", "One line per entry"))
+AAA_MAX_DAYS = 62  # the days-across layout has a column for every day, so it is for a month or two, not a year
+
+
+def aaa_layout(q):
+    got = q.get("layout", ["days"])[0]
+    return got if got in dict(AAA_LAYOUTS) else "days"
+
+
+def aaa_sheet(con, q):
+    """Everyone's submitted and approved hours between two dates for AAA Consulting: staff, contractors or both. Hours only, no rates or values."""
+    first, last, who = aaa_parse(q)
+    typ = {"contract": " and p.employment_type='Contract'", "staff": " and p.employment_type='Staff'", "all": ""}[who]
+    ents = con.execute(
+        "select p.nmc_id, p.name, p.employment_type, ro.skill_code, ro.name as role, c.name as client, s.scope_code, "
+        "(s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as ctr, t.work_date, t.hours, lo.name as location, t.overtime, t.status "
+        "from time_entry t join app_user p on p.user_id=t.user_id join phase ph on ph.phase_id=t.phase_id join scope s on s.scope_id=ph.scope_id "
+        "join client c on c.client_id=s.client_id join role ro on ro.role_id=t.worked_role_id join location lo on lo.location_id=t.location_id "
+        "where t.status<>'Draft' and t.work_date between ? and ?" + typ + " order by p.name, t.work_date, ctr",
+        (first.isoformat(), last.isoformat())).fetchall()
+    sub = "%s | %s to %s" % (dict(AAA_WHO)[who], dmy(first.isoformat()), dmy(last.isoformat()))
+    layout = aaa_layout(q)
+    ndays = (last - first).days + 1
+    if layout == "days" and ndays > AAA_MAX_DAYS:
+        layout, sub = "lines", sub + " | more than %d days, so one line per entry" % AAA_MAX_DAYS
+    if layout == "days":
+        days = [first + datetime.timedelta(days=i) for i in range(ndays)]
+        who_rows, per = {}, {}
+        for e in ents:
+            key = (e["nmc_id"], e["name"], "Contractor" if e["employment_type"] == "Contract" else "Staff", e["skill_code"], e["client"], e["ctr"])
+            who_rows[key] = who_rows.get(key, 0) + e["hours"]
+            per.setdefault(key, {})
+            per[key][e["work_date"]] = per[key].get(e["work_date"], 0) + e["hours"]
+        rows = [["NMC ID", "Name", "Type", "Skill code", "Client", "CTR"] + [d.strftime("%a %d/%m") for d in days] + ["Total"]]
+        for key in sorted(per, key=lambda k: (k[1], k[5], k[3])):
+            rows.append(list(key) + [per[key].get(d.isoformat()) for d in days] + [who_rows[key]])
+        if per:
+            rows.append(["Total"] + [None] * 5 + [sum(p.get(d.isoformat(), 0) for p in per.values()) or None for d in days] + [sum(who_rows.values())])
+        return rows, "AAA Consulting", "AAA Consulting: hours booked each day", sub
+    rows = [["NMC ID", "Name", "Type", "Skill code", "Role", "Client", "Scope", "CTR", "Date", "Hours", "Location", "Overtime", "Status"]]
+    for e in ents:
+        rows.append([e["nmc_id"], e["name"], "Contractor" if e["employment_type"] == "Contract" else "Staff", e["skill_code"], e["role"], e["client"], e["scope_code"],
+                     e["ctr"], dmy(e["work_date"]), e["hours"], e["location"], "Yes" if e["overtime"] else "No", e["status"]])
+    if ents:
+        rows.append(["Total"] + [None] * 8 + [sum(e["hours"] for e in ents)])
+    return rows, "AAA Consulting", "AAA Consulting: hours booked", sub
+
+
+def aaa_panel(u, q):
+    """The AAA Consulting export on the Reports page: two dates, staff / contractors / all, and the button."""
+    first, last, who = aaa_parse(q)
+    return ('<h4>Hours for AAA Consulting</h4><form method="get" action="/reports/aaa.xlsx">%s<p>From %s to %s &nbsp; Include %s &nbsp; Layout %s &nbsp; '
+            '<input type="submit" value="Export to Excel"></p></form>'
+            '<p><small>Days across the page gives each person and CTR one row with the hours booked on each day (up to %d days). One line per entry also shows the role, location, overtime '
+            'and status. Neither has rates or values. Hours still in draft are left out, and hours waiting for approval are included.</small></p>' % (
+                hidden(u=u), date_input("from", first.isoformat()), date_input("to", last.isoformat()), sel("who", AAA_WHO, who), sel("layout", AAA_LAYOUTS, aaa_layout(q)), AAA_MAX_DAYS))
 
 
 def period_sheet(con, u, q, rv):
@@ -928,7 +1053,7 @@ def ctr_sheet(con, u, q):
 def view_ctr(con, u, q):
     """One CTR (a phase): a Summary tab plus one tab per job family, like the tabs in the CTR workbook.
     Sales rates and values are only shown to cost controllers; everyone else sees hours, limited to what they may see."""
-    if permission_of(con, u) == "admin":  # Admin (IT) has no reports
+    if not can_see_reports(con, u):  # reports are for cost controllers and approvers
         return no_access(con, u, "CTR")
     rv = report_view(con, u)
     money = rv["money"]

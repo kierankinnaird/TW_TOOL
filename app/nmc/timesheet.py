@@ -1,7 +1,7 @@
 """The weekly timesheet: showing it, saving hours, booking rules and copying last week. Allowances are not claimed here (payroll sets them by location)."""
 import datetime
 import sqlite3
-from nmc.core import date_input, esc, fmt, layout, locations, me_row, monday, msgs_html, parse_adds, stamp
+from nmc.core import date_input, dmy, esc, fmt, layout, locations, me_row, monday, msgs_html, parse_adds, stamp, table
 
 
 TIMESHEET_JS = """<script>
@@ -551,3 +551,110 @@ def copy_week(con, form):
         msgs.append("%d draft entr%s that w%s in this week %s replaced." % (
             cleared, "y" if cleared == 1 else "ies", "as" if cleared == 1 else "ere", "was" if cleared == 1 else "were"))
     return view_timesheet(con, u, w, msgs, ok=not problems)
+
+
+def history_tabs(u, view, m):
+    return ('<div class="tabs"><a href="/history?u=%d&amp;view=calendar&amp;m=%s"%s>Calendar</a><a href="/history?u=%d&amp;view=list"%s>List of weeks</a></div>' % (
+        u, m, ' class="cur"' if view == "calendar" else "", u, ' class="cur"' if view == "list" else ""))
+
+
+def view_history(con, u, q=None):
+    """My past timesheets: a month calendar of the hours booked each day (the default), or a list of weeks. Either way each day or week opens that week's timesheet."""
+    q = q or {}
+    me = me_row(con, u)
+    if not me or me["permission"] == "admin":
+        return layout(con, u, "Timesheet history", "<p>The IT admin account does not book time.</p>")
+    if q.get("view", ["calendar"])[0] != "list":
+        return history_calendar(con, u, q)
+    weeks = con.execute(
+        "select date(work_date, 'weekday 0', '-6 days') as wk, sum(hours) as total, "
+        "sum(case when status in ('Approved','Edited') then hours else 0 end) as approved, sum(case when status='Submitted' then hours else 0 end) as submitted, "
+        "sum(case when status='Draft' then hours else 0 end) as draft, count(distinct work_date) as days, "
+        "sum(case when status='Draft' and (reject_reason is not null or reopen_reason is not null) then 1 else 0 end) as back "
+        "from time_entry where user_id=? group by wk order by wk desc", (u,)).fetchall()
+    months = con.execute(
+        "select strftime('%Y-%m', work_date) as m, sum(hours) as total, sum(case when status in ('Approved','Edited') then hours else 0 end) as approved, "
+        "count(distinct work_date) as days from time_entry where user_id=? group by m order by m desc", (u,)).fetchall()
+    if not weeks:
+        return layout(con, u, "Timesheet history", '<div class="empty"><p><b>Nothing booked yet.</b></p><p>Your past weeks will be listed here once you have entered hours on '
+                      '<a href="/timesheet?u=%d">My Timesheet</a>.</p></div>' % u)
+    b = ["<h4>By month</h4>",
+         table(["Month", "Days booked", "Hours", "Approved hours"],
+               [[datetime.date.fromisoformat(r["m"] + "-01").strftime("%B %Y"), r["days"], fmt(r["total"]), fmt(r["approved"])] for r in months]),
+         "<h4>By week</h4>"]
+    rows = []
+    for r in weeks:
+        status = ("Sent back or reopened: please check" if r["back"] else "Approved" if r["total"] == r["approved"] else "Part approved" if r["approved"] and r["submitted"] and not r["draft"] else "Waiting for approval" if r["submitted"] and not r["draft"]
+                  else "Not submitted" if r["draft"] and not r["submitted"] and not r["approved"] else "Part submitted")
+        rows.append([dmy(r["wk"]), r["days"], fmt(r["total"]), fmt(r["approved"]), fmt(r["submitted"]), fmt(r["draft"]), status,
+                     '<a href="/timesheet?u=%d&amp;w=%s">Open</a>' % (u, r["wk"])])
+    b.append(table(["Week commencing", "Days booked", "Hours", "Approved", "Submitted", "Draft", "State", ""], rows, raw_cols=(7,)))
+    b.append("<p><small>Open a week to see its lines, or to correct hours that were sent back. Approved weeks can only be changed by the cost team.</small></p>")
+    return layout(con, u, "Timesheet history", "".join(b))
+
+
+def history_calendar(con, u, q):
+    """One month as a Monday-to-Sunday grid: each day shows the hours booked and is coloured by where they stand; each week ends with its total and a link."""
+    today = datetime.date.today()
+    try:
+        first = datetime.date.fromisoformat((q.get("m", [""])[0] or "x") + "-01")
+    except ValueError:
+        first = today.replace(day=1)
+    last = (first.replace(day=28) + datetime.timedelta(days=4)).replace(day=1) - datetime.timedelta(days=1)
+    start = first - datetime.timedelta(days=first.weekday())
+    end = last + datetime.timedelta(days=6 - last.weekday())
+    prev = (first - datetime.timedelta(days=1)).replace(day=1)
+    nxt = last + datetime.timedelta(days=1)
+    m = first.strftime("%Y-%m")
+    ents = con.execute(
+        "select t.work_date, t.hours, t.status, t.overtime, lo.name as location, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as ctr, "
+        "(t.reject_reason is not null or t.reopen_reason is not null) as back "
+        "from time_entry t join scope s on s.scope_id=t.scope_id join phase ph on ph.phase_id=t.phase_id join location lo on lo.location_id=t.location_id "
+        "where t.user_id=? and t.work_date between ? and ? order by t.work_date, ctr", (u, start.isoformat(), end.isoformat())).fetchall()
+    days = {}
+    for e in ents:
+        days.setdefault(e["work_date"], []).append(e)
+    in_month = [e for e in ents if first.isoformat() <= e["work_date"] <= last.isoformat()]
+    total = sum(e["hours"] for e in in_month)
+    approved = sum(e["hours"] for e in in_month if e["status"] in ("Approved", "Edited"))
+    b = [history_tabs(u, "calendar", m),
+         '<div class="mnav"><span><a href="/history?u=%d&amp;m=%s">&lt;&lt; %s</a></span> <span class="cur-month">%s</span> <span><a href="/history?u=%d&amp;m=%s">%s &gt;&gt;</a></span> '
+         '<span><a href="/history?u=%d&amp;m=%s">This month</a></span>'
+         '<form method="get" action="/history"><input type="hidden" name="u" value="%d"> Month <input type="month" name="m" value="%s"> <input type="submit" value="Go"></form></div>' % (
+             u, prev.strftime("%Y-%m"), prev.strftime("%b %Y"), first.strftime("%B %Y"), u, nxt.strftime("%Y-%m"), nxt.strftime("%b %Y"),
+             u, today.strftime("%Y-%m"), u, m),
+         '<p class="stat">%s hours booked in %s, %s of them approved</p>' % (fmt(total), esc(first.strftime("%B")), fmt(approved)),
+         '<table class="cal"><tr>%s<th>Week</th></tr>' % "".join("<th>%s</th>" % d for d in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))]
+    d = start
+    while d <= end:
+        wk = [d + datetime.timedelta(days=i) for i in range(7)]
+        cells, wtotal = [], 0
+        for x in wk:
+            es = days.get(x.isoformat(), [])
+            hours = sum(e["hours"] for e in es)
+            wtotal += hours
+            cls = ["out"] if x.month != first.month else []
+            if x.weekday() >= 5:
+                cls.append("we")
+            if x == today:
+                cls.append("today")
+            tip = ""
+            if es:
+                state = ("back" if any(e["back"] for e in es) else "draft" if any(e["status"] == "Draft" for e in es) else "sub" if any(e["status"] == "Submitted" for e in es) else "ok")
+                cls.append(state)
+                tip = ' title="%s"' % esc("; ".join("%s %sh" % (e["ctr"], fmt(e["hours"])) for e in es))
+                tags = ", ".join(sorted({"offshore" for e in es if e["location"] == "Offshore"} | {"overtime" for e in es if e["overtime"]}))
+                body = '<b>%s</b>%s' % (fmt(hours), ("<br><span>%s</span>" % esc(tags)) if tags else "")
+            else:
+                body = ""
+            cells.append('<td class="%s"%s><a href="/timesheet?u=%d&amp;w=%s"><i>%d</i>%s</a></td>' % (" ".join(cls), tip, u, wk[0].isoformat(), x.day, body))
+        b.append("<tr>%s<td class=\"wt\">%s<br><a href=\"/timesheet?u=%d&amp;w=%s\">Open</a></td></tr>" % ("".join(cells), fmt(wtotal) if wtotal else "", u, wk[0].isoformat()))
+        d += datetime.timedelta(days=7)
+    b.append("</table>")
+    b.append('<p class="legend"><span class="ok">Approved</span> <span class="sub">Waiting for approval</span> <span class="draft">Not submitted</span> '
+             '<span class="back">Sent back or reopened</span></p>')
+    b.append("<p><small>Each day shows the hours booked. Hover a day to see its codes; select a day to open that week's timesheet.</small></p>")
+    if not in_month and not con.execute("select 1 from time_entry where user_id=? limit 1", (u,)).fetchone():
+        return layout(con, u, "Timesheet history", '<div class="empty"><p><b>Nothing booked yet.</b></p><p>Your past weeks will be shown here once you have entered hours on '
+                      '<a href="/timesheet?u=%d">My Timesheet</a>.</p></div>' % u)
+    return layout(con, u, "Timesheet history", "".join(b))

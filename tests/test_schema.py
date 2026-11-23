@@ -763,5 +763,61 @@ class TestInternalHours(Base):
         self.assertEqual(self.scalar("select count(*) from v_period_report where client='Internal'"), 0)
 
 
+
+class DemoHistory(unittest.TestCase):
+    """python scripts/build.py --history: twelve weeks of approved timesheets before the seed's own weeks."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.con = build(history=True)
+        cls.plain = build()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.con.close()
+        cls.plain.close()
+
+    def scalar(self, sql, *args):
+        return self.con.execute(sql, args).fetchone()[0]
+
+    def test_it_adds_three_months_of_weeks_and_leaves_the_seed_alone(self):
+        self.assertEqual(self.scalar("select min(work_date) from time_entry"), "2026-08-04")
+        self.assertEqual(self.scalar("select count(*) from period where week_start < '2026-10-26'"), 12)
+        self.assertEqual(self.scalar("select count(*) from period where week_start < '2026-10-26' and status='Closed'"), 12)
+        self.assertGreater(self.scalar("select count(*) from time_entry"), 1000)
+        seed_part = "select user_id, scope_id, work_date, hours, status from time_entry where work_date >= '2026-10-26' order by 1,2,3,4,5"
+        # the seed's own entries are all still there, unchanged; the first of its weeks also gets hours for people the seed has none for
+        self.assertLessEqual(set(self.plain.execute(seed_part).fetchall()), set(self.con.execute(seed_part).fetchall()))
+        self.assertEqual(self.scalar("select count(*) from time_entry where work_date >= '2026-11-02'"), self.plain.execute("select count(*) from time_entry where work_date >= '2026-11-02'").fetchone()[0])
+        self.assertEqual(self.scalar("select status from period where week_start='2026-10-26'"), "Closed")
+
+    def test_every_historical_hour_is_approved_by_the_scopes_approver(self):
+        old = "work_date < '2026-10-26'"
+        self.assertEqual(self.scalar("select count(*) from time_entry where %s and status not in ('Approved','Edited')" % old), 0)
+        bad = self.scalar("select count(*) from time_entry t where %s and t.approved_by is not null and not exists "
+                          "(select 1 from v_scope_approver a where a.scope_id=t.scope_id and a.user_id=t.approved_by)" % old)
+        self.assertEqual(bad, 0)
+        self.assertEqual(self.scalar("select count(*) from time_entry where %s and approved_by = user_id" % old), 0)
+
+    def test_it_spans_every_month_staff_and_contractors_and_has_corrections_in_the_audit_trail(self):
+        months = [r[0] for r in self.con.execute("select distinct strftime('%Y-%m', work_date) from time_entry where work_date < '2026-10-26' order by 1")]
+        self.assertEqual(months, ["2026-08", "2026-09", "2026-10"])
+        self.assertGreater(self.scalar("select count(*) from time_entry t join app_user p using(user_id) where p.employment_type='Contract' and work_date < '2026-10-26'"), 100)
+        self.assertGreater(self.scalar("select count(*) from time_entry_audit where reason like 'Corrected after a query%'"), 5)
+        self.assertEqual(self.scalar("select count(*) from time_entry where work_date = '2026-08-03'"), 0)            # the bank holiday
+
+    def test_offshore_nights_come_from_the_rotation_and_only_staff_earn_them(self):
+        self.assertGreater(self.scalar("select count(*) from v_offshore_night where work_date < '2026-10-26'"), 50)
+        self.assertEqual(self.scalar("select count(*) from v_offshore_night n join app_user p using(user_id) where p.employment_type<>'Staff'"), 0)
+
+    def test_it_is_the_same_every_time(self):
+        other = build(history=True)
+        try:
+            q = "select user_id, scope_id, work_date, hours, status from time_entry order by user_id, work_date, scope_id, entry_id"
+            self.assertEqual(other.execute(q).fetchall(), self.con.execute(q).fetchall())
+        finally:
+            other.close()
+
+
 if __name__ == "__main__":
     unittest.main()

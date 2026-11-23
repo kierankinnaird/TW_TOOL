@@ -2,7 +2,7 @@
 PRAGMA foreign_keys = ON;
 -- Schema version. The app refuses to start on a database with a lower number (see REQUIRED_SCHEMA in app/app.py),
 -- so raise both together whenever an older database could no longer work with the app.
-PRAGMA user_version = 22;  -- 22: the offshore allowance is per night spent offshore and worked out from the hours (no claims, no allowance approvals)
+PRAGMA user_version = 23;  -- 23: people carry the Microsoft account they sign in with (email, Entra object id). 22: the offshore allowance is per night spent offshore and worked out from the hours (no claims, no allowance approvals)
                           -- 21: the PAAF table is gone (the client's list of people is kept outside the app)
                           -- 2: a cost controller approves the hours a scope approver books to their own scope
                           -- 3: hours can only be booked within a person's start and end dates, and before a PAAF expires
@@ -64,7 +64,13 @@ CREATE TABLE app_user (
     permission      TEXT NOT NULL DEFAULT 'user' CHECK (permission IN ('user','controller','admin')),
     start_date      TEXT NOT NULL,
     end_date        TEXT,
-    line_manager_id INTEGER REFERENCES app_user(user_id) CHECK (line_manager_id IS NULL OR line_manager_id <> user_id)
+    line_manager_id INTEGER REFERENCES app_user(user_id) CHECK (line_manager_id IS NULL OR line_manager_id <> user_id),
+    -- Sign-in with Microsoft (Entra ID). Who a person is comes from Microsoft; what they may do stays here (permission, dates). Someone with no
+    -- row here cannot sign in. entra_object_id is the stable key (it never changes, unlike names and addresses); it is filled from the
+    -- tenant's user export, or on a first sign-in that matches by email. The password is never stored here.
+    email           TEXT COLLATE NOCASE UNIQUE CHECK (email IS NULL OR (email LIKE '%_@_%' AND email NOT LIKE '% %')),
+    entra_object_id TEXT UNIQUE CHECK (entra_object_id IS NULL OR length(entra_object_id) = 36),
+    last_login_at   TEXT
 );
 
 -- Hierarchy: client > project > scope > phase. Hours are booked to a phase (the lowest level).

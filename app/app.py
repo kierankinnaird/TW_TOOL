@@ -15,12 +15,12 @@ import sys
 from flask import Flask, Response, request
 from urllib.parse import parse_qs
 from werkzeug.serving import make_server as make_wsgi_server
-from nmc.core import ASSETS, REQUIRED_SCHEMA, db, ensure_current_period, monday, no_access, parse_adds, permission_of
-from nmc.timesheet import copy_week, save_timesheet, view_timesheet
+from nmc.core import ASSETS, REQUIRED_SCHEMA, can_see_reports, db, ensure_current_period, monday, no_access, parse_adds, permission_of
+from nmc.timesheet import copy_week, save_timesheet, view_history, view_timesheet
 from nmc.monthend import month_bounds, month_sheet, view_monthend
 from nmc.approvals import act_approval, reopen_week, view_approvals, view_missing, view_reopen
 from nmc.reports import (
-    ctr_sheet, grid_data, grid_sheet, manhour_data, manhour_sheet,
+    aaa_parse, aaa_sheet, ctr_sheet, grid_data, grid_sheet, manhour_data, manhour_sheet,
     period_sheet, report_sheet, report_view, view_ctr, view_grid,
     view_manhours, view_reports, xlsx_bytes)
 from nmc.dashboard import view_dashboard
@@ -142,6 +142,9 @@ def timesheet_page(con):
     return html_response(view_timesheet(con, u, w, adds=adds))
 
 
+page("/history")(lambda con, u, q: view_history(con, u, q))
+
+
 page("/approvals")(lambda con, u, q: view_approvals(con, u, q=q))
 
 
@@ -189,6 +192,21 @@ def monthend_download(con):
                     headers={"Content-Disposition": 'attachment; filename="month-%s.xlsx"' % month_bounds(q)[0].strftime("%Y-%m")})
 
 
+@flask_app.route("/reports/aaa.xlsx")
+@with_db
+def aaa_download(con):
+    """The hours export for AAA Consulting (dates, and staff / contractors / all). Cost controllers only: it covers everyone's hours."""
+    q = query()
+    u = user_id(con, q)
+    if permission_of(con, u) != "controller":
+        return html_response(no_access(con, u, "Reports"), 403)
+    rows, sheet, title, sub = aaa_sheet(con, q)
+    first, last, who = aaa_parse(q)
+    return Response(xlsx_bytes(sheet, rows, (1, len(rows)) if len(rows) > 1 else (1,), title, sub),
+                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="aaa-consulting-%s-%s-to-%s.xlsx"' % (who, first.isoformat(), last.isoformat())})
+
+
 @flask_app.route("/reports/export.xlsx")
 @with_db
 def report_export(con):
@@ -198,7 +216,7 @@ def report_export(con):
     key = q.get("k", [""])[0]
     if key == "month":
         return monthend_download()
-    if permission_of(con, u) == "admin":
+    if not can_see_reports(con, u):
         return html_response(no_access(con, u, "Reports"), 403)
     got = report_sheet(con, u, q, key)
     if got is None:
@@ -232,7 +250,7 @@ def table_download():
 def ctr_download(con):
     q = query()
     u = user_id(con, q)
-    if permission_of(con, u) == "admin":
+    if not can_see_reports(con, u):
         return html_response(no_access(con, u, "CTR"), 403)
     got = ctr_sheet(con, u, q)
     if got is None:
@@ -249,7 +267,7 @@ def ctr_download(con):
 def excel_download(con):
     q = query()
     u = user_id(con, q)
-    if permission_of(con, u) == "admin":
+    if not can_see_reports(con, u):
         return html_response(no_access(con, u, "Reports"), 403)
     if request.path.endswith("manhours.xlsx"):
         data = manhour_data(con, u, q)

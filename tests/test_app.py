@@ -328,7 +328,7 @@ class TestApp(unittest.TestCase):
         self.assertNotIn("Week 2030-01-08 opened", page)
 
     def test_reports_date_range(self):
-        page = self.get("/reports?u=5&from=2026-10-26&to=2026-10-26")
+        page = self.get("/reports?u=7&from=2026-10-26&to=2026-10-26")
         self.assertIn("2026-10-26", page)
         self.assertNotIn("2026-11-02</td>", page.split("Period reports")[1])
 
@@ -362,8 +362,8 @@ class TestApp(unittest.TestCase):
         self.assertIn(">%s-%s</td>" % (sp["scope_code"], "PM-D-001"), one_phase)
 
     def test_period_report_has_a_reset_button_back_to_the_unfiltered_page(self):
-        page = self.get("/reports?u=5&client=2")
-        self.assertIn("value=\"Reset\" onclick=\"location.href='/reports?u=5&r=period'\"", page)
+        page = self.get("/reports?u=7&client=2")
+        self.assertIn("value=\"Reset\" onclick=\"location.href='/reports?u=7&r=period'\"", page)
 
     def test_period_report_drops_a_filter_that_does_not_fit_the_client(self):
         con = app.db()
@@ -453,7 +453,7 @@ class TestApp(unittest.TestCase):
 
     # ---------- date pickers ----------
     def test_every_date_box_is_a_calendar_picker(self):
-        page = self.get("/reports?u=5&from=2026-10-26&to=2026-11-02")
+        page = self.get("/reports?u=7&from=2026-10-26&to=2026-11-02")
         self.assertIn('<input type="date" name="from" value="2026-10-26">', page)
         self.assertIn('<input type="date" name="to" value="2026-11-02">', page)
         self.assertNotIn("(yyyy-mm-dd)", page)
@@ -465,7 +465,7 @@ class TestApp(unittest.TestCase):
             self.assertNotIn('type="text" name="%s"' % names[0], page, path)
 
     def test_a_cleared_report_date_falls_back_to_the_default_range(self):
-        page = self.get("/reports?u=5&from=&to=")
+        page = self.get("/reports?u=7&from=&to=")
         year = datetime.date.today().year
         self.assertIn('<input type="date" name="from" value="%d-01-01">' % year, page)       # the current year, not a fixed range
         self.assertIn('<input type="date" name="to" value="%d-12-31">' % year, page)
@@ -480,7 +480,7 @@ class TestApp(unittest.TestCase):
 
     def test_only_cost_controllers_see_values_and_rates(self):
         ctr_total = self.one("select sum(total) from v_ctr")[0]
-        for u in (5, 6, 7):  # a standard user, and approvers of Apache and of other scopes
+        for u in (7, 8):  # the approvers of Apache and of Spirit: hours only, never money
             page, tree, rest = self.report_page(u)
             self.assertNotIn("Sales rate", page, u)
             self.assertNotIn("<th>Total</th>", page, u)
@@ -492,18 +492,33 @@ class TestApp(unittest.TestCase):
         self.assertIn("%.2f" % ctr_total, page)
         self.assertRegex(page, r">\d[\d,]*\.\d\d<")  # the same pattern the others must not match does match here, so the check is real
 
-    def test_a_standard_user_sees_only_their_own_hours(self):
-        page, tree, rest = self.report_page(5)  # Ewan Shaw books to Apache only
-        self.assertIn("Ewan Shaw</span>", tree)  # a person row in the tree (the user switcher uses <option>, not <span>)
-        for other in ("Stuart Sherwood", "Emma Noble", "Daniel Evans"):
-            self.assertNotIn("%s</span>" % other, tree, other)
-        self.assertNotIn("A1500", page)  # a Spirit scope he has not booked to
-        mine = self.one("select coalesce(sum(hours),0) from time_entry where user_id=5 and status='Approved'")[0]
-        total_row = rest.split("Total for range")[1].split("</tr>")[0]
-        self.assertIn("<b>%s</b>" % app.fmt(mine), total_row)  # the weekly report is his own approved hours only
-        self.assertIn(">Apache</option>", page)  # the filters only offer what he can see
-        self.assertNotIn(">Spirit</option>", page)
-        self.assertIn(">Spirit</option>", self.report_page(29)[0])
+    def test_a_standard_user_has_no_reports_but_has_a_timesheet_history(self):
+        for u in (5, 6, 24):  # people who only book time
+            self.assertIn("not available to your role", self.get("/reports?u=%d" % u), u)
+            self.assertIn("not available to your role", self.get("/reports/grid?u=%d" % u), u)
+            self.assertIn("not available to your role", self.get("/ctr?u=%d&phase=1" % u), u)
+            self.assertNotIn('href="/reports?u=%d' % u, self.get("/timesheet?u=%d" % u), u)       # not in their menu
+            for path in ("/reports/export.xlsx?u=%d&k=ctr", "/reports/grid.xlsx?u=%d", "/reports/period.xlsx?u=%d", "/ctr.xlsx?u=%d&phase=1", "/reports/aaa.xlsx?u=%d"):
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(self.base + path % u)
+                self.assertEqual(cm.exception.code, 403, path)
+                cm.exception.close()
+        self.assertIn('href="/history?u=5', self.get("/timesheet?u=5"))
+
+    def test_timesheet_history_lists_my_weeks_with_hours_and_a_way_to_open_each(self):
+        page = self.get("/history?u=5&view=list")
+        self.assertIn("<h4>By month</h4>", page)
+        self.assertIn("<h4>By week</h4>", page)
+        self.assertIn("26/10/2026", page)                       # Ewan Shaw's two seeded weeks, newest first
+        self.assertLess(page.index("02/11/2026"), page.index("26/10/2026"))
+        self.assertIn('href="/timesheet?u=5&amp;w=2026-11-02">Open</a>', page)
+        by_month = page.split("<h4>By week</h4>")[0]
+        for month, hours in self.q_all("select strftime('%Y-%m', work_date), sum(hours) from time_entry where user_id=5 group by 1"):       # each month's hours are what he booked
+            self.assertIn("<td>%s</td>" % datetime.date.fromisoformat(month + "-01").strftime("%B %Y"), by_month)
+            self.assertIn("<td>%s</td>" % app.fmt(hours), by_month)
+        self.assertNotIn("Daniel Evans", page.split("<main>")[1])   # only my own weeks (the user switcher lists everyone)
+        self.assertIn("Nothing booked yet", self.get("/history?u=28"))   # a new person has none (Jamie McNab books nothing in the seed)
+        self.assertIn("does not book time", self.get("/history?u=30"))
 
     def test_an_approver_sees_everyones_hours_on_their_scopes_only(self):
         page, tree, rest = self.report_page(7)  # Alisdair Woodhead approves the Apache scopes
@@ -517,17 +532,17 @@ class TestApp(unittest.TestCase):
         self.assertNotIn("BB0002", tree)
 
     def test_ctr_page_shows_hours_only_and_nothing_outside_what_you_can_see(self):
-        page = self.get("/ctr?u=5&phase=1")  # BB0001 Define: Ewan Shaw has hours here
+        page = self.get("/ctr?u=7&phase=1")  # BB0001 Define: an Apache approver sees the hours on it
         self.assertIn("<th>Pending hrs</th>", page)
         self.assertNotIn("<th>Total</th>", page)
         self.assertNotIn("Cost &pound;", page)
         self.assertNotIn("Sales rate", page)
         family = re.search(r"family=([^\"&]+)", page).group(1)
-        tab = self.get("/ctr?u=5&phase=1&family=%s" % family)
+        tab = self.get("/ctr?u=7&phase=1&family=%s" % family)
         for money in ("Sales rate", "<th>Total</th>", "<th>Value</th>"):
             self.assertNotIn(money, tab, money)
         self.assertNotRegex(tab, r">\d[\d,]*\.\d\d<")
-        other = self.get("/ctr?u=5&phase=6")  # a Spirit phase he has no hours in: nothing is revealed, not even its name
+        other = self.get("/ctr?u=7&phase=6")  # a Spirit phase, not his scope: nothing is revealed, not even its name
         self.assertIn("no hours you can see", other)
         self.assertNotIn("Morecambe Hub", other)
         controller = self.get("/ctr?u=29&phase=6")
@@ -538,9 +553,9 @@ class TestApp(unittest.TestCase):
         self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "h_8_4_1_0_2026-11-04": "3.5", "reason": ""})
         self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Submit week", "reason": ""})
         sees = {}
-        for u in (4, 5, 7, 31, 29):  # David Hart booked it, Ewan Shaw has nothing to do with it, Alisdair Woodhead approves Apache not INT01, Graeme Hogg approves INT01, the cost controller
+        for u in (7, 31, 29):  # Alisdair Woodhead approves Apache not INT01, Graeme Hogg approves INT01, the cost controller
             sees[u] = "David Hart" in self.report_page(u)[2].split("Internal hours")[1]
-        self.assertEqual(sees, {4: True, 5: False, 7: False, 31: True, 29: True})
+        self.assertEqual(sees, {7: False, 31: True, 29: True})
 
     # ---------- missing timesheets (R31) ----------
     def missing(self, u, **params):
@@ -739,10 +754,9 @@ class TestApp(unittest.TestCase):
             self.assertIn('<td>%s</td><td align="right">%s</td><td align="right">%s</td><td align="right">%s</td>' % (
                 name, app.fmt(normal), app.fmt(ot), app.fmt(normal + ot)), section)
         self.assertIn("no separate rate yet", section)  # the cost controller is told overtime is valued at the normal rate
-        # Rob Millman (24) worked 4 hours offshore and nothing else, so that is all he sees; and no mention of values
-        own = self.get("/reports?u=24&from=2026-01-01&to=2026-12-31").split("Hours by location and overtime")[1]
-        self.assertIn('<td>Offshore</td><td align="right">4</td><td align="right">0</td><td align="right">4</td>', own)
-        self.assertNotIn("On Shore", own)
+        # an approver sees the hours on their scopes only, and no mention of values
+        own = self.get("/reports?u=7&from=2026-01-01&to=2026-12-31").split("Hours by location and overtime")[1]
+        self.assertIn("<td>Offshore</td>", own)                       # Rob Millman's offshore hours on an Apache scope
         self.assertNotIn("no separate rate yet", own)
 
     def test_the_it_admin_manages_the_locations(self):
@@ -974,8 +988,8 @@ class TestApp(unittest.TestCase):
         self.assertGreater(before, 0)
         self.reopen(5)
         self.assertLess(approved(5), before)  # this week's approved hours are drafts again
-        page = self.get("/reports?u=5&from=2026-01-01&to=2026-12-31")
-        self.assertIn("Actual booked hrs", page)  # and his report no longer counts them
+        page = self.get("/reports?u=7&from=2026-01-01&to=2026-12-31")
+        self.assertIn("Actual booked hrs", page)  # and the Apache approver's report no longer counts them
         self.assertEqual(self.week_states(5, "2026-10-26", "2026-11-01"), ["Approved", "Approved"])  # the earlier week is still approved
 
     def test_who_has_been_reopened_shows_in_missing_timesheets_and_the_audit_trail(self):
@@ -1261,8 +1275,8 @@ class TestApp(unittest.TestCase):
             page = self.get("/timesheet?u=%d" % u)
             return {k: ('href="/%s?u=%d' % (path, u)) in page for k, path in
                     (("approvals", "approvals"), ("reports", "reports"), ("admin", "admin"), ("audit", "audit"))}
-        self.assertEqual(menu(5), {"approvals": False, "reports": True, "admin": False, "audit": False})    # standard user
-        self.assertEqual(menu(6), {"approvals": False, "reports": True, "admin": False, "audit": False})    # another standard user
+        self.assertEqual(menu(5), {"approvals": False, "reports": False, "admin": False, "audit": False})   # standard user: timesheet and its history only
+        self.assertEqual(menu(6), {"approvals": False, "reports": False, "admin": False, "audit": False})   # another standard user
         self.assertEqual(menu(7), {"approvals": True, "reports": True, "admin": False, "audit": False})     # approver (Apache)
         self.assertEqual(menu(8), {"approvals": True, "reports": True, "admin": False, "audit": False})     # approver (Spirit)
         self.assertEqual(menu(29), {"approvals": True, "reports": True, "admin": True, "audit": True})      # cost controller (approvers' own hours)
@@ -1497,12 +1511,15 @@ class TestApp(unittest.TestCase):
             return r.read(), r.headers
 
     def sheet_rows(self, data):
-        """Read the first sheet of an .xlsx file into rows of values (numbers as floats), with the standard library only."""
+        """Read the table in the first sheet of an .xlsx file into rows of values (numbers as floats), with the standard library only.
+        The logo, title and date lines above the table (the first four rows) are left out; sheet_banner() reads those."""
         ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
         with zipfile.ZipFile(io.BytesIO(data)) as z:
             root = ET.fromstring(z.read("xl/worksheets/sheet1.xml"))
         rows = []
         for row in root.iter("{%s}row" % ns["m"]):
+            if int(row.get("r")) <= 4:
+                continue
             cells = {}
             for c in row:
                 letters = re.match(r"[A-Z]+", c.get("r")).group(0)
@@ -1531,10 +1548,10 @@ class TestApp(unittest.TestCase):
         self.assertIn('<td align="right"><b>%s</b></td>' % app.fmt(total), page)
 
     def test_the_grid_shows_values_only_to_cost_controllers_and_other_people_only_their_own_hours(self):
-        mine = self.get("/reports/grid?u=5&from=2026-11-02&to=2026-11-08")
+        mine = self.get("/reports/grid?u=8&from=2026-11-02&to=2026-11-08")   # Kenneth Nicolson approves Spirit
         self.assertNotIn("<th>Value</th>", mine)
-        self.assertIn(">Ewan Shaw</td>", mine)
-        self.assertNotIn(">Daniel Evans</td>", mine)
+        self.assertNotIn(">Ewan Shaw</td>", mine)                           # Ewan books to Apache only
+        self.assertIn("not available to your role", self.get("/reports/grid?u=5"))   # a standard user has no reports
         # an approver sees the people on the scopes they approve
         self.assertIn(">Daniel Evans</td>", self.get("/reports/grid?u=7&st=all&from=2026-11-02&to=2026-11-08"))
         self.assertIn("not available to your role", self.get("/reports/grid?u=30"))  # the IT admin has no reports
@@ -1590,14 +1607,14 @@ class TestApp(unittest.TestCase):
         # the month and the weekly period reports download from the same place
         self.assertTrue(self.raw("/reports/export.xlsx?u=29&k=period")[0].startswith(b"PK"))
         self.assertTrue(self.raw("/reports/export.xlsx?u=29&k=month&m=2026-11")[0].startswith(b"PK"))
-        # everyone else gets only their own hours and no values; the budget report and the month are for cost controllers
-        own = self.sheet_rows(self.raw("/reports/export.xlsx?u=5&k=ctr")[0])
+        # an approver gets the hours on their scopes and no values; the budget report and the month are for cost controllers
+        own = self.sheet_rows(self.raw("/reports/export.xlsx?u=7&k=ctr")[0])
         self.assertNotIn("Value (approved)", own[0])
         for key in ("budget", "month"):
             with self.assertRaises(urllib.error.HTTPError):
-                urllib.request.urlopen(self.base + "/reports/export.xlsx?u=5&k=%s" % key)
+                urllib.request.urlopen(self.base + "/reports/export.xlsx?u=7&k=%s" % key)
         with self.assertRaises(urllib.error.HTTPError):
-            urllib.request.urlopen(self.base + "/reports/export.xlsx?u=5&k=nothing")
+            urllib.request.urlopen(self.base + "/reports/export.xlsx?u=7&k=nothing")
 
     def test_a_single_ctr_downloads_as_excel(self):
         con = app.db()
@@ -1664,9 +1681,9 @@ class TestApp(unittest.TestCase):
         # the link on the page carries the same settings, and other people only download what they could see
         page = self.get("/reports/grid?u=29&layout=pw&from=2026-11-02&to=2026-11-08")
         self.assertIn("/reports/grid.xlsx?u=29&amp;layout=pw", page)
-        own = self.sheet_rows(self.raw("/reports/grid.xlsx?u=5&from=2026-11-02&to=2026-11-08")[0])
+        own = self.sheet_rows(self.raw("/reports/grid.xlsx?u=8&from=2026-11-02&to=2026-11-08")[0])
         self.assertNotIn("Value", own[0])
-        self.assertEqual({r[0] for r in own[1:-1]}, {"Ewan Shaw"})
+        self.assertNotIn("Ewan Shaw", {r[0] for r in own[1:-1]})            # an approver of Spirit does not get Apache people
         with self.assertRaises(urllib.error.HTTPError) as cm:
             urllib.request.urlopen(self.base + "/reports/grid.xlsx?u=30")
         self.assertEqual(cm.exception.code, 403)
@@ -1679,6 +1696,192 @@ class TestApp(unittest.TestCase):
         client_only = " and scope_id in (select s.scope_id from scope s join client c on c.client_id=s.client_id where c.is_internal=0)"
         self.assertAlmostEqual(rows[-1][7], self.approved_hours("2026-10-01", "2026-12-31", client_only))
         self.assertIn("/reports/period.xlsx?u=29", self.get("/reports?u=29"))
+
+    def test_every_excel_file_carries_the_logo_title_and_date(self):
+        data, _ = self.raw("/reports/export.xlsx?u=29&k=ctr")
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = z.namelist()
+            self.assertIn("xl/media/nmc-logo.png", names)
+            self.assertTrue(z.read("xl/media/nmc-logo.png").startswith(bytes([137, 80, 78, 71])))
+            with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app", "static", "nmc-logo-black.png"), "rb") as f:
+                self.assertEqual(z.read("xl/media/nmc-logo.png"), f.read())   # the black logo, for a white sheet
+            sheet = z.read("xl/worksheets/sheet1.xml").decode()
+            self.assertIn("<drawing ", sheet)
+            self.assertRegex(sheet, r"CTR hours")
+            self.assertRegex(sheet, r"Produced \d\d/\d\d/\d{4} \d\d:\d\d")
+            self.assertIn("FFFE6700", z.read("xl/styles.xml").decode())   # the header row is NMC orange
+            for part in names:
+                if part.endswith(".xml") or part.endswith(".rels"):
+                    ET.fromstring(z.read(part))                           # every part is well-formed
+
+    def contractor_hours(self, kind, d0, d1):
+        con = app.db()
+        try:
+            return con.execute("select coalesce(sum(t.hours),0) from time_entry t join app_user p on p.user_id=t.user_id "
+                               "where t.status<>'Draft' and t.work_date between ? and ?" + kind, (d0, d1)).fetchone()[0]
+        finally:
+            con.close()
+
+    def test_the_aaa_consulting_export_filters_by_dates_and_staff_or_contractors(self):
+        page = self.get("/reports?u=29")
+        self.assertIn("AAA Consulting", page)
+        self.assertIn("/reports/aaa.xlsx", page)
+        span = "from=2026-01-01&to=2026-12-31&layout=lines"
+        for who, kind in (("contract", " and p.employment_type='Contract'"), ("staff", " and p.employment_type='Staff'"), ("all", "")):
+            data, headers = self.raw("/reports/aaa.xlsx?u=29&%s&who=%s" % (span, who))
+            self.assertIn("aaa-consulting-%s-2026-01-01-to-2026-12-31.xlsx" % who, headers["Content-Disposition"])
+            rows = self.sheet_rows(data)
+            self.assertEqual(rows[0][:3], ["NMC ID", "Name", "Type"])
+            lines = rows[1:-1]
+            self.assertGreater(len(lines), 0, who)
+            self.assertAlmostEqual(rows[-1][9], self.contractor_hours(kind, "2026-01-01", "2026-12-31"))
+            self.assertAlmostEqual(rows[-1][9], sum(r[9] for r in lines))
+            self.assertTrue(all(r[2] == {"contract": "Contractor", "staff": "Staff"}.get(who, r[2]) for r in lines))
+            self.assertNotIn("Draft", [r[12] for r in lines])
+            self.assertFalse(any("Value" in str(c) or "rate" in str(c).lower() for c in rows[0]))   # hours only
+        # a narrower range gives fewer hours, and dates are dd/mm/yyyy
+        narrow = self.sheet_rows(self.raw("/reports/aaa.xlsx?u=29&from=2026-11-02&to=2026-11-08&who=all&layout=lines")[0])
+        self.assertTrue(all(re.match(r"\d\d/\d\d/2026$", r[8]) and "2026-11-02" <= "%s-%s-%s" % (r[8][6:], r[8][3:5], r[8][:2]) <= "2026-11-08" for r in narrow[1:-1]))
+        self.assertAlmostEqual(narrow[-1][9], self.contractor_hours("", "2026-11-02", "2026-11-08"))
+        with zipfile.ZipFile(io.BytesIO(self.raw("/reports/aaa.xlsx?u=29&%s&who=contract" % span)[0])) as z:
+            self.assertIn("Contractors | 01/01/2026 to 31/12/2026", z.read("xl/worksheets/sheet1.xml").decode())
+
+    def test_the_aaa_consulting_export_can_show_the_hours_booked_each_day(self):
+        data, _ = self.raw("/reports/aaa.xlsx?u=29&from=2026-11-02&to=2026-11-08&who=all")      # days across is the default layout
+        rows = self.sheet_rows(data)
+        self.assertEqual(rows[0][:6], ["NMC ID", "Name", "Type", "Skill code", "Client", "CTR"])
+        self.assertEqual(rows[0][6:], ["Mon 02/11", "Tue 03/11", "Wed 04/11", "Thu 05/11", "Fri 06/11", "Sat 07/11", "Sun 08/11", "Total"])
+        lines = rows[1:-1]
+        self.assertGreater(len(lines), 0)
+        for r in lines:                                                      # each row's days add up to its total
+            r = r + [None] * (14 - len(r))
+            self.assertAlmostEqual(sum(c or 0 for c in r[6:13]), r[13])
+        self.assertAlmostEqual(rows[-1][13], self.contractor_hours("", "2026-11-02", "2026-11-08"))
+        self.assertAlmostEqual(sum(r[13] for r in lines), rows[-1][13])
+        # the contractors-only version only has contractors, and a year is too long for a column per day
+        con_only = self.sheet_rows(self.raw("/reports/aaa.xlsx?u=29&from=2026-11-02&to=2026-11-08&who=contract")[0])
+        self.assertTrue(all(r[2] == "Contractor" for r in con_only[1:-1]))
+        with zipfile.ZipFile(io.BytesIO(self.raw("/reports/aaa.xlsx?u=29&from=2026-01-01&to=2026-12-31&who=all")[0])) as z:
+            self.assertIn("one line per entry", z.read("xl/worksheets/sheet1.xml").decode())
+
+    # ---------- Microsoft sign-in: who a person is comes from their Microsoft account ----------
+    def test_admin_can_set_a_work_email_and_it_is_kept_unique_and_lower_case(self):
+        base = {"t": "users", "employment_type": "Staff", "role_id": "6", "permission": "user", "start_date": "2026-11-02", "end_date": ""}
+        self.assertIn("User added", self.admin_post("/admin/add", dict(base, nmc_id="A971", name="Sso One", email=" Sso.One@NMCEnergy.com ")))
+        self.assertEqual(self.one("select email from app_user where nmc_id='A971'")[0], "sso.one@nmcenergy.com")
+        self.assertIn("already exists", self.admin_post("/admin/add", dict(base, nmc_id="A972", name="Sso Two", email="SSO.ONE@nmcenergy.com")))
+        self.assertIn("not a valid email", self.admin_post("/admin/add", dict(base, nmc_id="A973", name="Sso Three", email="not an email")))
+        self.assertIn("User added", self.admin_post("/admin/add", dict(base, nmc_id="A974", name="No Email", email="")))     # an email is optional until they sign in
+        self.assertIsNone(self.one("select email from app_user where nmc_id='A974'")[0])
+        self.assertIn("sso.one@nmcenergy.com", self.get("/admin?u=%s&t=users&f_q=sso.one" % self.IT_ADMIN))              # shown in the list and found by search
+
+    def test_changing_an_email_unlinks_the_microsoft_account_but_other_edits_keep_it(self):
+        self.admin_post("/admin/add", {"t": "users", "nmc_id": "A975", "name": "Link Me", "employment_type": "Staff", "role_id": "6", "permission": "user",
+                                       "start_date": "2026-11-02", "end_date": "", "email": "link.me@nmcenergy.com"})
+        con = app.db()
+        con.execute("update app_user set entra_object_id='11111111-2222-3333-4444-555555555555' where nmc_id='A975'")
+        con.commit()
+        con.close()
+        uid = self.one("select user_id from app_user where nmc_id='A975'")[0]
+        save = {"t": "users", "id": uid, "name": "Link Me", "employment_type": "Staff", "role_id": "6", "permission": "user", "end_date": "", "line_manager_id": "",
+                "email": "link.me@nmcenergy.com"}
+        self.admin_post("/admin/save", dict(save, name="Link Me Too"))
+        self.assertEqual(self.one("select entra_object_id from app_user where user_id=?", uid)[0], "11111111-2222-3333-4444-555555555555")
+        self.assertIn("Linked", self.get("/admin/edit?u=%s&t=users&id=%d" % (self.IT_ADMIN, uid)))
+        self.admin_post("/admin/save", dict(save, email="link.me2@nmcenergy.com"))
+        self.assertIsNone(self.one("select entra_object_id from app_user where user_id=?", uid)[0])
+
+    def test_the_user_import_links_real_people_by_name_and_leaves_the_rest(self):
+        import csv
+        import import_users
+        head = ["Display name", "User principal name", "Object Id", "Block credential", "Title"]
+        rows = [["Ross Martin", "ross.martin@nmcenergy.com", "AAAAAAAA-0000-0000-0000-000000000001", "False", ""],
+                ["Ross Martin.", "ross.martin@nmcenergy.com", "AAAAAAAA-0000-0000-0000-000000000002", "True", ""],              # an old blocked account
+                ["Nobody Known", "nobody.known@nmcenergy.com", "AAAAAAAA-0000-0000-0000-000000000003", "False", ""],           # not in the app
+                ["Short Address", "short@nmcenergy.com", "AAAAAAAA-0000-0000-0000-000000000004", "False", "Director"],          # not firstname.lastname
+                ["Some Client", "some.client_spirit-energy.com#EXT#@nmcenergy0.onmicrosoft.com", "AAAAAAAA-0000-0000-0000-000000000005", "False", ""],
+                ["Accounts", "invoices@nmcenergy.com", "AAAAAAAA-0000-0000-0000-000000000006", "False", ""]]
+        path = os.path.join(tempfile.mkdtemp(), "users.csv")
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(head)
+            w.writerows(rows)
+        people = import_users.read_people(path)
+        self.assertEqual([p[1] for p in people], ["ross.martin@nmcenergy.com", "nobody.known@nmcenergy.com"])
+        self.assertEqual([p[1] for p in import_users.read_people(path, also=["Short Address"])][-1], "short@nmcenergy.com")
+        con = build()
+        try:
+            name = con.execute("select name from app_user where user_id=1").fetchone()[0]
+            con.execute("update app_user set name='Ross Martin' where user_id=1")
+            linked, already, not_in_app, not_in_export, clashes = import_users.link_people(con, people)       # a dry run changes nothing
+            self.assertEqual((linked, not_in_app), (["Ross Martin"], ["Nobody Known"]))
+            self.assertIsNone(con.execute("select email from app_user where user_id=1").fetchone()[0])
+            import_users.link_people(con, people, apply=True)
+            self.assertEqual(con.execute("select email, entra_object_id from app_user where user_id=1").fetchone(), ("ross.martin@nmcenergy.com", "aaaaaaaa-0000-0000-0000-000000000001"))
+            self.assertEqual(import_users.link_people(con, people)[1], ["Ross Martin"])                       # running it again finds it already linked
+            self.assertNotIn("Ross Martin", import_users.link_people(con, people)[3])
+            self.assertNotEqual(name, "")
+        finally:
+            con.close()
+
+    def test_loading_the_company_people_adds_those_with_a_title_and_history_covers_them(self):
+        import csv
+        import load_users
+        import seed_history
+        head = ["Display name", "User principal name", "Object Id", "Block credential", "Title", "When created", "Licenses"]
+        rows = [["Pat New", "pat.new@nmcenergy.com", "BBBBBBBB-0000-0000-0000-000000000001", "False", "Lead Piping Engineer", "2024-01-01 10:00:00Z", "Microsoft 365"],
+                ["Sam Loose", "sam.loose@nmcenergy.com", "BBBBBBBB-0000-0000-0000-000000000002", "False", "Senior Electrical Engineer", "2026-09-02 10:00:00Z", "Microsoft 365"],
+                ["Chris Boss", "chris.boss@nmcenergy.com", "BBBBBBBB-0000-0000-0000-000000000003", "False", "Chief Executive Officer", "2020-01-01 10:00:00Z", "Microsoft 365"],
+                ["No Title", "no.title@nmcenergy.com", "BBBBBBBB-0000-0000-0000-000000000004", "False", "", "2026-06-01 10:00:00Z", "Microsoft 365"],
+                ["Odd Title", "odd.title@nmcenergy.com", "BBBBBBBB-0000-0000-0000-000000000005", "False", "Chief Biscuit Officer", "2026-06-01 10:00:00Z", "Microsoft 365"]]
+        path = os.path.join(tempfile.mkdtemp(), "users.csv")
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(head)
+            w.writerows(rows)
+        con = build()
+        try:
+            before = con.execute("select count(*) from app_user").fetchone()[0]
+            dry = load_users.load_users(con, path, apply=False)
+            self.assertEqual(con.execute("select count(*) from app_user").fetchone()[0], before)            # a dry run writes nothing
+            self.assertEqual(dry["added"], ["Chris Boss", "Pat New", "Sam Loose"])
+            res = load_users.load_users(con, path)
+            self.assertEqual(res["added"], ["Chris Boss", "Pat New", "Sam Loose"])
+            self.assertEqual(res["loose"], ["Sam Loose: Senior Electrical Engineer -> EL-01"])
+            self.assertTrue(any("Odd Title" in x and "not mapped" in x for x in res["no_title"]) and "No Title" in res["no_title"])
+            new = {r[0]: r[1:] for r in con.execute("select u.name, u.nmc_id, u.employment_type, u.permission, u.start_date, u.email, u.entra_object_id, r.skill_code "
+                                                    "from app_user u join role r using(role_id) where u.user_id>?", (before,))}
+            self.assertEqual(new["Pat New"], ("A033", "Staff", "user", "2026-01-01", "pat.new@nmcenergy.com", "bbbbbbbb-0000-0000-0000-000000000001", "PI-01"))
+            self.assertEqual(new["Sam Loose"][3], "2026-09-02")                                             # started after the year began: their account date
+            self.assertEqual(new["Chris Boss"][-1], "BS-11")
+            self.assertEqual(con.execute("select count(*) from rate r join role ro using(role_id) where ro.skill_code='BS-11'").fetchone()[0], 0)   # no invented rates
+            self.assertEqual(load_users.load_users(con, path)["added"], [])                                  # running it again adds nobody
+            seed_history.add_history(con)
+            booked = {r[0]: r[1] for r in con.execute("select u.name, count(*) from time_entry t join app_user u using(user_id) group by 1")}
+            self.assertGreater(booked["Pat New"], 20)
+            self.assertGreater(booked["Chris Boss"], 0)
+            self.assertEqual(con.execute("select count(*) from time_entry t join app_user u using(user_id) where u.name='Sam Loose' and t.work_date < '2026-09-02'").fetchone()[0], 0)
+        finally:
+            con.close()
+
+    def test_the_microsoft_account_columns_are_checked_by_the_database(self):
+        con = build()
+        try:
+            for sql in ("update app_user set email='nobody' where user_id=1", "update app_user set email='a b@x.com' where user_id=1",
+                        "update app_user set entra_object_id='too short' where user_id=1"):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    con.execute(sql)
+            con.execute("update app_user set email='One@X.com' where user_id=1")
+            with self.assertRaises(sqlite3.IntegrityError):                                                   # unique whatever the case
+                con.execute("update app_user set email='one@x.com' where user_id=2")
+        finally:
+            con.close()
+
+    def test_the_aaa_consulting_export_is_for_cost_controllers_only(self):
+        for u in (5, 7, 30):
+            with self.assertRaises(urllib.error.HTTPError):
+                urllib.request.urlopen(self.base + "/reports/aaa.xlsx?u=%d" % u)
+        self.assertNotIn("AAA Consulting", self.get("/reports?u=5"))
 
     def test_excel_text_is_stored_as_text_and_special_characters_are_safe(self):
         data = app.xlsx_bytes("Test <sheet>:1", [["Name", "Hours"], ["=1+1 & <b>x</b>\x01", 7.5]])
@@ -1727,9 +1930,9 @@ class TestApp(unittest.TestCase):
         section = self.get("/reports?u=29&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]
         self.assertIn("<td>Ewan Shaw</td><td>Offshore allowance</td><td align=\"right\">2</td><td align=\"right\">0</td>", section)
         self.assertIn("200.00", section)                                                     # money for cost controllers
-        own = self.get("/reports?u=5&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]
+        own = self.get("/reports?u=7&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]       # the Apache approver sees the people on his scopes
         self.assertIn("Ewan Shaw", own)
-        other = self.get("/reports?u=9&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]       # Daniel Evans sees none of Ewan's
+        other = self.get("/reports?u=8&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]       # the Spirit approver sees none of Ewan's
         self.assertNotIn("Ewan Shaw", other.split("<h4>")[0])
         month = self.get("/monthend?u=29&m=2026-11")
         self.assertIn("Offshore nights", month)
