@@ -1,6 +1,6 @@
 # NMC Timewriting System: v1 mock database
 
-SQLite mock of the v1 data model for the in-house timesheet system (CMAP replacement). The people and job titles in the demo data are real NMC staff, a selection taken from the staff directory (the rest are left out so they can be used to test onboarding); rates, projects, codes and hours are made up.
+PostgreSQL mock of the v1 data model for the in-house timesheet system (CMAP replacement). The people and job titles in the demo data are real NMC staff, a selection taken from the staff directory (the rest are left out so they can be used to test onboarding); rates, projects, codes and hours are made up.
 
 ## Layout
 
@@ -18,13 +18,16 @@ app/
   nmc/admin.py      the Admin tabs and the audit trail
   static/         the TASA Orbiter font file, the only static file the app serves
 scripts/
-  build.py        builds build/timewriting.db from schema + seed
+  build.py        fills the PostgreSQL database in DATABASE_URL from schema + seed (emptying it first)
   export_schema_tables.py   writes build/schema_tables.csv (columns as a table)
+  import_users.py, load_users.py   link and load people from the Microsoft 365 user export
+  seed_history.py demo timesheet history (used by build.py --history)
 tests/
   test_schema.py  unittest suite for the rules and views
   test_app.py     front-end smoke tests
 docs/             source documents such as the SOR (git-ignored, kept on the local machine only)
-build/            generated .db files (git-ignored)
+build/            generated files (git-ignored)
+docker-compose.yml   a local PostgreSQL server (and the app) for development and the tests
 ```
 
 The web layer is Flask. `python app/app.py` runs Werkzeug's development server, which is fine for the mock; a real deployment would run `flask_app` under a production WSGI server (for example waitress or gunicorn). Every page is a function that takes the database connection and returns HTML; the routes in `app.py` only read the request and call it.
@@ -35,20 +38,24 @@ NMC brand colours (orange `#fe6700`, black `#0f0f12`, off-white `#f5f5f6`), the 
 
 ## Use
 
+The data lives in PostgreSQL (14 or later). For development, `docker compose up -d db` starts a local server on `localhost:55432` (the default the app and scripts use, so nothing needs setting). To use another server, set `DATABASE_URL` (for example `postgresql://user:password@host:5432/nmc`); Azure's PostgreSQL Flexible Server works as it is. Create the database with the plain "C" collation so names sort by character code, as they always have here: `CREATE DATABASE nmc TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C';` (the compose file does this).
+
 ```
-python scripts/build.py                      # creates build/timewriting.db
-python -m unittest discover -s tests -v      # runs the tests
+python scripts/build.py                      # fills the database in DATABASE_URL with demo data (it empties it first: never run it on real hours)
+python -m unittest discover -s tests -v      # runs the tests (each gets its own throwaway database on the same server)
 ```
+
+The tests make and drop their own databases, so the server needs a user that may create databases; set `TEST_DATABASE_URL` (the maintenance database, for example `.../postgres`) to use a server other than the local one.
 
 Front end (no login: pick who you are in the "Signed in as" box):
 
 ```
 python scripts/build.py
-pip install -r requirements.txt           # once: Flask
+pip install -r requirements.txt           # once: Flask and the PostgreSQL driver
 python app/app.py                            # then open http://localhost:8000
 ```
 
-The app checks the database's schema version when it starts (`PRAGMA user_version` in `db/schema.sql`, `REQUIRED_SCHEMA` in `app/nmc/core.py`; raise both together when a schema change would break older databases). If it says the database was built with an older schema, run `python scripts/build.py` to make a fresh `build/timewriting.db`. That leaves any other database file alone, so a database you pointed `TW_DB` at keeps its data; clear `TW_DB` (PowerShell: `Remove-Item Env:TW_DB`) to use the new one.
+The app checks the database's schema version when it starts (the `schema_info` row in `db/schema.sql`, `REQUIRED_SCHEMA` in `app/nmc/core.py`; raise both together when a schema change would break older databases). If it says the database was built with an older schema, run `python scripts/build.py` to rebuild the demo database (this empties the database in `DATABASE_URL`, so it is for demo data only; a database holding real hours needs the change applied to it as a migration instead).
 
 Pages: My Timesheet (weekly grid), Approvals (approvers and cost controllers), Missing timesheets (approvers and cost controllers), Reports (CTR and weekly period reports), Admin and Audit trail (cost controllers and the IT admin, each seeing their own tabs). Rebuilding the database resets the data.
 
@@ -141,7 +148,7 @@ Hours NMC pays for itself rather than bills to a client are booked to an interna
 - Everything else is the same as client hours: draft, submit, approve by an approver of the scope, controlled edits, audit trail, open weekly period.
 - They are left out of the CTR and the weekly period report, which are about billable value. Reports has a separate Internal hours section for the chosen date range.
 
-Open `build/timewriting.db` in VS Code with a SQLite extension. Useful queries:
+Connect to the database with any PostgreSQL client (VS Code's PostgreSQL extension, pgAdmin, `psql`). Useful queries:
 
 ```sql
 SELECT * FROM v_ctr;                          -- Cost Time Resource per phase and role (approved only)

@@ -10,6 +10,6 @@ docs
 # Not needed to run the demo
 backup db
 tests
-build/sandbox.db
+build
 build/schema_tables.csv
 init_db.py

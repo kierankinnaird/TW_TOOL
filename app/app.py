@@ -2,7 +2,7 @@
 
 Needs Flask:   pip install -r requirements.txt
 Run from the repo root:   python app/app.py        then open  http://localhost:8000
-Uses build/timewriting.db (create it first with: python scripts/build.py).
+Uses the PostgreSQL database in DATABASE_URL (fill it with demo data using: python scripts/build.py; docker-compose.yml starts a local server).
 There is no login: pick who you are from the "Signed in as" box (mock).
 """
 import datetime
@@ -10,7 +10,6 @@ import functools
 import logging
 import os
 import re
-import sqlite3
 import sys
 from flask import Flask, Response, request
 from urllib.parse import parse_qs
@@ -25,7 +24,7 @@ from nmc.reports import (
     view_manhours, view_reports, xlsx_bytes)
 from nmc.dashboard import view_dashboard
 from nmc.admin import act_allowance_rates, act_budgets, act_period, admin_add, admin_save, view_admin, view_admin_edit, view_audit
-from nmc import core
+from nmc import core, pg
 from nmc.core import REQUIRED_SCHEMA, db, fmt, monday  # noqa: F401  (kept importable from here: the tests and scripts use app.db, app.fmt and so on)
 from nmc.reports import ctr_tree_rows, xlsx_bytes  # noqa: F401
 
@@ -322,26 +321,26 @@ def make_server(port=8000):
     return make_wsgi_server("127.0.0.1", port, flask_app, threaded=True)
 
 
-def schema_problem(path):
-    """A message if the database at path was built with an older schema than this app needs, otherwise None."""
-    con = sqlite3.connect(path)
+def schema_problem(url=None):
+    """A message if the database at url (default: DATABASE_URL) cannot be reached, or was built with an older schema than this app needs, otherwise None."""
     try:
-        have = con.execute("pragma user_version").fetchone()[0]
+        con = pg.connect(url)
+    except pg.Error as e:
+        return ("Cannot reach the database: %s\nSet DATABASE_URL, or start the local server (docker compose up -d) and build it with: python scripts/build.py"
+                % pg.error_text(e))
+    try:
+        have = pg.schema_version(con)
     finally:
         con.close()
     if have >= REQUIRED_SCHEMA:
         return None
-    return ("The database %s was built with an older schema (version %d, this app needs %d), so pages would fail.\n"
-            "Build a fresh one with:  python scripts/build.py\n"
-            "That makes build/timewriting.db and leaves this file alone. If TW_DB is set, clear it to use the new file "
-            "(PowerShell: Remove-Item Env:TW_DB)." % (path, have, REQUIRED_SCHEMA))
+    return ("The database was built with an older schema (version %d, this app needs %d), so pages would fail.\n"
+            "Build a fresh demo database with:  python scripts/build.py  (this empties the database named in DATABASE_URL)." % (have, REQUIRED_SCHEMA))
 
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-    if not os.path.exists(core.DB_PATH):
-        sys.exit("No database at %s. Run: python scripts/build.py" % core.DB_PATH)
-    problem = schema_problem(core.DB_PATH)
+    problem = schema_problem(core.DB_URL)
     if problem:
         sys.exit(problem)
     print("Timewriting mock running at http://localhost:%d  (Ctrl+C to stop)" % port)

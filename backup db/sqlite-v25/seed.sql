@@ -1,0 +1,343 @@
+-- Seed data for the v1 mock database. The people and their job titles come from the NMC staff directory (a selection, so the rest
+-- can be used to test onboarding). Rates, codes, projects and hours are examples.
+
+-- Job titles come from the resource tables in the Morecambe Hub estimate (NMC-A0100-PM-EST-0001), grouped into job families.
+INSERT INTO role (role_id, skill_code, name, family) VALUES
+ (1,'PM-01','Project Manager','Project Management'),
+ (2,'EM-02','Engineering Manager','Engineering Management'),
+ (3,'PE-01','Project Engineer','Project Engineering'),
+ (4,'PM-04','Planner','Project Management'),
+ (5,'PM-02','Project Controls Manager','Project Management'),
+ (6,'PM-06','Cost Engineer','Project Management'),
+ (7,'EM-01','Operations Superintendent','Engineering Management'),
+ (8,'PM-03','Project Controls Engineer','Project Management'),
+ (9,'PM-05','Cost Estimator','Project Management'),
+ (10,'PM-07','Document Controller','Project Management'),
+ (11,'PE-02','Project Engineer - EDC','Project Engineering'),
+ (12,'PE-03','Project Engineer - HLV','Project Engineering'),
+ (13,'PE-04','Project Engineer - Integrity','Project Engineering'),
+ (14,'PE-05','Project Engineer - Subsea','Project Engineering'),
+ (15,'PR-01','Lead Process Engineer','Process Engineering'),
+ (16,'PI-01','Lead Piping Engineer','Piping Engineering'),
+ (17,'PI-02','Senior Designer','Piping Engineering'),
+ (18,'IN-01','Lead Instrument Engineer','Instrument Engineering'),
+ (19,'EL-01','Lead Electrical Engineer','Electrical Engineering'),
+ (20,'ST-01','Lead Structural Engineer','Structural Engineering'),
+ (21,'CN-01','Lead Construction Engineer','Construction Engineering'),
+ (22,'PL-01','Subsea Pipeline Engineer','Subsea Pipelines'),
+ (23,'TS-01','Lead Technical Safety Engineer','Technical Safety'),
+ (24,'HS-01','HSES Advisor','HSES'),
+ (25,'ME-01','Lead Mechanical Engineer','Mechanical Engineering'),
+ (26,'ME-02','Senior Mechanical Engineer','Mechanical Engineering'),
+ (27,'ME-03','Senior Mechanical Designer','Mechanical Engineering'),
+ (28,'QC-01','Lead QA/QC Engineer','QA/QC'),
+ (29,'QC-02','Senior QA/QC Inspector','QA/QC'),
+ -- Head of Projects is priced like a Project Manager (a placeholder until the cost team sets a rate). The other two titles never
+ -- bill a client, so they have no rate card (internal codes only).
+ (30,'PM-08','Head of Projects','Project Management'),
+ (31,'BS-01','System Administrator','Business Services'),
+ (32,'BS-02','Commercial Lead','Business Services'),
+ (33,'BS-03','Managing Director','Business Services');
+
+INSERT INTO client (client_id, name) VALUES (1,'Apache'),(2,'Spirit');
+-- NMC's own client for internal hours (paid by NMC, not billed). Its codes are scopes under one project; admin can add more.
+INSERT INTO client (client_id, name, is_internal) VALUES (3,'Internal',1);
+
+-- Rate cards. Spirit rates are the estimate's GBP/hr by job title; Apache rates are example figures (Spirit x 0.95, nearest 0.50).
+-- rate_id: roles 1-6 are Apache 1-6 and Spirit 7-12; roles 7-29 are Apache 13-35 and Spirit 36-58. Head of Projects (role 30) is Apache 59, Spirit 60.
+INSERT INTO rate (rate_id, client_id, role_id, sales_rate) VALUES
+ (1,1,1,114.00),
+ (2,1,2,104.50),
+ (3,1,3,95.00),
+ (4,1,4,85.50),
+ (5,1,5,100.00),
+ (6,1,6,85.50),
+ (7,2,1,120.00),
+ (8,2,2,110.00),
+ (9,2,3,100.00),
+ (10,2,4,90.00),
+ (11,2,5,105.00),
+ (12,2,6,90.00),
+ (13,1,7,109.00),
+ (14,1,8,66.50),
+ (15,1,9,95.00),
+ (16,1,10,62.00),
+ (17,1,11,95.00),
+ (18,1,12,95.00),
+ (19,1,13,95.00),
+ (20,1,14,95.00),
+ (21,1,15,104.50),
+ (22,1,16,85.50),
+ (23,1,17,64.50),
+ (24,1,18,85.50),
+ (25,1,19,85.50),
+ (26,1,20,85.50),
+ (27,1,21,85.50),
+ (28,1,22,90.00),
+ (29,1,23,114.00),
+ (30,1,24,85.50),
+ (31,1,25,85.50),
+ (32,1,26,76.00),
+ (33,1,27,64.50),
+ (34,1,28,76.00),
+ (35,1,29,62.00),
+ (36,2,7,115.00),
+ (37,2,8,70.00),
+ (38,2,9,100.00),
+ (39,2,10,65.00),
+ (40,2,11,100.00),
+ (41,2,12,100.00),
+ (42,2,13,100.00),
+ (43,2,14,100.00),
+ (44,2,15,110.00),
+ (45,2,16,90.00),
+ (46,2,17,68.00),
+ (47,2,18,90.00),
+ (48,2,19,90.00),
+ (49,2,20,90.00),
+ (50,2,21,90.00),
+ (51,2,22,95.00),
+ (52,2,23,120.00),
+ (53,2,24,90.00),
+ (54,2,25,90.00),
+ (55,2,26,80.00),
+ (56,2,27,68.00),
+ (57,2,28,80.00),
+ (58,2,29,65.00),
+ (59,1,30,114.00),
+ (60,2,30,120.00);
+
+INSERT INTO app_user (user_id, nmc_id, employment_type, name, role_id, permission, start_date, end_date) VALUES
+ (1, 'A001','Staff',   'Emma Noble',        6,'controller','2026-01-01',NULL),
+ (2, 'A002','Staff',   'Abbi Murray',       6,'controller','2026-01-01',NULL),
+ (3, 'A003','Contract','Stuart Sherwood',   5,'user', '2026-01-01',NULL),
+ (4, 'A004','Staff',   'David Hart',        4,'user', '2026-01-01',NULL),
+ (5, 'A005','Contract','Ewan Shaw',         4,'user', '2026-03-01',NULL),
+ (6, 'A006','Staff',   'Jamie Ireland',     1,'user', '2026-01-01',NULL),
+ (7, 'A007','Staff',   'Alisdair Woodhead', 2,'user', '2026-01-01',NULL),
+ (8, 'A008','Staff',   'Kenneth Nicolson',  30,'user','2026-01-01',NULL),
+ (9, 'A009','Staff',   'Daniel Evans',      3,'user', '2026-02-01',NULL),
+ (10,'A010','Staff',   'Ajin Sabu',         4,'user', '2026-02-01',NULL),
+ (11,'A011','Staff','Louis Ducharme',7,'user','2026-01-01',NULL),
+ (12,'A012','Staff','Gary Martin',15,'user','2026-01-01',NULL),
+ (13,'A013','Contract','Ken Smart',16,'user','2026-01-01',NULL),
+ (14,'A014','Staff','Andy Gray',17,'user','2026-01-01',NULL),
+ (15,'A015','Staff','Peter McConnachie',19,'user','2026-01-01',NULL),
+ (16,'A016','Staff','Craig Mahoney',18,'user','2026-01-01',NULL),
+ (17,'A017','Contract','Barry Philp',20,'user','2026-01-01',NULL),
+ (18,'A018','Staff','Lloyd Quinn',21,'user','2026-01-01',NULL),
+ (19,'A019','Staff','Janis Watt',23,'user','2026-01-01',NULL),
+ (20,'A020','Contract','Gary Davidson',22,'user','2026-01-01',NULL),
+ (21,'A021','Staff','Neil Pennock',11,'user','2026-01-01',NULL),
+ (22,'A022','Staff','Jason Pang',13,'user','2026-01-01',NULL),
+ (23,'A023','Staff','Arlene Chalmers',10,'user','2026-01-01',NULL),
+ (24,'A024','Staff','Rob Millman',24,'user','2026-01-01',NULL),
+ (25,'A025','Staff','Gary Bridge',9,'user','2026-01-01',NULL),
+ (26,'A026','Contract','Greig McAndrew',8,'user','2026-01-01',NULL),
+ (27,'A027','Staff','Jai Hart',10,'user','2026-01-01',NULL),
+ (28,'A028','Staff','Jamie McNab',25,'user','2026-01-01',NULL),
+ -- Permission levels. Cost controllers manage codes, scopes and rates and see all reports with values; they do not have to be
+ -- cost engineers (Stephanie Apedaile is the commercial lead). The admin (IT) account manages users and job roles only.
+ -- Neither approves hours. Alisdair Woodhead approves for Apache and Kenneth Nicolson for Spirit (see the scopes below).
+ (29,'A029','Staff','Stephanie Apedaile',32,'controller','2026-01-01',NULL),
+ (30,'A030','Staff','NMC Admin',31,'admin','2026-01-01',NULL),
+ -- The managing director approves the overhead (internal) time, and can delegate it by naming secondary approvers on the internal codes.
+ (31,'A031','Staff','Graeme Hogg',33,'user','2026-01-01',NULL);
+
+-- Approvers: each client has a main approver. Secondary approvers on a scope (scope_approver) are added in Admin when a scope needs more
+-- than one person. Alisdair Woodhead is the Apache and Internal main approver and Kenneth Nicolson the Spirit one (both standard users).
+UPDATE client SET approver_user_id = 7 WHERE client_id = 1;
+UPDATE app_user SET books_time = 0 WHERE user_id IN (30, 31);   -- the IT admin account and the managing director do not write time
+UPDATE client SET approver_user_id = 31 WHERE client_id = 3;   -- the Internal client: Graeme Hogg, managing director
+UPDATE client SET approver_user_id = 8 WHERE client_id = 2;
+
+INSERT INTO project (project_id, project_code, name, client_id) VALUES
+ (1,'APJ-01','Wellbay Decommissioning',1),
+ (2,'APJ-02','Platform Decommissioning',1),
+ (3,'SPJ-01','Morecambe Hub',2),
+ (4,'INT','Internal',3);
+
+INSERT INTO scope (scope_id, scope_code, client_id, project_id, description, status) VALUES
+ (1,'BB0001',1,1,'Wellbay Clearance','Open'),
+ (2,'BB0002',1,2,'Platform Study',   'Open'),
+ (3,'FB0001',1,2,'EDC Engineering',  'Closed'),
+ (4,'A1400', 2,3,'Rivers and Calder','Pipeline'),
+ (5,'A1500', 2,3,'PGC & NRU',        'Open'),
+ (6,'A1600', 2,3,'Pipeline Removal', 'Open'),
+ -- Internal codes (no rate)
+ (7,'INT01',3,4,'Business Services',   'Open'),
+ (8,'INT02',3,4,'Training',            'Open'),
+ (9,'INT03',3,4,'Business Development','Open');
+
+-- Phases. Hours are booked to a phase. Every scope has at least one.
+INSERT INTO phase (phase_id, scope_id, name) VALUES
+ (1,1,'Define'),(2,1,'Execute'),(3,2,'Define'),(4,3,'Define'),(5,4,'Define'),(6,5,'Define'),(7,6,'Define'),
+ (8,7,'General'),(9,8,'General'),(10,9,'General');
+
+-- Hour types: where hours are worked. Entries default to location 1 (On Shore) and normal time; overtime is a flag on the entry.
+-- The choices are On Shore, Offshore and Site visit; the IT admin can add more on the Locations tab.
+INSERT INTO location (location_id, name, earns_allowance) VALUES (1,'On Shore',0),(2,'Offshore',1),(3,'Site visit',0);
+
+-- Weekly periods: week of 26 Oct (to be closed later) and week of 2 Nov.
+INSERT INTO period (week_start) VALUES ('2026-10-26'),('2026-11-02');
+
+-- Time entries. Columns: user, scope, phase, worked role, rate, date, hours, created_by.
+INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by) VALUES
+ -- Week of 26 Oct
+ (5,1,1,4,4,  '2026-10-26',8,5),
+ (5,1,1,4,4,  '2026-10-27',8,5),
+ (3,1,1,5,5,  '2026-10-28',8,3),
+ (1,5,6,6,12, '2026-10-28',8,1),
+ (9,2,3,3,3,  '2026-10-29',8,9),
+ (10,5,6,4,10,'2026-10-27',8,10),
+ -- Week of 2 Nov. Ewan Shaw (Planner): own role Mon-Tue, covering Project Controls Manager Wed-Thu
+ (5,1,1,4,4, '2026-11-02',8,5),
+ (5,1,1,4,4, '2026-11-03',8,5),
+ (5,1,1,5,5, '2026-11-04',8,5),
+ (5,1,1,5,5, '2026-11-05',8,5),
+ -- Stuart Sherwood (Project Controls Manager): two Apache scopes in one day, then Spirit
+ (3,1,1,5,5, '2026-11-02',6,3),
+ (3,2,3,5,5, '2026-11-02',2,3),
+ (3,5,6,5,11,'2026-11-03',8,3),
+ (3,5,6,5,11,'2026-11-04',8,3),
+ (3,2,3,5,5, '2026-11-05',4,3),
+ (3,6,7,5,11,'2026-11-05',4,3),
+ -- Emma Noble (Cost Engineer): Apache and Spirit
+ (1,1,1,6,6, '2026-11-02',4,1),
+ (1,5,6,6,12,'2026-11-02',4,1),
+ (1,6,7,6,12,'2026-11-03',8,1),
+ (1,2,3,6,6, '2026-11-04',8,1),
+ (1,1,1,6,6, '2026-11-05',8,1),
+ -- Daniel Evans (Project Engineer): Apache and Spirit
+ (9,1,1,3,3, '2026-11-02',8,9),
+ (9,5,6,3,9, '2026-11-03',8,9),
+ (9,2,3,3,3, '2026-11-04',8,9),
+ (9,6,7,3,9, '2026-11-05',8,9),
+ -- Ajin Sabu (Planner): Spirit, covering Project Controls Manager on Wednesday
+ (10,5,6,4,10,'2026-11-02',8,10),
+ (10,5,6,4,10,'2026-11-03',8,10),
+ (10,6,7,5,11,'2026-11-04',8,10),
+ -- Execute phase of BB0001: Daniel Evans (Project Engineer)
+ (9,1,2,3,3,'2026-11-03',8,9);
+
+-- More people across job families (booked to their own job title)
+INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by) VALUES
+ (11,2,3,7,13,'2026-10-27',8,11),
+ (11,2,3,7,13,'2026-10-28',8,11),
+ (12,2,3,15,21,'2026-10-27',8,12),
+ (13,2,3,16,22,'2026-10-28',8,13),
+ (14,2,3,17,23,'2026-10-28',8,14),
+ (15,2,3,19,25,'2026-10-29',8,15),
+ (16,2,3,18,24,'2026-10-29',8,16),
+ (17,2,3,20,26,'2026-10-29',8,17),
+ (20,2,3,22,28,'2026-10-27',8,20),
+ (19,2,3,23,29,'2026-11-03',8,19),
+ (18,1,1,21,27,'2026-10-28',8,18),
+ (22,1,2,13,19,'2026-11-03',8,22),
+ (23,1,1,10,16,'2026-10-27',8,23),
+ (12,5,6,15,44,'2026-10-28',8,12),
+ (13,5,6,16,45,'2026-11-02',8,13),
+ (25,5,6,9,38,'2026-10-29',8,25),
+ (26,5,6,8,37,'2026-11-03',8,26),
+ (17,5,6,20,49,'2026-11-02',8,17),
+ (20,6,7,22,51,'2026-11-03',8,20),
+ (19,6,7,23,52,'2026-11-04',8,19),
+ (11,6,7,7,36,'2026-11-04',4,11);
+
+-- Examples of the other hour types: an overtime day on site, and a day offshore.
+INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) VALUES
+ (21,1,2,11,17,'2026-11-02',8,21, 1,1),
+ (24,1,1,24,30,'2026-10-28',4,24, 2,0);
+
+-- Approvals are edits, so they name who did it (and are written to time_entry_audit).
+-- Week of 26 Oct: approved by each scope's approver.
+UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-02 09:00',
+       last_edited_by=7, last_edited_at='2026-11-02 09:00' WHERE scope_id=1 AND work_date < '2026-11-02';
+UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-02 09:05',
+       last_edited_by=7, last_edited_at='2026-11-02 09:05' WHERE scope_id=2 AND work_date < '2026-11-02';
+UPDATE time_entry SET status='Approved', approved_by=8, approved_at='2026-11-02 09:10',
+       last_edited_by=8, last_edited_at='2026-11-02 09:10' WHERE scope_id=5 AND work_date < '2026-11-02';
+
+-- Week of 2 Nov: partly approved.
+UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-06 09:00',
+       last_edited_by=7, last_edited_at='2026-11-06 09:00'
+ WHERE scope_id=1 AND work_date IN ('2026-11-02','2026-11-03');
+UPDATE time_entry SET status='Approved', approved_by=8, approved_at='2026-11-06 09:15',
+       last_edited_by=8, last_edited_at='2026-11-06 09:15'
+ WHERE scope_id=5 AND work_date >= '2026-11-02';
+
+-- Close the week of 26 Oct.
+UPDATE period SET status='Closed', closed_by=29, closed_at='2026-11-02 12:00' WHERE week_start='2026-10-26';
+
+-- Controlled edit after the period closed: Approved -> Edited (reason required), then re-approved.
+UPDATE time_entry SET hours=7.5, status='Edited', edit_count=edit_count+1,
+       last_change_reason='Hours corrected after Apache query on 27 Oct',
+       last_edited_by=7, last_edited_at='2026-11-04 10:00'
+ WHERE user_id=5 AND work_date='2026-10-27';
+UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-04 14:00',
+       last_edited_by=7, last_edited_at='2026-11-04 14:00'
+ WHERE user_id=5 AND work_date='2026-10-27';
+
+-- Owner corrects an approved entry this week: now Edited, waiting for re-approval.
+UPDATE time_entry SET hours=7, status='Edited', edit_count=edit_count+1,
+       last_change_reason='Corrected hours per site log',
+       last_edited_by=3, last_edited_at='2026-11-06 09:30'
+ WHERE user_id=3 AND scope_id=1 AND work_date='2026-11-02';
+
+-- Rejected: back to Draft with the reason stored.
+UPDATE time_entry SET status='Draft', reject_reason='Project Controls Manager cover not agreed with client, please confirm',
+       last_edited_by=8, last_edited_at='2026-11-06 10:00'
+ WHERE user_id=10 AND work_date='2026-11-04';
+
+-- The offshore allowance: one allowance, paid per night spent offshore, staff only (worked out from the hours, nothing is claimed). It is worth GBP 100 a night; cost controllers
+-- change it on the Admin, Allowance rate tab by adding a row with a later effective date.
+INSERT INTO allowance_type (allowance_id, name) VALUES (1,'Offshore allowance');
+INSERT INTO allowance_rate (allowance_id, amount, effective_from) VALUES (1, 100, '2026-01-01');
+
+-- CTR sheet details. Every CTR has a code (discipline - phase letter - sequence); the number shown is the scope code in front of it,
+-- for example A1500-PM-D-001. One CTR has the sheet fields filled in as an example.
+UPDATE phase SET ctr_code = 'PM-' || upper(substr(name, 1, 1)) || '-001';
+UPDATE client SET framework_ref = 'SPT-01163 Contract' WHERE client_id = 2;
+UPDATE phase SET description = 'Wellbay Clearance - Define', prepared_by = 'AB', checked_by = 'GH / KNic',
+  objectives = 'Define the scope, sequence and cost of clearing the Wellbay so that an execute phase can be sanctioned.',
+  inputs = '- Existing programme and sequencing documentation' || char(10) || '- Latest MDR and well data',
+  scope_of_work = 'Project engineering, planning and cost control support for the define phase.',
+  assumptions = '- Access to information in the data room' || char(10) || '- Client reviews within 5 working days',
+  exclusions = '- Offshore surveys, which are covered by their own CTR',
+  basis = '1. Based on the MDR and programme for the Wellbay Clearance define phase.'
+WHERE phase_id = 1;
+
+-- ---------------------------------------------------------------------------------------------------------------------
+-- An offshore week, with the offshore allowance. Both are staff (contractors would earn none). A night is earned when someone is
+-- offshore that day and the next, so the last offshore day earns no night. Nothing is claimed: nights are worked out from the hours.
+--   Louis Ducharme (Operations Superintendent): week of 2 Nov offshore on BB0002 Mon-Fri (8 normal hours a day, plus 4 hours overtime
+--     on Wed and Thu): 4 nights (Mon-Thu). Hours are approved Mon-Wed and submitted Thu-Fri.
+--   Lloyd Quinn (Lead Construction Engineer): Mon on site, Tue-Fri offshore on BB0001 Define, all submitted: 3 nights (Tue-Thu).
+--   Rob Millman (HSES Advisor) has a single offshore day on 28 Oct: a day trip, no night.
+-- ---------------------------------------------------------------------------------------------------------------------
+INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) VALUES
+ (11,2,3,7,13,'2026-11-02',8,11,2,0),
+ (11,2,3,7,13,'2026-11-03',8,11,2,0),
+ (11,2,3,7,13,'2026-11-04',8,11,2,0),
+ (11,2,3,7,13,'2026-11-05',8,11,2,0),
+ (11,2,3,7,13,'2026-11-06',8,11,2,0),
+ (11,2,3,7,13,'2026-11-04',4,11,2,1),
+ (11,2,3,7,13,'2026-11-05',4,11,2,1),
+ (18,1,1,21,27,'2026-11-02',8,18,1,0),
+ (18,1,1,21,27,'2026-11-03',8,18,2,0),
+ (18,1,1,21,27,'2026-11-04',8,18,2,0),
+ (18,1,1,21,27,'2026-11-05',8,18,2,0),
+ (18,1,1,21,27,'2026-11-06',8,18,2,0);
+UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-05 10:00', last_edited_by=7, last_edited_at='2026-11-05 10:00'
+ WHERE user_id=11 AND scope_id=2 AND status='Submitted' AND work_date BETWEEN '2026-11-02' AND '2026-11-04';
+
+-- Line managers. Graeme Hogg (managing director) manages the heads and the commercial team; Alisdair Woodhead and Kenneth Nicolson manage
+-- the engineers and planners of their clients; the IT admin has none.
+UPDATE app_user SET line_manager_id = 31 WHERE user_id IN (1, 2, 6, 7, 8, 29);
+UPDATE app_user SET line_manager_id = 7 WHERE user_id IN (3, 4, 5, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
+UPDATE app_user SET line_manager_id = 8 WHERE user_id = 10;
+
+-- Budget hours per CTR, as loaded from P6 on 6 Nov 2026 (hours only). BB0002 Define is at 90% of its budget and A1500 is over.
+INSERT INTO ctr_budget (phase_id, hours, as_of, loaded_by) VALUES
+ (1, 160, '2026-11-06', 29), (2, 40, '2026-11-06', 29), (3, 120, '2026-11-06', 29), (4, 60, '2026-11-06', 29),
+ (6, 95, '2026-11-06', 29), (7, 120, '2026-11-06', 29);

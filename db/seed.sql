@@ -147,6 +147,7 @@ INSERT INTO app_user (user_id, nmc_id, employment_type, name, role_id, permissio
 -- Approvers: each client has a main approver. Secondary approvers on a scope (scope_approver) are added in Admin when a scope needs more
 -- than one person. Alisdair Woodhead is the Apache and Internal main approver and Kenneth Nicolson the Spirit one (both standard users).
 UPDATE client SET approver_user_id = 7 WHERE client_id = 1;
+UPDATE app_user SET books_time = 0 WHERE user_id IN (30, 31);   -- the IT admin account and the managing director do not write time
 UPDATE client SET approver_user_id = 31 WHERE client_id = 3;   -- the Internal client: Graeme Hogg, managing director
 UPDATE client SET approver_user_id = 8 WHERE client_id = 2;
 
@@ -299,9 +300,9 @@ UPDATE phase SET ctr_code = 'PM-' || upper(substr(name, 1, 1)) || '-001';
 UPDATE client SET framework_ref = 'SPT-01163 Contract' WHERE client_id = 2;
 UPDATE phase SET description = 'Wellbay Clearance - Define', prepared_by = 'AB', checked_by = 'GH / KNic',
   objectives = 'Define the scope, sequence and cost of clearing the Wellbay so that an execute phase can be sanctioned.',
-  inputs = '- Existing programme and sequencing documentation' || char(10) || '- Latest MDR and well data',
+  inputs = '- Existing programme and sequencing documentation' || chr(10) || '- Latest MDR and well data',
   scope_of_work = 'Project engineering, planning and cost control support for the define phase.',
-  assumptions = '- Access to information in the data room' || char(10) || '- Client reviews within 5 working days',
+  assumptions = '- Access to information in the data room' || chr(10) || '- Client reviews within 5 working days',
   exclusions = '- Offshore surveys, which are covered by their own CTR',
   basis = '1. Based on the MDR and programme for the Wellbay Clearance define phase.'
 WHERE phase_id = 1;

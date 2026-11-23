@@ -2,17 +2,17 @@
 import datetime
 import html
 import os
-import sqlite3
+from . import pg
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-DB_PATH = os.environ.get("TW_DB", os.path.join(ROOT, "build", "timewriting.db"))
+DB_URL = None   # the database to use; None means DATABASE_URL (see pg.database_url). Tests point it at a throwaway database.
 
 
-# Databases built before this version lack columns and rules the app relies on. Matches PRAGMA user_version in db/schema.sql.
-REQUIRED_SCHEMA = 23
+# Databases built before this version lack columns and rules the app relies on. Matches the version in schema_info in db/schema.sql.
+REQUIRED_SCHEMA = 26
 
 
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
@@ -31,10 +31,7 @@ ASSETS = {"/static/TASAOrbiterVF.woff2": (os.path.join(ROOT, "app", "static", "T
 
 # ---------- helpers ----------
 def db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys = ON")
-    return con
+    return pg.connect(DB_URL)
 
 
 def esc(v):
@@ -73,7 +70,7 @@ def monday(d):
 def ensure_current_period(con):
     """Open this week's period automatically: the first request of a new week creates it. A week that already
     exists, open or closed, is left alone, so a week an admin has closed stays closed."""
-    con.execute("insert or ignore into period (week_start) values (?)", (monday(datetime.date.today()).isoformat(),))
+    con.execute("insert into period (week_start) values (?) on conflict do nothing", (monday(datetime.date.today()).isoformat(),))
     con.commit()
 
 
@@ -322,7 +319,7 @@ if(f[i].tagName!=='INPUT'||!/^(hidden|submit|button|checkbox|radio)$/.test(f[i].
 function title(t){var e=t;while(e&&e!==main){var p=e.previousElementSibling;while(p){if(/^H[1-4]$/.test(p.tagName))return p.textContent.trim();p=p.previousElementSibling;}e=e.parentElement;}
 var h=main.querySelector('h1');return h?h.textContent.trim():'Table';}
 main.querySelectorAll('table').forEach(function(t){
-if(t.getAttribute('border')==='0'||t.classList.contains('ts')||t.querySelector('table')||t.rows.length<2||!t.querySelector('th')||t.rows[0].cells.length<2||editable(t))return;
+if(t.getAttribute('border')==='0'||t.classList.contains('ts')||t.classList.contains('cal')||t.querySelector('table')||t.rows.length<2||!t.querySelector('th')||t.rows[0].cells.length<2||editable(t))return;
 var panel=t.closest('.rpt');if(panel&&panel.querySelector('a[href*="/reports/export.xlsx"],a[href*="period.xlsx"]')&&panel.querySelectorAll('table').length===1)return;
 var name=title(t),p=document.createElement('p'),a=document.createElement('a');
 a.href='#';a.textContent='Download table as Excel';p.className='xl';p.appendChild(a);
@@ -344,10 +341,10 @@ def layout(con, u, title, body):
         " (%s)" % x["permission"] if x["permission"] != "user" else "") for x in users)
     me = me_row(con, u)
     perm = me["permission"] if me else None
-    n_back, n_open = con.execute("select sum(reject_reason is not null), sum(reopen_reason is not null) from time_entry "
+    n_back, n_open = con.execute("select count(*) filter (where reject_reason is not null), count(*) filter (where reopen_reason is not null) from time_entry "
                                  "where user_id=? and status='Draft'", (u,)).fetchone()
     note = ", ".join(x for x in ("%d sent back" % n_back if n_back else "", "%d reopened" % n_open if n_open else "") if x)
-    items = [] if perm == "admin" else [("timesheet", "My Timesheet%s" % (" (%s)" % note if note else ""), "/timesheet?u=%d" % u),
+    items = [] if perm == "admin" or not me["books_time"] else [("timesheet", "My Timesheet%s" % (" (%s)" % note if note else ""), "/timesheet?u=%d" % u),
                                         ("history", "Timesheet history", "/history?u=%d" % u)]  # the IT admin's account books no time
     if approval_queue(con, u) is not None:
         items.append(("approvals", "Approvals (%d)" % pending_for(con, u), "/approvals?u=%d" % u))
@@ -497,6 +494,50 @@ def need_text(value, label):
     if not value:
         raise ValueError("%s is required." % label)
     return value
+
+
+USER_AUDIT_FIELDS = (("name", "Name"), ("email", "Email"), ("employment_type", "Employment"), ("role_id", "Role"), ("permission", "Permission"),
+                     ("start_date", "Start date"), ("end_date", "End date"), ("line_manager_id", "Line manager"), ("books_time", "Writes time"),
+                     ("entra_object_id", "Microsoft account"))
+
+
+def user_audit_text(con, field, value):
+    """A stored value of a person as readable text for the audit trail."""
+    if value is None or value == "":
+        return "none"
+    if field == "role_id":
+        r = con.execute("select skill_code || ' ' || name from role where role_id=?", (value,)).fetchone()
+        return r[0] if r else str(value)
+    if field == "line_manager_id":
+        r = con.execute("select name from app_user where user_id=?", (value,)).fetchone()
+        return r[0] if r else str(value)
+    if field == "books_time":
+        return "Yes" if value else "No"
+    if field == "entra_object_id":
+        return "linked"          # the id itself is not shown
+    if field in ("start_date", "end_date"):
+        return dmy(value)
+    return str(value)
+
+
+def person_row(con, uid):
+    """A person's row, with its columns readable by name."""
+    return con.execute("select * from app_user where user_id=?", (uid,)).fetchone()
+
+
+def audit_user_added(con, actor, uid):
+    """Record that a person was added (by actor, or by the system when actor is None)."""
+    row = con.execute("select name from app_user where user_id=?", (uid,)).fetchone()
+    con.execute("insert into user_audit (user_id, changed_by, action, field, new_value) values (?,?,'ADD','Person',?)", (uid, actor, row[0]))
+
+
+def audit_user_changes(con, actor, uid, old):
+    """Record each field of a person that differs from old (their row as it was before the change)."""
+    new = person_row(con, uid)
+    for field, label in USER_AUDIT_FIELDS:
+        if old[field] != new[field]:
+            con.execute("insert into user_audit (user_id, changed_by, action, field, old_value, new_value) values (?,?,'CHANGE',?,?,?)",
+                        (uid, actor, label, user_audit_text(con, field, old[field]), user_audit_text(con, field, new[field])))
 
 
 def need_email(value):

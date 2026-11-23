@@ -12,10 +12,11 @@ export is listed too. The export has real names, so keep it out of the repo (doc
 import csv
 import os
 import re
-import sqlite3
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "app"))
+from nmc import pg  # noqa: E402
 DOMAIN = "nmcenergy.com"
 FIRST_DOT_LAST = re.compile(r"^[a-z][a-z'\-]*\.[a-z][a-z'\-]*$")
 
@@ -70,8 +71,8 @@ if __name__ == "__main__":
     args = [a for i, a in enumerate(argv) if not a.startswith("--") and not (i and argv[i - 1] == "--also")]
     if not args:
         sys.exit(__doc__)
-    db = os.environ.get("TW_DB") or os.path.join(ROOT, "build", "timewriting.db")
-    con = sqlite3.connect(db)
+    con = pg.connect()
+    db = "the database in DATABASE_URL"
     linked, already, not_in_app, not_in_export, clashes = link_people(con, read_people(args[0], also), "--apply" in sys.argv)
     print("%s %s" % (db, "(changes written)" if "--apply" in sys.argv else "(dry run: nothing written, add --apply to do it)"))
     print("Linked: %d   Already linked: %d" % (len(linked), len(already)))

@@ -209,15 +209,15 @@ def period_data(con, u, q, rv):
     else:
         # the view above adds everyone's hours together, so for everyone else the same figures are built from their own entries only
         per = con.execute(
-            "select date(t.work_date,'weekday 0','-6 days') as week_start, c.name as client, p.name as project, s.scope_code, "
+            "select monday_of(t.work_date) as week_start, c.name as client, p.name as project, s.scope_code, "
             "(s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, r.skill_code, r.name as role, sum(t.hours) as hours, 0 as total "
             "from time_entry t join phase ph on ph.phase_id=t.phase_id join scope s on s.scope_id=ph.scope_id "
             "join project p on p.project_id=s.project_id join client c on c.client_id=s.client_id "
             "join rate rt on rt.rate_id=t.rate_id join role r on r.role_id=rt.role_id "
-            "where t.status='Approved' and date(t.work_date,'weekday 0','-6 days') between ? and ? "
+            "where t.status='Approved' and monday_of(t.work_date) between ? and ? "
             "and (t.user_id=? or exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=?)) "
             "and (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?) and (? is null or ph.phase_id=?) "
-            "group by week_start, ph.phase_id, rt.rate_id order by week_start, client, project, s.scope_code, phase, r.skill_code",
+            "group by week_start, ph.phase_id, rt.rate_id, c.client_id, p.project_id, s.scope_id, r.role_id order by week_start, client, project, s.scope_code, phase, r.skill_code",
             (d_from, d_to, u, u) + chosen).fetchall()
     return per, d_from, d_to, filters
 
@@ -226,12 +226,12 @@ def internal_data(con, u, rv, d_from, d_to):
     """Internal hours (paid by NMC, not billed): by week, code, person and skill code, approved and pending."""
     ivis, iargs = visible_to(rv, u)
     return con.execute(
-        "select date(t.work_date,'weekday 0','-6 days') as week_start, s.scope_code, s.description, u.name as person, ro.skill_code, "
+        "select monday_of(t.work_date) as week_start, s.scope_code, s.description, u.name as person, ro.skill_code, "
         "sum(case when t.status='Approved' then t.hours else 0 end) as approved, "
         "sum(case when t.status in ('Submitted','Edited') then t.hours else 0 end) as pending "
         "from time_entry t join scope s on s.scope_id=t.scope_id join client c on c.client_id=s.client_id "
         "join app_user u on u.user_id=t.user_id join role ro on ro.role_id=t.worked_role_id "
-        "where c.is_internal=1 and t.status<>'Draft' and date(t.work_date,'weekday 0','-6 days') between ? and ?" + ivis +
+        "where c.is_internal=1 and t.status<>'Draft' and monday_of(t.work_date) between ? and ?" + ivis +
         " group by week_start, s.scope_id, u.user_id, ro.role_id order by week_start, s.scope_code, u.name", (d_from, d_to) + iargs).fetchall()
 
 
@@ -239,11 +239,11 @@ def allowance_data(con, u, rv, d_from, d_to):
     """Offshore nights in the date range, per person: approved and waiting (and the approved value)."""
     avis, aargs = ("", ()) if rv["all"] else (" and (a.user_id=? or exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=?))", (u, u))
     return con.execute(
-        "select bu.name as person, at.name as allowance, sum(a.status='Approved') as approved, sum(a.status='Submitted') as waiting, "
+        "select bu.name as person, at.name as allowance, count(*) filter (where a.status='Approved') as approved, count(*) filter (where a.status='Submitted') as waiting, "
         "sum(case when a.status='Approved' then a.amount else 0 end) as value "
         "from v_allowance_value a join scope s on s.scope_id=a.scope_id join app_user bu on bu.user_id=a.user_id join allowance_type at on at.allowance_id=a.allowance_id "
-        "where a.status<>'Draft' and date(a.work_date,'weekday 0','-6 days') between ? and ?" + avis +
-        " group by a.user_id, a.allowance_id order by bu.name, a.allowance_id", (d_from, d_to) + aargs).fetchall()
+        "where a.status<>'Draft' and monday_of(a.work_date) between ? and ?" + avis +
+        " group by a.user_id, a.allowance_id, bu.user_id, at.allowance_id order by bu.name, a.allowance_id", (d_from, d_to) + aargs).fetchall()
 
 
 def location_data(con, u, rv, d_from, d_to):
@@ -253,7 +253,7 @@ def location_data(con, u, rv, d_from, d_to):
         "select lo.name as location, sum(case when t.overtime=0 then t.hours else 0 end) as normal, "
         "sum(case when t.overtime=1 then t.hours else 0 end) as ot "
         "from time_entry t join scope s on s.scope_id=t.scope_id join location lo on lo.location_id=t.location_id "
-        "where t.status='Approved' and date(t.work_date,'weekday 0','-6 days') between ? and ?" + lvis +
+        "where t.status='Approved' and monday_of(t.work_date) between ? and ?" + lvis +
         " group by lo.location_id order by lo.location_id", (d_from, d_to) + largs).fetchall()
 
 
@@ -669,11 +669,11 @@ def manhour_data(con, u, q):
     d_to = q.get("to", [""])[0] or "%d-12-31" % this_year
     vis, vargs = visible_to(report_view(con, u), u)
     found = con.execute(
-        "select date(t.work_date,'weekday 0','-6 days') as wk, ro.family, ro.skill_code, ro.name as role, us.name as person, "
+        "select monday_of(t.work_date) as wk, ro.family, ro.skill_code, ro.name as role, us.name as person, "
         "sum(case when t.status='Approved' then t.hours else 0 end) as approved, "
         "sum(case when t.status in ('Submitted','Edited') then t.hours else 0 end) as pending "
         "from time_entry t join scope s on s.scope_id=t.scope_id join role ro on ro.role_id=t.worked_role_id join app_user us on us.user_id=t.user_id "
-        "where s.client_id=? and t.status<>'Draft' and date(t.work_date,'weekday 0','-6 days') between ? and ?" + vis +
+        "where s.client_id=? and t.status<>'Draft' and monday_of(t.work_date) between ? and ?" + vis +
         " group by wk, ro.role_id, us.user_id order by ro.family, ro.skill_code, us.name, wk", (cid, d_from, d_to) + vargs).fetchall()
     weeks = sorted({r["wk"] for r in found})
     tree = {}  # family -> (skill code, role) -> person -> {"w": {week: approved}, "pending": hours}
@@ -1064,7 +1064,7 @@ def view_ctr(con, u, q):
         pid = 0
     ph = con.execute("select ph.*, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, ph.name as phase_name, ph.status as phase_status, ph.description as phase_desc, s.scope_code, s.description as scope_desc, s.status as scope_status, c.framework_ref, "
                      "pr.project_code, pr.name as project, c.name as client, "
-                     "(select group_concat(x.name, ', ') from (select au.name from v_scope_approver va join app_user au on au.user_id=va.user_id "
+                     "(select string_agg(x.name, ', ') from (select au.name from v_scope_approver va join app_user au on au.user_id=va.user_id "
                      "where va.scope_id=s.scope_id order by au.name) x) as approver "
                      "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
                      "join client c on c.client_id=s.client_id "
@@ -1113,7 +1113,7 @@ def view_ctr(con, u, q):
         "select bu.name as person, at.name as allowance, a.status, count(*) as days, sum(a.amount) as value "
         "from v_allowance_value a join scope s on s.scope_id=a.scope_id join app_user bu on bu.user_id=a.user_id "
         "join allowance_type at on at.allowance_id=a.allowance_id "
-        "where a.phase_id=? and a.status<>'Draft'" + avis + " group by a.user_id, a.allowance_id, a.status "
+        "where a.phase_id=? and a.status<>'Draft'" + avis + " group by a.user_id, a.allowance_id, a.status, bu.user_id, at.allowance_id "
         "order by bu.name, a.allowance_id", (pid,) + aargs).fetchall()
     a_value = sum(r["value"] for r in arows if r["status"] == "Approved")
     tabs.append(("<b>[Allowances]</b>" if fam == "Allowances" else '<a href="%s&amp;family=Allowances">Allowances</a>' % base) if arows else "")
@@ -1194,7 +1194,7 @@ def view_ctr(con, u, q):
             "select at.name as allowance, a.amount, count(*) as units "
             "from v_allowance_value a join scope s on s.scope_id=a.scope_id join allowance_type at on at.allowance_id=a.allowance_id "
             "where a.phase_id=? and a.status='Approved'" + avis +
-            " group by a.allowance_id, a.amount order by a.allowance_id, a.amount", (pid,) + aargs).fetchall()
+            " group by a.allowance_id, a.amount, at.allowance_id order by a.allowance_id, a.amount", (pid,) + aargs).fetchall()
         add_total = sum(r["amount"] * r["units"] for r in adds)
         add_rows = "".join("<tr><td>%s</td>%s<td align=\"right\">%d</td>%s</tr>" % (
             esc(r["allowance"]),

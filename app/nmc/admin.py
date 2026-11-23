@@ -2,12 +2,12 @@
 import csv
 import datetime
 import re
-import sqlite3
 from urllib.parse import quote
+from nmc import pg
 from nmc.core import (
     date_input, dmy, edit_link, esc, fmt,
     fmt_time, hidden, layout, msgs_html,
-    need_date, need_email, need_text, no_access, opts_approvers,
+    audit_user_added, audit_user_changes, need_date, need_email, need_text, no_access, opts_approvers,
     opts_clients, opts_projects, opts_roles, opts_scopes,
     opts_users, permission_of, sel,
     stamp, table, txt)
@@ -46,6 +46,7 @@ def payment_terms(g):
     return terms, value
 
 
+BOOKS_TIME_OPTIONS = [("1", "Yes"), ("0", "No (a director, for example: no timesheet, never chased)")]
 PERMISSION_OPTIONS = [("user", "user"), ("controller", "controller (cost controller)"), ("admin", "admin (IT)")]
 
 
@@ -83,21 +84,21 @@ def admin_body(con, u, t, q=None):
         b.append('<form method="get" action="/admin">%s<p>Find a person (name, email or NMC ID) <input type="text" name="f_q" size="20" value="%s"> '
                  '<input type="submit" value="Search"> <input type="button" value="Clear" onclick="location.href=\'/admin?u=%d&amp;t=users\'"></p></form>' % (
                      hidden(u=u, t="users"), esc(needle), u))
-        rows = [[r["nmc_id"], r["name"], r["email"] or "", r["employment_type"], r["skill_code"] + " " + r["role"], r["manager"] or "", r["permission"], dmy(r["start_date"]),
+        rows = [[r["nmc_id"], r["name"], r["email"] or "", r["employment_type"], r["skill_code"] + " " + r["role"], r["manager"] or "", r["permission"], "Yes" if r["books_time"] else "No", dmy(r["start_date"]),
                  dmy(r["end_date"]), edit_link(u, "users", r["user_id"])]
                 for r in con.execute("select u.*, r.skill_code, r.name as role, m.name as manager from app_user u join role r on r.role_id=u.role_id "
                                      "left join app_user m on m.user_id=u.line_manager_id "
-                                     "where (? = '' or u.name like '%' || ? || '%' or u.nmc_id like '%' || ? || '%' or u.email like '%' || ? || '%') order by u.nmc_id", (needle, needle, needle, needle))]
-        b.append(table(["NMC ID", "Name", "Email", "Employment", "Role", "Line manager", "Permission", "Start", "End", ""], rows, raw_cols=(9,)))
+                                     "where (? = '' or u.name ilike '%' || ? || '%' or u.nmc_id ilike '%' || ? || '%' or u.email ilike '%' || ? || '%') order by u.nmc_id", (needle, needle, needle, needle))]
+        b.append(table(["NMC ID", "Name", "Email", "Employment", "Role", "Line manager", "Permission", "Writes time", "Start", "End", ""], rows, raw_cols=(10,)))
         b.append('<h4>Add a user</h4><form method="post" action="/admin/add">%s<table border="0" cellpadding="2">'
                  "<tr><td>NMC ID</td><td>%s</td></tr><tr><td>Name</td><td>%s</td></tr><tr><td>Work email (the Microsoft account they sign in with)</td><td>%s</td></tr>"
                  "<tr><td>Employment</td><td>%s</td></tr><tr><td>Role</td><td>%s</td></tr><tr><td>Line manager</td><td>%s</td></tr>"
-                 "<tr><td>Permission</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr>"
+                 "<tr><td>Permission</td><td>%s</td></tr><tr><td>Writes time</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr>"
                  "<tr><td>End date (optional)</td><td>%s</td></tr></table><input type=\"submit\" value=\"Add user\"></form>"
                  % (hidden(u=u, t="users"), txt("nmc_id", "", 8), txt("name", "", 30), txt("email", "", 34),
                     sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")]), sel("role_id", opts_roles(con)),
                     sel("line_manager_id", opts_users(con), None, True, "None"),
-                    sel("permission", PERMISSION_OPTIONS), date_input("start_date", datetime.date.today().isoformat()),
+                    sel("permission", PERMISSION_OPTIONS), sel("books_time", BOOKS_TIME_OPTIONS), date_input("start_date", datetime.date.today().isoformat()),
                     date_input("end_date")))
     elif t == "roles":
         family = ((q or {}).get("f_family", [""])[0]).strip()
@@ -199,7 +200,7 @@ def admin_body(con, u, t, q=None):
                  "Each code has an approver, who approves the hours booked to it. Close a code to stop new bookings to it.</small></p>")
         rows = [[r["scope_code"], r["description"], r["status"], r["approvers"] or "", edit_link(u, "internal", r["scope_id"])]
                 for r in con.execute("select s.scope_id, s.scope_code, s.description, s.status, "
-                                     "(select group_concat(x.name, ', ') from (select au.name from v_scope_approver va join app_user au on au.user_id=va.user_id "
+                                     "(select string_agg(x.name, ', ') from (select au.name from v_scope_approver va join app_user au on au.user_id=va.user_id "
                                      "where va.scope_id=s.scope_id order by au.name) x) as approvers from scope s "
                                      "join client c on c.client_id=s.client_id where c.is_internal=1 order by s.scope_code")]
         b.append(table(["Code", "Name", "Status", "Approvers", ""], rows, raw_cols=(4,)))
@@ -220,7 +221,7 @@ def admin_body(con, u, t, q=None):
         b.append("<h4>Scopes</h4>")
         rows = [[r["client"], r["project"], r["scope_code"], r["description"], r["status"], r["secondary"] or "none", edit_link(u, "scopes", r["scope_id"])]
                 for r in con.execute("select s.scope_id, c.name as client, pr.name as project, s.scope_code, s.description, s.status, "
-                                     "(select group_concat(x.name, ', ') from (select au.name from scope_approver sa join app_user au on au.user_id=sa.user_id "
+                                     "(select string_agg(x.name, ', ') from (select au.name from scope_approver sa join app_user au on au.user_id=sa.user_id "
                                      "where sa.scope_id=s.scope_id order by au.name) x) as secondary "
                                      "from scope s join client c on c.client_id=s.client_id join project pr on pr.project_id=s.project_id "
                                      "order by c.name, pr.name, s.scope_code")]
@@ -274,14 +275,14 @@ def view_admin_edit(con, u, t, i, msgs=None):
             return layout(con, u, "Admin", "<p>Not found.</p>")
         form = ("<tr><td>NMC ID</td><td>%s</td></tr><tr><td>Name</td><td>%s</td></tr><tr><td>Work email</td><td>%s</td></tr>"
                 "<tr><td>Microsoft account</td><td>%s</td></tr><tr><td>Last signed in</td><td>%s</td></tr><tr><td>Employment</td><td>%s</td></tr>"
-                "<tr><td>Role</td><td>%s</td></tr><tr><td>Line manager</td><td>%s</td></tr><tr><td>Permission</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr>"
+                "<tr><td>Role</td><td>%s</td></tr><tr><td>Line manager</td><td>%s</td></tr><tr><td>Permission</td><td>%s</td></tr><tr><td>Writes time</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr>"
                 "<tr><td>End date</td><td>%s</td></tr>" % (
                     esc(r["nmc_id"]), txt("name", r["name"], 30), txt("email", r["email"] or "", 34),
                     "Linked" if r["entra_object_id"] else "Not linked yet (linked on first sign-in, or by the user import)", esc(dmy(r["last_login_at"]) or "Never"),
                     sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")], r["employment_type"]),
                     sel("role_id", opts_roles(con, active_only=False), r["role_id"]),
                     sel("line_manager_id", [x for x in opts_users(con) if x[0] != i], r["line_manager_id"], True, "None"),
-                    sel("permission", PERMISSION_OPTIONS, r["permission"]), esc(dmy(r["start_date"])), date_input("end_date", r["end_date"] or "")))
+                    sel("permission", PERMISSION_OPTIONS, r["permission"]), sel("books_time", BOOKS_TIME_OPTIONS, str(r["books_time"])), esc(dmy(r["start_date"])), date_input("end_date", r["end_date"] or "")))
         note = "<p><small>Changing someone's role does not change their booked hours.</small></p>"
     elif t == "roles":
         r = con.execute("select * from role where role_id=?", (i,)).fetchone()
@@ -377,10 +378,11 @@ def admin_add(con, form):
     g = lambda k: form.get(k, [""])[0].strip()
     try:
         if t == "users":
-            con.execute("insert into app_user (nmc_id, employment_type, name, role_id, permission, start_date, end_date, line_manager_id, email) values (?,?,?,?,?,?,?,?,?)",
+            cur = con.execute("insert into app_user (nmc_id, employment_type, name, role_id, permission, start_date, end_date, line_manager_id, email, books_time) values (?,?,?,?,?,?,?,?,?,?) returning user_id",
                         (need_text(g("nmc_id"), "NMC ID"), g("employment_type"), need_text(g("name"), "Name"), int(g("role_id")),
                          g("permission"), need_date(g("start_date"), "Start date"), need_date(g("end_date"), "End date", False),
-                         int(g("line_manager_id")) if g("line_manager_id") else None, need_email(g("email"))))
+                         int(g("line_manager_id")) if g("line_manager_id") else None, need_email(g("email")), 0 if g("books_time") == "0" else 1))
+            audit_user_added(con, u, cur.fetchone()[0])
             msg = "User added."
         elif t == "roles":
             con.execute("insert into role (skill_code, name, family) values (?,?,?)",
@@ -409,9 +411,9 @@ def admin_add(con, form):
             pr = con.execute("select client_id from project where project_id=?", (int(g("project_id") or 0),)).fetchone()
             if not pr:
                 raise ValueError("Choose a project (add one first if there are none).")
-            cur = con.execute("insert into scope (scope_code, client_id, project_id, description, status) values (?,?,?,?,?)",
+            cur = con.execute("insert into scope (scope_code, client_id, project_id, description, status) values (?,?,?,?,?) returning scope_id",
                               (need_text(g("scope_code"), "Scope code"), pr[0], int(g("project_id")), need_text(g("description"), "Description"), g("status")))
-            con.execute("insert into phase (scope_id, name) values (?, 'General')", (cur.lastrowid,))
+            con.execute("insert into phase (scope_id, name) values (?, 'General')", (cur.fetchone()[0],))
             msg = "Scope added with a General CTR."
         elif t == "phases":
             terms, value = payment_terms(g)
@@ -428,11 +430,11 @@ def admin_add(con, form):
             if not pr:
                 raise ValueError("There is no Internal client and project to add codes to.")
             n = con.execute("select coalesce(max(cast(substr(scope_code, 4) as integer)), 0) + 1 from scope "
-                            "where scope_code like 'INT%' and substr(scope_code, 4) glob '[0-9]*'").fetchone()[0]
+                            "where scope_code like 'INT%' and substr(scope_code, 4) ~ '^[0-9]+$'").fetchone()[0]
             code = "INT%02d" % n
-            cur = con.execute("insert into scope (scope_code, client_id, project_id, description, status) values (?,?,?,?, 'Open')",
+            cur = con.execute("insert into scope (scope_code, client_id, project_id, description, status) values (?,?,?,?, 'Open') returning scope_id",
                               (code, pr["client_id"], pr["project_id"], need_text(g("description"), "Name")))
-            con.execute("insert into phase (scope_id, name) values (?, 'General')", (cur.lastrowid,))
+            con.execute("insert into phase (scope_id, name) values (?, 'General')", (cur.fetchone()[0],))
             msg = "Internal code %s added." % code
         else:
             raise ValueError("Unknown form.")
@@ -440,13 +442,11 @@ def admin_add(con, form):
         return view_admin(con, u, t, [msg], ok=True)
     except ValueError as e:
         return view_admin(con, u, t, [str(e)])
-    except sqlite3.IntegrityError as e:
-        text = str(e)
-        if "UNIQUE" in text:
-            text = "That already exists (it must be unique)."
+    except pg.IntegrityError as e:
+        text = "That already exists (it must be unique)." if isinstance(e, pg.UniqueViolation) else pg.error_text(e)
         return view_admin(con, u, t, [text])
-    except sqlite3.DatabaseError as e:
-        return view_admin(con, u, t, [str(e)])
+    except pg.DatabaseError as e:
+        return view_admin(con, u, t, [pg.error_text(e)])
 
 
 def admin_save(con, form):
@@ -460,10 +460,12 @@ def admin_save(con, form):
             if manager == i:
                 raise ValueError("A person cannot be their own line manager.")
             email = need_email(g("email"))
-            con.execute("update app_user set name=?, employment_type=?, role_id=?, permission=?, end_date=?, line_manager_id=?, email=?, "
-                        "entra_object_id=case when email is not ? then null else entra_object_id end where user_id=?",
+            before = con.execute("select * from app_user where user_id=?", (i,)).fetchone()
+            con.execute("update app_user set name=?, employment_type=?, role_id=?, permission=?, end_date=?, line_manager_id=?, email=?, books_time=?, "
+                        "entra_object_id=case when email is distinct from ? then null else entra_object_id end where user_id=?",
                         (need_text(g("name"), "Name"), g("employment_type"), int(g("role_id")), g("permission"),
-                         need_date(g("end_date"), "End date", False), manager, email, email, i))
+                         need_date(g("end_date"), "End date", False), manager, email, 0 if g("books_time") == "0" else 1, email, i))
+            audit_user_changes(con, u, i, before)
         elif t == "roles" and g("old_family"):
             if not g("new_family"):
                 return view_admin(con, u, t, ["Give the family a name."], q={"f_family": [g("old_family")]})
@@ -489,7 +491,7 @@ def admin_save(con, form):
             con.execute("update scope set description=?, status=? where scope_id=?", (need_text(g("description"), "Description"), g("status"), i))
             con.execute("delete from scope_approver where scope_id=?", (i,))
             for person in form.get("secondary", []):
-                con.execute("insert or ignore into scope_approver (scope_id, user_id) values (?,?)", (i, int(person)))
+                con.execute("insert into scope_approver (scope_id, user_id) values (?,?) on conflict do nothing", (i, int(person)))
         elif t == "projects":
             con.execute("update project set name=?, status=? where project_id=?", (need_text(g("name"), "Project name"), g("status"), i))
         elif t == "phases":
@@ -506,15 +508,15 @@ def admin_save(con, form):
                          g("exclusions") or None, g("prepared_by") or None, g("checked_by") or None, g("expenses") or "Reimbursable", terms, lump, g("basis") or None, i))
             con.execute("delete from phase_person where phase_id=?", (i,))
             for person in form.get("person", []):
-                con.execute("insert or ignore into phase_person (phase_id, user_id) values (?,?)", (i, int(person)))
+                con.execute("insert into phase_person (phase_id, user_id) values (?,?) on conflict do nothing", (i, int(person)))
         else:
             raise ValueError("Unknown form.")
         con.commit()
         return view_admin(con, u, "scopes" if t in ("projects", "phases") else t, ["Saved."], ok=True)
     except ValueError as e:
         return view_admin_edit(con, u, t, i, [str(e)])
-    except sqlite3.DatabaseError as e:
-        text = "That already exists (it must be unique)." if "UNIQUE" in str(e) else str(e)
+    except pg.DatabaseError as e:
+        text = "That already exists (it must be unique)." if isinstance(e, pg.UniqueViolation) else pg.error_text(e)
         return view_admin_edit(con, u, t, i, [text])
 
 
@@ -546,7 +548,7 @@ def act_allowance_rates(con, form):
     except ValueError as e:
         con.rollback()
         return view_admin(con, u, "allowance_rates", [str(e)])
-    except sqlite3.IntegrityError:
+    except pg.IntegrityError:
         con.rollback()
         return view_admin(con, u, "allowance_rates", ["A rate already exists from that date. Rates are never edited: choose a later date."])
 
@@ -722,8 +724,8 @@ def act_period(con, form):
             msg = ["Week %s closed." % ws]
         con.commit()
         return view_admin(con, u, "periods", msg, ok=True)
-    except sqlite3.DatabaseError as e:
-        return view_admin(con, u, "periods", ["%s" % e])
+    except pg.DatabaseError as e:
+        return view_admin(con, u, "periods", [pg.error_text(e)])
 
 
 def nowrap(v):
@@ -748,4 +750,16 @@ def view_audit(con, u, q=None):
             '<small>Showing the latest 200 changes%s.</small></p></form>' % (
                 hidden(u=u), sel("person", opts_users(con), person, True, "Everyone"), " for this person" if person else "")) +         table(heads, [[fmt(v) if i in (9, 10) else nowrap(fmt_time(v)) if i == 1 else nowrap(dmy(v)) if i == 6 else str(v).capitalize() if i == 3 else v
                                                                                    for i, v in enumerate(r)] for r in rows], raw_cols=(1, 6))
+    changes = con.execute(
+        "select a.changed_at, coalesce(ch.name, 'System') as by_whom, p.name as person, a.action, a.field, a.old_value, a.new_value from user_audit a "
+        "join app_user p on p.user_id=a.user_id left join app_user ch on ch.user_id=a.changed_by "
+        "where (? is null or a.user_id=?) order by a.audit_id desc limit 200", (person, person)).fetchall()
+    body += "<h4>Changes to people</h4>"
+    if changes:
+        body += table(["When", "Changed by", "Person", "What", "Old", "New"],
+                      [[nowrap(fmt_time(r["changed_at"])), r["by_whom"], r["person"], "Added" if r["action"] == "ADD" else r["field"], r["old_value"] or "", r["new_value"] or ""] for r in changes],
+                      raw_cols=(0,))
+        body += "<p><small>Who was added, and each change to a person's email, permission, role, dates, line manager, whether they write time, or their linked Microsoft account. The latest 200.</small></p>"
+    else:
+        body += "<p>No changes to people yet.</p>"
     return layout(con, u, "Audit trail", body)

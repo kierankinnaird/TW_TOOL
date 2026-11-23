@@ -1,6 +1,6 @@
 """The weekly timesheet: showing it, saving hours, booking rules and copying last week. Allowances are not claimed here (payroll sets them by location)."""
 import datetime
-import sqlite3
+from nmc import pg
 from nmc.core import date_input, dmy, esc, fmt, layout, locations, me_row, monday, msgs_html, parse_adds, stamp, table
 
 
@@ -59,7 +59,7 @@ def stretch_locked(con, u, d0, d6):
     """A stretch is locked once it has been submitted: it has hours past Draft and nothing left in Draft. Sent-back or
     reopened entries go back to Draft, which opens it again."""
     non_draft, draft = con.execute(
-        "select coalesce(sum(status<>'Draft'),0), coalesce(sum(status='Draft'),0) from time_entry where user_id=? and work_date between ? and ?", (u, d0, d6)).fetchone()
+        "select count(*) filter (where status<>'Draft'), count(*) filter (where status='Draft') from time_entry where user_id=? and work_date between ? and ?", (u, d0, d6)).fetchone()
     return non_draft > 0 and draft == 0
 
 
@@ -91,6 +91,9 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
     if me["permission"] == "admin":
         return layout(con, u, "My Timesheet", '<p>The IT admin account is a system account and does not book time. '
                       'Use <a href="/admin?u=%d">Admin</a> to manage users, job titles and locations.</p>' % u)
+    if not me["books_time"]:
+        return layout(con, u, "My Timesheet", '<div class="empty"><p><b>You are not set up to write time</b>, so there is no timesheet for you and nobody will chase you for one.</p>'
+                      "<p>If that is wrong, ask the cost team to change it on your user record.</p></div>")
     days = [w + datetime.timedelta(days=i) for i in range(7)]
     d0, d6 = days[0].isoformat(), days[6].isoformat()
     period = con.execute("select * from period where week_start=?", (d0,)).fetchone()
@@ -205,7 +208,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
                "select ch.name as who, a.changed_at from time_entry_audit a left join app_user ch on ch.user_id=a.changed_by "
                "where a.entry_id=? and a.new_status='Draft' and a.reason like 'Reopened:%' order by a.audit_id desc limit 1", "reopened")
     elsewhere = [r for r in con.execute(
-        "select date(work_date,'weekday 0','-6 days') as wk, count(*) as n from time_entry "
+        "select monday_of(work_date) as wk, count(*) as n from time_entry "
         "where user_id=? and status='Draft' and (reject_reason is not null or reopen_reason is not null) group by wk order by wk", (u,)) if r["wk"] != d0]
     if elsewhere:
         b.append("<p><small>You also have hours sent back or reopened in: %s.</small></p>" % ", ".join(
@@ -365,7 +368,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
 
 def book_entry(con, u, pid, rid, lid, ot, date, hours):
     """Create one Draft entry for u. Returns None when it is booked, or a short reason when it cannot be (no rate, location switched
-    off). The database rules (open scope, start and end dates, open week) raise sqlite3.DatabaseError instead."""
+    off). The database rules (open scope, start and end dates, open week) raise a database error (pg.DatabaseError) instead."""
     info = con.execute("select s.scope_id, s.client_id, c.is_internal from phase ph join scope s on s.scope_id=ph.scope_id "
                        "join client c on c.client_id=s.client_id where ph.phase_id=?", (pid,)).fetchone()
     if not info:
@@ -433,8 +436,8 @@ def save_timesheet(con, form):
                                 (u, stamp(), existing["entry_id"]))
                     con.execute("delete from time_entry where entry_id=?", (existing["entry_id"],))
                     cleared += 1
-                except sqlite3.DatabaseError as e:
-                    msgs.append("%s: %s" % (label, e))
+                except pg.DatabaseError as e:
+                    msgs.append("%s: %s" % (label, pg.error_text(e)))
             elif existing:
                 msgs.append("%s: %s hours are locked. Ask a cost controller to reopen the timesheet." % (label, existing["status"].lower()))
             continue
@@ -463,8 +466,8 @@ def save_timesheet(con, form):
                     typed[key] = raw
                     continue
             saved += 1
-        except sqlite3.DatabaseError as e:
-            msgs.append("%s: %s" % (label, friendly(e)))
+        except pg.DatabaseError as e:
+            msgs.append("%s: %s" % (label, friendly(pg.error_text(e))))
             typed[key] = raw
     for key in typed:  # a row whose hours could not be saved stays on the grid so what was typed can be corrected
         _, pid, rid, lid, ot, _date = key.split("_", 5)
@@ -484,8 +487,8 @@ def save_timesheet(con, form):
                     con.execute("delete from time_entry where entry_id=?", (x["entry_id"],))
                 adds = [a for a in adds if tuple(a[:3]) != del_h]
                 ok_msgs.append("Row deleted%s." % (" (%d draft entr%s removed)" % (len(rowset), "y" if len(rowset) == 1 else "ies") if rowset else ""))
-            except sqlite3.DatabaseError as e:
-                msgs.append("Delete failed: %s" % e)
+            except pg.DatabaseError as e:
+                msgs.append("Delete failed: %s" % pg.error_text(e))
     if saved:
         ok_msgs.append("%d entr%s saved." % (saved, "y" if saved == 1 else "ies"))
     if cleared:
@@ -504,8 +507,8 @@ def save_timesheet(con, form):
                 ok_msgs.append("%d entr%s submitted for approval." % (n, "y" if n == 1 else "ies"))
             if not n:
                 msgs.append("Nothing to submit: there are no draft hours in %s." % ("this week" if (a, b) == (d0, d6) else "the days up to %s" % datetime.date.fromisoformat(b).strftime("%d/%m")))
-        except sqlite3.DatabaseError as e:
-            msgs.append("Submit failed: %s" % e)
+        except pg.DatabaseError as e:
+            msgs.append("Submit failed: %s" % pg.error_text(e))
     con.commit()
     body_msgs = ok_msgs if not msgs else msgs + ok_msgs
     return view_timesheet(con, u, w, body_msgs, adds, ok=not msgs, typed=typed)
@@ -536,8 +539,8 @@ def copy_week(con, form):
         date = (datetime.date.fromisoformat(e["work_date"]) + datetime.timedelta(days=7)).isoformat()
         try:
             problem = book_entry(con, u, e["phase_id"], e["worked_role_id"], e["location_id"], e["overtime"], date, e["hours"])
-        except sqlite3.DatabaseError as ex:
-            problem = str(ex)
+        except pg.DatabaseError as ex:
+            problem = pg.error_text(ex)
         if problem:
             problems[problem] = problems.get(problem, 0) + 1
         else:
@@ -562,18 +565,18 @@ def view_history(con, u, q=None):
     """My past timesheets: a month calendar of the hours booked each day (the default), or a list of weeks. Either way each day or week opens that week's timesheet."""
     q = q or {}
     me = me_row(con, u)
-    if not me or me["permission"] == "admin":
-        return layout(con, u, "Timesheet history", "<p>The IT admin account does not book time.</p>")
+    if not me or me["permission"] == "admin" or not me["books_time"]:
+        return layout(con, u, "Timesheet history", "<p>This account does not write time, so there is no history.</p>")
     if q.get("view", ["calendar"])[0] != "list":
         return history_calendar(con, u, q)
     weeks = con.execute(
-        "select date(work_date, 'weekday 0', '-6 days') as wk, sum(hours) as total, "
+        "select monday_of(work_date) as wk, sum(hours) as total, "
         "sum(case when status in ('Approved','Edited') then hours else 0 end) as approved, sum(case when status='Submitted' then hours else 0 end) as submitted, "
         "sum(case when status='Draft' then hours else 0 end) as draft, count(distinct work_date) as days, "
         "sum(case when status='Draft' and (reject_reason is not null or reopen_reason is not null) then 1 else 0 end) as back "
         "from time_entry where user_id=? group by wk order by wk desc", (u,)).fetchall()
     months = con.execute(
-        "select strftime('%Y-%m', work_date) as m, sum(hours) as total, sum(case when status in ('Approved','Edited') then hours else 0 end) as approved, "
+        "select substr(work_date, 1, 7) as m, sum(hours) as total, sum(case when status in ('Approved','Edited') then hours else 0 end) as approved, "
         "count(distinct work_date) as days from time_entry where user_id=? group by m order by m desc", (u,)).fetchall()
     if not weeks:
         return layout(con, u, "Timesheet history", '<div class="empty"><p><b>Nothing booked yet.</b></p><p>Your past weeks will be listed here once you have entered hours on '

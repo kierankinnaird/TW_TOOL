@@ -1,7 +1,7 @@
 """Approvals, missing timesheets and reopening a timesheet."""
 import datetime
-import sqlite3
 from urllib.parse import quote
+from nmc import pg
 from nmc.core import (
     dmy,
     approval_queue, date_input, esc,
@@ -37,9 +37,9 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
     where, wargs = queue
     q = q or {}
     waiting = con.execute(
-        "select wk, sum(n) as n from (select date(t.work_date,'weekday 0','-6 days') as wk, count(*) as n from time_entry t join scope s on s.scope_id=t.scope_id "
+        "select wk, sum(n) as n from (select monday_of(t.work_date) as wk, count(*) as n from time_entry t join scope s on s.scope_id=t.scope_id "
         "where t.status in ('Submitted','Edited')" + where + " group by wk "
-        ") group by wk order by wk", list(wargs)).fetchall()
+        ") x group by wk order by wk", list(wargs)).fetchall()
     try:
         w = monday(datetime.date.fromisoformat(q["w"][0]))
     except (KeyError, ValueError, IndexError):
@@ -184,8 +184,8 @@ def act_approval(con, form):
                 con.execute("update time_entry set status='Draft', reject_reason=?, reopen_reason=NULL, last_edited_by=?, last_edited_at=? "
                             "where entry_id=?", (reason, u, stamp(), eid))
             done += 1
-        except sqlite3.DatabaseError as e:
-            msgs.append("Entry %d: %s" % (eid, e))
+        except pg.DatabaseError as e:
+            msgs.append("Entry %d: %s" % (eid, pg.error_text(e)))
     con.commit()
     verb = "approved" if approve else "sent back to draft"
     ok_msgs = []
@@ -236,11 +236,11 @@ def view_missing(con, u, q):
     # everyone who is active at some point in the week (start and end dates)
     people = con.execute(
         "select p.user_id, p.nmc_id, p.name, p.employment_type, r.name as title from app_user p join role r on r.role_id=p.role_id "
-        "where p.permission<>'admin' and p.start_date<=? and (p.end_date is null or p.end_date>=?)" + scope_sql + " order by p.name", [d6, d0] + scope_args).fetchall()
+        "where p.permission<>'admin' and p.books_time=1 and p.start_date<=? and (p.end_date is null or p.end_date>=?)" + scope_sql + " order by p.name", [d6, d0] + scope_args).fetchall()
     week = {r["user_id"]: r for r in con.execute(
-        "select user_id, sum(status<>'Draft') as n_sub, sum(status='Draft') as n_draft, "
+        "select user_id, count(*) filter (where status<>'Draft') as n_sub, count(*) filter (where status='Draft') as n_draft, "
         "sum(case when status<>'Draft' then hours else 0 end) as h_sub, sum(case when status='Draft' then hours else 0 end) as h_draft, "
-        "sum(status='Draft' and (reject_reason is not null or reopen_reason is not null)) as n_back from time_entry where work_date between ? and ? group by user_id", (d0, d6))}
+        "count(*) filter (where status='Draft' and (reject_reason is not null or reopen_reason is not null)) as n_back from time_entry where work_date between ? and ? group by user_id", (d0, d6))}
 
     order = ["Submitted", "Partly submitted", "Draft only", "Not started"]
     counts = dict.fromkeys(order, 0)
@@ -313,7 +313,7 @@ def view_reopen(con, u, q, msgs=None, ok=False):
     if person is None:
         return layout(con, u, "Reopen timesheet", "".join(b))
     name = dict(people)[person]
-    wks = [r[0] for r in con.execute("select distinct date(work_date,'weekday 0','-6 days') as wk from time_entry where user_id=? and status<>'Draft' "
+    wks = [r[0] for r in con.execute("select distinct monday_of(work_date) as wk from time_entry where user_id=? and status<>'Draft' "
                                      "order by 1 desc limit 12", (person,))]
     b.append("<p><small>Weeks with submitted or approved hours: %s.</small></p>" % (
         ", ".join('<a href="/reopen?u=%d&amp;person=%d&amp;w=%s">%s</a>' % (u, person, wk, datetime.date.fromisoformat(wk).strftime("%d/%m/%Y")) for wk in wks) or "none"))
@@ -373,15 +373,15 @@ def reopen_week(con, form):
             con.execute("update time_entry set status='Draft', approved_by=NULL, approved_at=NULL, reject_reason=NULL, reopen_reason=?, "
                         "last_edited_by=?, last_edited_at=? where entry_id=?", (reason, u, stamp(), eid))
             n += 1
-        except sqlite3.DatabaseError as e:
-            msgs.append("Entry %d: %s" % (eid, e))
+        except pg.DatabaseError as e:
+            msgs.append("Entry %d: %s" % (eid, pg.error_text(e)))
     ok_msgs = []
     if n:
         who = con.execute("select name from app_user where user_id=?", (person,)).fetchone()[0]
         ok_msgs.append("%d entr%s reopened%s. They are drafts again, with your reason, for %s to correct and submit." % (
             n, "y" if n == 1 else "ies", "", who))
         if "reopen_period" in form:
-            con.execute("insert or ignore into period (week_start) values (?)", (d0,))
+            con.execute("insert into period (week_start) values (?) on conflict do nothing", (d0,))
             con.execute("update period set status='Open', closed_by=NULL, closed_at=NULL where week_start=?", (d0,))
             ok_msgs.append("The week commencing %s is open again." % w.strftime("%d/%m/%Y"))
     con.commit()

@@ -1,21 +1,20 @@
 """Schema tests. Run from the repo root: python -m unittest discover -s tests -v"""
 import os
-import sqlite3
 import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
-from build import build  # noqa: E402
+from pgtest import build  # noqa: E402   (a throwaway PostgreSQL database per test, with the seed)
+from nmc import pg  # noqa: E402
 
 NEW_ENTRY = (
     "INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by) "
-    "VALUES (?,?,?,?,?,?,?,?)"
+    "VALUES (?,?,?,?,?,?,?,?) RETURNING entry_id"
 )
 
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.con = build()  # in-memory, with seed data
+        self.con = build()  # a fresh database with the seed data
 
     def tearDown(self):
         self.con.close()
@@ -24,7 +23,7 @@ class Base(unittest.TestCase):
         return self.con.execute(sql, args).fetchone()[0]
 
     def blocked(self, sql, args=(), msg=None):
-        with self.assertRaises(sqlite3.DatabaseError) as cm:
+        with self.assertRaises(pg.DatabaseError) as cm:
             self.con.execute(sql, args)
         if msg:
             self.assertIn(msg, str(cm.exception))
@@ -148,8 +147,8 @@ class TestPeriods(Base):
         self.blocked(NEW_ENTRY, (5, 1, 1, 4, 4, "2026-12-01", 8, 5), "period is not open")
 
     def test_sunday_belongs_to_the_week_starting_the_previous_monday(self):
-        self.assertEqual(self.scalar("select date('2026-11-08','weekday 0','-6 days')"), "2026-11-02")
-        self.assertEqual(self.scalar("select date('2026-11-02','weekday 0','-6 days')"), "2026-11-02")
+        self.assertEqual(self.scalar("select monday_of('2026-11-08')"), "2026-11-02")
+        self.assertEqual(self.scalar("select monday_of('2026-11-02')"), "2026-11-02")
 
     def test_period_must_start_on_monday(self):
         self.blocked("INSERT INTO period (week_start) VALUES ('2026-11-03')")
@@ -320,7 +319,7 @@ class TestPermissionLevels(Base):
 
     def test_a_cost_controller_approves_hours_booked_by_the_only_approver_and_nothing_else(self):
         # Kenneth (8) is Spirit's main approver and its only one; he books to A1500 (scope 5, phase 6) at the Head of Projects rate 60
-        eid = self.con.execute(NEW_ENTRY, (8, 5, 6, 30, 60, "2026-11-04", 4, 8)).lastrowid
+        eid = self.con.execute(NEW_ENTRY, (8, 5, 6, 30, 60, "2026-11-04", 4, 8)).fetchone()[0]
         sql = "UPDATE time_entry SET status='Approved', approved_by=?, last_edited_by=?, last_edited_at='t1' WHERE entry_id=?"
         self.blocked(sql, (8, 8, eid), "Only an approver of the scope")        # never their own
         self.blocked(sql, (7, 7, eid), "Only an approver of the scope")        # another client's approver
@@ -332,7 +331,7 @@ class TestPermissionLevels(Base):
         self.blocked(sql, (29, 29, other), "Only an approver of the scope")
 
     def test_with_a_secondary_approver_the_controller_no_longer_approves_the_main_approvers_hours(self):
-        eid = self.con.execute(NEW_ENTRY, (8, 5, 6, 30, 60, "2026-11-04", 4, 8)).lastrowid
+        eid = self.con.execute(NEW_ENTRY, (8, 5, 6, 30, 60, "2026-11-04", 4, 8)).fetchone()[0]
         self.con.execute("INSERT INTO scope_approver (scope_id, user_id) VALUES (5, 6)")                   # Jamie Ireland is now a second approver of A1500
         sql = "UPDATE time_entry SET status='Approved', approved_by=?, last_edited_by=?, last_edited_at='t1' WHERE entry_id=?"
         self.blocked(sql, (29, 29, eid), "Only an approver of the scope")      # someone else can approve Kenneth's hours, so the controller does not
@@ -405,11 +404,11 @@ class TestOffshoreNights(Base):
         super().setUp()
         self.con.execute("UPDATE app_user SET employment_type='Staff' WHERE user_id=5")   # Ewan Shaw is a contractor in the seed
         for w in ("2026-11-09", "2026-11-16", "2026-11-23"):
-            self.con.execute("INSERT OR IGNORE INTO period (week_start) VALUES (?)", (w,))
+            self.con.execute("insert into period (week_start) values (?) on conflict do nothing", (w,))
 
     def off(self, date, user=5, phase=1, hours=8, loc=2, scope=1, role=4, rate=4):
         return self.con.execute("INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, status) "
-                                "VALUES (?,?,?,?,?,?,?,?,?,'Draft')", (user, scope, phase, role, rate, date, hours, user, loc)).lastrowid
+                                "VALUES (?,?,?,?,?,?,?,?,?,'Draft') RETURNING entry_id", (user, scope, phase, role, rate, date, hours, user, loc)).fetchone()[0]
 
     def nights(self, user=5):
         return [r[0] for r in self.con.execute("select work_date from v_offshore_night where user_id=? order by work_date", (user,))]
@@ -469,8 +468,8 @@ class TestOffshoreNights(Base):
         self.assertEqual([tuple(r) for r in self.con.execute("select allowance_id, amount, effective_from from allowance_rate")], [(1, 100, "2026-01-01")])
         self.blocked("UPDATE allowance_rate SET amount=1", msg="never edited")
         self.blocked("DELETE FROM allowance_rate", msg="never deleted")
-        self.blocked("INSERT INTO allowance_rate (allowance_id, amount, effective_from) VALUES (1,150,'2026-01-01')", msg="UNIQUE")
-        self.blocked("INSERT INTO allowance_rate (allowance_id, amount, effective_from) VALUES (1,-5,'2026-06-01')", msg="CHECK")
+        self.blocked("INSERT INTO allowance_rate (allowance_id, amount, effective_from) VALUES (1,150,'2026-01-01')", msg="unique constraint")
+        self.blocked("INSERT INTO allowance_rate (allowance_id, amount, effective_from) VALUES (1,-5,'2026-06-01')", msg="check constraint")
 
     def test_the_value_does_not_depend_on_overtime_or_how_many_hours(self):
         self.off("2026-11-09", hours=2)
@@ -483,7 +482,7 @@ class TestOffshoreNights(Base):
         self.assertEqual(self.nights(), ["2026-11-09"])
 
     def test_nothing_is_claimed_there_is_no_claims_table(self):
-        self.assertEqual(self.scalar("select count(*) from sqlite_master where name in ('allowance_entry','allowance_audit')"), 0)
+        self.assertEqual(self.scalar("select count(*) from information_schema.tables where table_schema='public' and table_name in ('allowance_entry','allowance_audit')"), 0)
 
 
 class TestCtrBudgets(Base):
@@ -491,8 +490,8 @@ class TestCtrBudgets(Base):
     def test_budgets_are_append_only_and_unique_per_date(self):
         self.blocked("UPDATE ctr_budget SET hours=1", msg="never edited")
         self.blocked("DELETE FROM ctr_budget", msg="never deleted")
-        self.blocked("INSERT INTO ctr_budget (phase_id, hours, as_of) VALUES (1, 5, '2026-11-06')", msg="UNIQUE")
-        self.blocked("INSERT INTO ctr_budget (phase_id, hours, as_of) VALUES (1, -5, '2026-12-01')", msg="CHECK")
+        self.blocked("INSERT INTO ctr_budget (phase_id, hours, as_of) VALUES (1, 5, '2026-11-06')", msg="unique constraint")
+        self.blocked("INSERT INTO ctr_budget (phase_id, hours, as_of) VALUES (1, -5, '2026-12-01')", msg="check constraint")
 
     def test_the_view_compares_the_latest_budget_with_approved_hours_only(self):
         row = self.con.execute("select budget_hours, actual_hours, pending_hours from v_ctr_budget where phase_id=1").fetchone()
@@ -511,9 +510,10 @@ class TestBuildExtras(unittest.TestCase):
             extra = os.path.join(d, "extra.sql")
             with open(extra, "w", encoding="utf-8") as f:
                 f.write("INSERT INTO scope (scope_code, client_id, project_id, description, status) VALUES ('X9999', 2, 3, 'Local scope', 'Open');")
-            con = build(None, extra=[extra])
-            self.assertEqual(con.execute("select count(*) from scope where scope_code='X9999'").fetchone()[0], 1)
-            self.assertEqual(build(None).execute("select count(*) from scope where scope_code='X9999'").fetchone()[0], 0)
+            with build(None, extra=[extra]) as con:
+                self.assertEqual(con.execute("select count(*) from scope where scope_code='X9999'").fetchone()[0], 1)
+            with build(None) as con:
+                self.assertEqual(con.execute("select count(*) from scope where scope_code='X9999'").fetchone()[0], 0)
 
 
 class TestRatesAreAppendOnly(Base):
@@ -555,10 +555,10 @@ class TestAuditTrailIsAppendOnly(Base):
 class TestPaymentTerms(Base):
     def test_only_a_lump_sum_ctr_carries_a_value(self):
         self.con.execute("UPDATE phase SET payment_terms='Lump Sum', lump_sum_value=5000 WHERE phase_id=1")
-        self.blocked("UPDATE phase SET payment_terms='Reimbursable' WHERE phase_id=1", msg="CHECK")        # the value must go first
-        self.blocked("UPDATE phase SET lump_sum_value=-1 WHERE phase_id=1", msg="CHECK")
+        self.blocked("UPDATE phase SET payment_terms='Reimbursable' WHERE phase_id=1", msg="check constraint")        # the value must go first
+        self.blocked("UPDATE phase SET lump_sum_value=-1 WHERE phase_id=1", msg="check constraint")
         self.con.execute("UPDATE phase SET payment_terms='Non-reimbursable', lump_sum_value=NULL WHERE phase_id=1")
-        self.blocked("UPDATE phase SET lump_sum_value=100 WHERE phase_id=1", msg="CHECK")
+        self.blocked("UPDATE phase SET lump_sum_value=100 WHERE phase_id=1", msg="check constraint")
 
 
 class TestRateForSkillCode(Base):
@@ -658,7 +658,7 @@ class TestReopen(Base):
 
     def test_a_cost_controller_cannot_reopen_their_own_hours(self):
         # Stephanie (29) books INT01  and cannot reopen it herself
-        mine = self.con.execute(NEW_ENTRY, (29, 7, 8, 32, None, "2026-11-04", 2, 29)).lastrowid  # role 32 = Commercial Lead
+        mine = self.con.execute(NEW_ENTRY, (29, 7, 8, 32, None, "2026-11-04", 2, 29)).fetchone()[0]  # role 32 = Commercial Lead
         self.blocked(self.REOPEN, ("Oops", 29, "t1", mine), "cannot reopen their own")
         self.con.execute(self.REOPEN, ("Oops", 1, "t2", mine))  # another cost controller (Emma Noble) can
 
@@ -676,7 +676,7 @@ class TestHourTypes(Base):
     def test_the_locations_are_seeded_and_new_entries_default_to_on_site_normal_time(self):
         self.assertEqual([tuple(r) for r in self.con.execute("select location_id, name, active from location order by location_id")],
                          [(1, "On Shore", 1), (2, "Offshore", 1), (3, "Site visit", 1)])
-        eid = self.con.execute(NEW_ENTRY, (5, 1, 1, 4, 4, "2026-11-06", 8, 5)).lastrowid
+        eid = self.con.execute(NEW_ENTRY, (5, 1, 1, 4, 4, "2026-11-06", 8, 5)).fetchone()[0]
         self.assertEqual(tuple(self.con.execute("select location_id, overtime from time_entry where entry_id=?", (eid,)).fetchone()), (1, 0))
 
     def test_the_seed_has_offshore_weeks_and_overtime_days(self):
@@ -752,7 +752,7 @@ class TestInternalHours(Base):
     def test_approved_internal_hours_are_not_in_the_client_ctr_or_period_report(self):
         ctr_before = self.scalar("select sum(hours) from v_ctr")
         period_before = self.scalar("select sum(hours) from v_period_report")
-        eid = self.book().lastrowid
+        eid = self.book().fetchone()[0]
         # approved by the internal client approver (31), who is not the owner
         self.con.execute("UPDATE time_entry SET status='Approved', approved_by=31, approved_at='2026-11-05 09:00', "
                          "last_edited_by=31, last_edited_at='2026-11-05 09:00' WHERE entry_id=?", (eid,))
@@ -800,7 +800,7 @@ class DemoHistory(unittest.TestCase):
         self.assertEqual(self.scalar("select count(*) from time_entry where %s and approved_by = user_id" % old), 0)
 
     def test_it_spans_every_month_staff_and_contractors_and_has_corrections_in_the_audit_trail(self):
-        months = [r[0] for r in self.con.execute("select distinct strftime('%Y-%m', work_date) from time_entry where work_date < '2026-10-26' order by 1")]
+        months = [r[0] for r in self.con.execute("select distinct substr(work_date, 1, 7) from time_entry where work_date < '2026-10-26' order by 1")]
         self.assertEqual(months, ["2026-08", "2026-09", "2026-10"])
         self.assertGreater(self.scalar("select count(*) from time_entry t join app_user p using(user_id) where p.employment_type='Contract' and work_date < '2026-10-26'"), 100)
         self.assertGreater(self.scalar("select count(*) from time_entry_audit where reason like 'Corrected after a query%'"), 5)

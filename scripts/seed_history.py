@@ -24,7 +24,7 @@ def derive_combos(con, combos, full_time, rnd):
     """Booking patterns for people the seed has no hours for (the company's people loaded from the tenant export): a billable role books to the
     open client scopes the client has a rate for (one or two of them), anything else books internal time. Approvers, cost controllers and the IT
     admin are left out: they do not book here, and nobody approves their own hours."""
-    skip = {r[0] for r in con.execute("select user_id from v_scope_approver")} | {r[0] for r in con.execute("select user_id from app_user where permission<>'user'")}
+    skip = {r[0] for r in con.execute("select user_id from v_scope_approver")} | {r[0] for r in con.execute("select user_id from app_user where permission<>'user' or books_time=0")}
     scopes = con.execute("select s.scope_id, s.client_id, (select min(phase_id) from phase p where p.scope_id=s.scope_id and p.status='Open') "
                          "from scope s join client c on c.client_id=s.client_id join project pr on pr.project_id=s.project_id "
                          "where c.is_internal=0 and s.status='Open' and pr.status='Open' order by s.scope_id").fetchall()
@@ -101,13 +101,13 @@ def add_history(con, first_monday=FIRST_MONDAY, weeks=WEEKS):
                 hours = 12 if offshore else rnd.choice((8, 8, 8, 8, 7.5)) if uid in full_time or rota is not None else rnd.choice((4, 6, 8))
                 if not offshore and rnd.random() < 0.12:                 # part of the day on internal time
                     iscope = rnd.choice((7, 8, 8))
-                    con.execute("insert into time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, location_id, overtime, created_by, created_at) "
-                                "values (?,?,?,?,NULL,?,?,1,0,?,?)", (uid, iscope, INTERNAL_PHASES[iscope], own_role[uid], iso, 4, uid, "%s 17:00:00" % iso))
-                    made.append((con.execute("select last_insert_rowid()").fetchone()[0], uid, iscope, iso))
+                    cur_i = con.execute("insert into time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, location_id, overtime, created_by, created_at) "
+                                "values (?,?,?,?,NULL,?,?,1,0,?,?) returning entry_id", (uid, iscope, INTERNAL_PHASES[iscope], own_role[uid], iso, 4, uid, "%s 17:00:00" % iso))
+                    made.append((cur_i.fetchone()[0], uid, iscope, iso))
                     hours = min(hours, 4)
                 cur = con.execute("insert into time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, location_id, overtime, created_by, created_at) "
-                                  "values (?,?,?,?,?,?,?,?,?,?,?)", (uid, scope, phase, role, rate, iso, hours, loc, ot, uid, "%s 17:00:00" % iso))
-                made.append((cur.lastrowid, uid, scope, iso))
+                                  "values (?,?,?,?,?,?,?,?,?,?,?) returning entry_id", (uid, scope, phase, role, rate, iso, hours, loc, ot, uid, "%s 17:00:00" % iso))
+                made.append((cur.fetchone()[0], uid, scope, iso))
         approved_day = (sunday + datetime.timedelta(days=2)).isoformat()      # approved on the Tuesday after the week
         for i, (eid, uid, scope, iso) in enumerate(made):
             who = INTERNAL_APPROVER if scope in INTERNAL_PHASES else approver[scope]

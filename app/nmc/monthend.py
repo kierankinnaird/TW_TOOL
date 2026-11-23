@@ -28,8 +28,8 @@ def month_people(con, first, last):
         "(select count(*) from v_offshore_night n where n.user_id=p.user_id and n.work_date between ? and ?) as nights "
         "from app_user p join role r on r.role_id=p.role_id "
         "left join time_entry t on t.user_id=p.user_id and t.work_date between ? and ? "
-        "where p.permission<>'admin' and p.start_date<=? and (p.end_date is null or p.end_date>=?) "
-        "group by p.user_id order by p.name", (first.isoformat(), last.isoformat(), first.isoformat(), last.isoformat(), last.isoformat(), first.isoformat())).fetchall()
+        "where p.permission<>'admin' and p.books_time=1 and p.start_date<=? and (p.end_date is null or p.end_date>=?) "
+        "group by p.user_id, r.role_id order by p.name", (first.isoformat(), last.isoformat(), first.isoformat(), last.isoformat(), last.isoformat(), first.isoformat())).fetchall()
     out = []
     for r in rows:
         state = ("No hours entered" if not r["total"] else "Not submitted (%s h in draft)" % fmt(r["draft"]) if r["draft"] else "Submitted")
@@ -46,7 +46,7 @@ def month_ctrs(con, first, last):
         "sum(t.hours * coalesce(rt.sales_rate, 0)) as value "
         "from time_entry t join phase ph on ph.phase_id=t.phase_id join scope s on s.scope_id=ph.scope_id join client c on c.client_id=s.client_id "
         "join role ro on ro.role_id=t.worked_role_id left join rate rt on rt.rate_id=t.rate_id "
-        "where t.work_date between ? and ? group by ph.phase_id, t.worked_role_id order by c.name, s.scope_code, ph.name, ro.skill_code",
+        "where t.work_date between ? and ? group by ph.phase_id, t.worked_role_id, c.client_id, s.scope_id, ro.role_id order by c.name, s.scope_code, ph.name, ro.skill_code",
         (first.isoformat(), last.isoformat())).fetchall()
 
 

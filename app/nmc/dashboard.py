@@ -160,10 +160,10 @@ def view_dashboard(con, u, q):
     else:
         b.append("<p>No budgets have been loaded yet. Load them from P6 on Admin, Budgets and the charts will fill in.</p>")
     # approved hours by week and client
-    per = con.execute("select date(t.work_date,'weekday 0','-6 days') as wk, c.name as client, sum(t.hours) as hrs "
+    per = con.execute("select monday_of(t.work_date) as wk, c.name as client, sum(t.hours) as hrs "
                       "from time_entry t join scope s on s.scope_id=t.scope_id join client c on c.client_id=s.client_id "
                       "where t.status='Approved' and c.is_internal=0 and (? is null or s.client_id=?) and (? is null or s.project_id=?) and (? is null or s.scope_id=?) "
-                      "and (? is null or t.phase_id=?) and date(t.work_date,'weekday 0','-6 days') between ? and ? group by wk, c.client_id order by wk",
+                      "and (? is null or t.phase_id=?) and monday_of(t.work_date) between ? and ? group by wk, c.client_id order by wk",
                       chosen + (d_from or "0000-01-01", d_to or "9999-12-31")).fetchall()
     b.append("<h4>Approved hours by week and client</h4>")
     if per:

@@ -1,4 +1,3 @@
-import sqlite3
 """Front-end smoke tests. Run from the repo root: python -m unittest discover -s tests -v"""
 import datetime
 import os
@@ -17,16 +16,16 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 sys.path.insert(0, os.path.join(ROOT, "app"))
-from build import build  # noqa: E402
+import pgtest  # noqa: E402
+from pgtest import build, clone  # noqa: E402   (a throwaway PostgreSQL database per test)
 import app  # noqa: E402
-from nmc import core  # noqa: E402
+from nmc import core, pg  # noqa: E402
 
 
 class TestApp(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        core.DB_PATH = os.path.join(self.tmp, "t.db")
-        build(core.DB_PATH).close()
+        core.DB_URL = clone()
         self.server = app.make_server(0)
         self.base = "http://127.0.0.1:%d" % self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -38,7 +37,7 @@ class TestApp(unittest.TestCase):
     def open_next_week(self):
         """The seeded week of 2 Nov is already submitted (so locked); tests that book new hours use the week after, opened here."""
         con = app.db()
-        con.execute("insert or ignore into period (week_start) values ('2026-11-09')")
+        con.execute("insert into period (week_start) values ('2026-11-09') on conflict do nothing")
         con.commit()
         con.close()
 
@@ -513,12 +512,12 @@ class TestApp(unittest.TestCase):
         self.assertLess(page.index("02/11/2026"), page.index("26/10/2026"))
         self.assertIn('href="/timesheet?u=5&amp;w=2026-11-02">Open</a>', page)
         by_month = page.split("<h4>By week</h4>")[0]
-        for month, hours in self.q_all("select strftime('%Y-%m', work_date), sum(hours) from time_entry where user_id=5 group by 1"):       # each month's hours are what he booked
+        for month, hours in self.q_all("select substr(work_date, 1, 7), sum(hours) from time_entry where user_id=5 group by 1"):       # each month's hours are what he booked
             self.assertIn("<td>%s</td>" % datetime.date.fromisoformat(month + "-01").strftime("%B %Y"), by_month)
             self.assertIn("<td>%s</td>" % app.fmt(hours), by_month)
         self.assertNotIn("Daniel Evans", page.split("<main>")[1])   # only my own weeks (the user switcher lists everyone)
         self.assertIn("Nothing booked yet", self.get("/history?u=28"))   # a new person has none (Jamie McNab books nothing in the seed)
-        self.assertIn("does not book time", self.get("/history?u=30"))
+        self.assertIn("does not write time", self.get("/history?u=30"))
 
     def test_an_approver_sees_everyones_hours_on_their_scopes_only(self):
         page, tree, rest = self.report_page(7)  # Alisdair Woodhead approves the Apache scopes
@@ -578,7 +577,8 @@ class TestApp(unittest.TestCase):
 
     def test_a_cost_controller_sees_everyone_and_how_far_each_has_got(self):
         page, rows = self.missing(29, w="2026-11-02", s="all")
-        self.assertEqual(len(rows), 30)  # everyone active that week except the IT admin's system account
+        self.assertEqual(len(rows), 29)  # everyone active that week except the IT admin's system account and the managing director, who does not write time
+        self.assertNotIn("Graeme Hogg", rows)
         self.assertEqual(rows["Ewan Shaw"][4], "Submitted")
         self.assertEqual(rows["David Hart"][4], "Not started")
         # Ajin Sabu: two entries submitted (16 hrs) and one sent back to draft (8 hrs)
@@ -1051,7 +1051,7 @@ class TestApp(unittest.TestCase):
     # ---------- month end inside a week (Paul): submit and lock the month, keep entering the new one ----------
     def test_a_month_end_inside_the_week_can_be_submitted_and_locked_on_its_own(self):
         con = app.db()
-        con.execute("insert or ignore into period (week_start) values ('2026-11-30')")
+        con.execute("insert into period (week_start) values ('2026-11-30') on conflict do nothing")
         con.commit()
         con.close()
         w = "2026-11-30"  # Monday 30 Nov is the last day of November; Tue 1 Dec starts the new month
@@ -1093,7 +1093,7 @@ class TestApp(unittest.TestCase):
         self.assertIn("not available", self.get("/monthend?u=5&m=2026-11").lower())
         # a week over the month end counts on each side by date: 30 Nov in November, 1 Dec in December
         con = app.db()
-        con.execute("insert or ignore into period (week_start) values ('2026-11-30')")
+        con.execute("insert into period (week_start) values ('2026-11-30') on conflict do nothing")
         con.commit()
         con.close()
         import re
@@ -1171,10 +1171,10 @@ class TestApp(unittest.TestCase):
 
     # ---------- schema version ----------
     def test_the_app_refuses_an_older_database_with_a_clear_message(self):
-        self.assertIsNone(app.schema_problem(core.DB_PATH))                         # the test database was just built
-        self.assertEqual(self.one("pragma user_version")[0], app.REQUIRED_SCHEMA)  # schema.sql and the app agree
-        old = os.path.join(self.tmp, "old.db")
-        con = sqlite3.connect(old)  # a database from before schema versions existed: user_version 0
+        self.assertIsNone(app.schema_problem(core.DB_URL))                          # the test database was just built
+        self.assertEqual(self.one("select version from schema_info")[0], app.REQUIRED_SCHEMA)  # schema.sql and the app agree
+        old = pgtest.empty()  # a database with no schema_info at all: version 0
+        con = pg.connect(old)
         con.execute("create table client (client_id integer primary key, name text)")
         con.commit()
         con.close()
@@ -1183,9 +1183,13 @@ class TestApp(unittest.TestCase):
         self.assertIn("python scripts/build.py", problem)
         # and starting the app on it stops with that message instead of failing page by page
         run = subprocess.run([sys.executable, os.path.join(ROOT, "app", "app.py"), "0"], capture_output=True, text=True,
-                             timeout=30, env=dict(os.environ, TW_DB=old))
+                             timeout=30, env=dict(os.environ, DATABASE_URL=old))
         self.assertNotEqual(run.returncode, 0)
         self.assertIn("older schema", run.stderr)
+
+    def test_the_app_says_so_when_it_cannot_reach_the_database(self):
+        problem = app.schema_problem("postgresql://nobody:x@127.0.0.1:1/none")
+        self.assertIn("Cannot reach the database", problem)
 
     # ---------- timestamps ----------
     def test_audit_and_periods_show_times_to_the_second_only(self):
@@ -1335,7 +1339,7 @@ class TestApp(unittest.TestCase):
 
     def test_there_is_no_paaf_tab(self):
         self.assertNotIn("PAAF", self.get("/admin?u=29"))
-        self.assertEqual(self.one("select count(*) from sqlite_master where name like '%paaf%'")[0], 0)
+        self.assertEqual(self.one("select count(*) from information_schema.tables where table_schema='public' and table_name like '%paaf%'")[0], 0)
 
     def test_new_rate_applies_from_its_date_and_old_hours_keep_old_price(self):
         self.open_next_week()
@@ -1832,6 +1836,7 @@ class TestApp(unittest.TestCase):
         rows = [["Pat New", "pat.new@nmcenergy.com", "BBBBBBBB-0000-0000-0000-000000000001", "False", "Lead Piping Engineer", "2024-01-01 10:00:00Z", "Microsoft 365"],
                 ["Sam Loose", "sam.loose@nmcenergy.com", "BBBBBBBB-0000-0000-0000-000000000002", "False", "Senior Electrical Engineer", "2026-09-02 10:00:00Z", "Microsoft 365"],
                 ["Chris Boss", "chris.boss@nmcenergy.com", "BBBBBBBB-0000-0000-0000-000000000003", "False", "Chief Executive Officer", "2020-01-01 10:00:00Z", "Microsoft 365"],
+                ["Dee Rector", "dee.rector@nmcenergy.com", "BBBBBBBB-0000-0000-0000-000000000006", "False", "Technical Director", "2020-01-01 10:00:00Z", "Microsoft 365"],
                 ["No Title", "no.title@nmcenergy.com", "BBBBBBBB-0000-0000-0000-000000000004", "False", "", "2026-06-01 10:00:00Z", "Microsoft 365"],
                 ["Odd Title", "odd.title@nmcenergy.com", "BBBBBBBB-0000-0000-0000-000000000005", "False", "Chief Biscuit Officer", "2026-06-01 10:00:00Z", "Microsoft 365"]]
         path = os.path.join(tempfile.mkdtemp(), "users.csv")
@@ -1844,23 +1849,129 @@ class TestApp(unittest.TestCase):
             before = con.execute("select count(*) from app_user").fetchone()[0]
             dry = load_users.load_users(con, path, apply=False)
             self.assertEqual(con.execute("select count(*) from app_user").fetchone()[0], before)            # a dry run writes nothing
-            self.assertEqual(dry["added"], ["Chris Boss", "Pat New", "Sam Loose"])
+            self.assertEqual(dry["added"], ["Chris Boss", "Dee Rector", "Pat New", "Sam Loose"])
             res = load_users.load_users(con, path)
-            self.assertEqual(res["added"], ["Chris Boss", "Pat New", "Sam Loose"])
+            self.assertEqual(res["added"], ["Chris Boss", "Dee Rector", "Pat New", "Sam Loose"])
             self.assertEqual(res["loose"], ["Sam Loose: Senior Electrical Engineer -> EL-01"])
             self.assertTrue(any("Odd Title" in x and "not mapped" in x for x in res["no_title"]) and "No Title" in res["no_title"])
             new = {r[0]: r[1:] for r in con.execute("select u.name, u.nmc_id, u.employment_type, u.permission, u.start_date, u.email, u.entra_object_id, r.skill_code "
                                                     "from app_user u join role r using(role_id) where u.user_id>?", (before,))}
-            self.assertEqual(new["Pat New"], ("A033", "Staff", "user", "2026-01-01", "pat.new@nmcenergy.com", "bbbbbbbb-0000-0000-0000-000000000001", "PI-01"))
+            self.assertEqual(new["Pat New"], ("A034", "Staff", "user", "2026-01-01", "pat.new@nmcenergy.com", "bbbbbbbb-0000-0000-0000-000000000001", "PI-01"))
             self.assertEqual(new["Sam Loose"][3], "2026-09-02")                                             # started after the year began: their account date
             self.assertEqual(new["Chris Boss"][-1], "BS-11")
+            self.assertEqual(con.execute("select name, books_time from app_user where user_id>? order by name", (before,)).fetchall(),
+                             [("Chris Boss", 0), ("Dee Rector", 0), ("Pat New", 1), ("Sam Loose", 1)])            # directors and the CEO do not write time
             self.assertEqual(con.execute("select count(*) from rate r join role ro using(role_id) where ro.skill_code='BS-11'").fetchone()[0], 0)   # no invented rates
             self.assertEqual(load_users.load_users(con, path)["added"], [])                                  # running it again adds nobody
             seed_history.add_history(con)
             booked = {r[0]: r[1] for r in con.execute("select u.name, count(*) from time_entry t join app_user u using(user_id) group by 1")}
             self.assertGreater(booked["Pat New"], 20)
-            self.assertGreater(booked["Chris Boss"], 0)
+            self.assertNotIn("Chris Boss", booked)                                                             # the CEO has no history: he does not write time
+            self.assertNotIn("Dee Rector", booked)
             self.assertEqual(con.execute("select count(*) from time_entry t join app_user u using(user_id) where u.name='Sam Loose' and t.work_date < '2026-09-02'").fetchone()[0], 0)
+        finally:
+            con.close()
+
+    def test_timesheet_history_is_a_month_calendar_of_hours_by_day(self):
+        page = self.get("/history?u=5&m=2026-11")                                 # the calendar is the default view
+        self.assertIn('<table class="cal">', page)
+        self.assertIn("<th>Mon</th><th>Tue</th><th>Wed</th><th>Thu</th><th>Fri</th><th>Sat</th><th>Sun</th><th>Week</th>", page)
+        mine = self.one("select coalesce(sum(hours),0) from time_entry where user_id=5 and work_date between '2026-11-01' and '2026-11-30'")[0]
+        approved = self.one("select coalesce(sum(hours),0) from time_entry where user_id=5 and status in ('Approved','Edited') and work_date between '2026-11-01' and '2026-11-30'")[0]
+        self.assertIn("%s hours booked in November, %s of them approved" % (app.fmt(mine), app.fmt(approved)), page)
+        # Ewan Shaw's Monday 2 Nov is approved and his Wednesday 4 Nov is still waiting; each day links to that week's timesheet
+        for day, state in (("2", "ok"), ("4", "sub")):
+            cell = re.search(r'<td class="([^"]*)"[^>]*><a href="/timesheet\?u=5&amp;w=2026-11-02"><i>%s</i><b>8</b>' % day, page)
+            self.assertTrue(cell, "Nov %s shows 8 hours" % day)
+            self.assertIn(state, cell.group(1).split())
+        self.assertIn('<td class="ok"', self.get("/history?u=5&m=2026-10"))      # last month's hours are approved
+        self.assertIn("&lt;&lt; Oct 2026", page)                                 # the months either side are one click away
+        self.assertIn("Nov 2026 &gt;&gt;", self.get("/history?u=5&m=2026-10"))
+        self.assertIn("November 2026", page)
+        self.assertIn("<h4>By week</h4>", self.get("/history?u=5&view=list"))     # the list of weeks is still there
+        self.assertNotIn("Download table as Excel", "")                           # (the calendar itself is not exported as a table)
+        self.assertIn("<i>1</i>", self.get("/history?u=5&m=not-a-month"))         # a bad month falls back to this month rather than failing
+        self.assertIn("Nothing booked yet", self.get("/history?u=28"))
+
+    def test_people_who_do_not_write_time_have_no_timesheet_and_are_never_chased(self):
+        self.assertEqual(self.one("select books_time from app_user where user_id=31")[0], 0)          # the managing director, from the seed
+        page = self.get("/timesheet?u=31")
+        self.assertIn("not set up to write time", page)
+        self.assertNotIn('href="/timesheet?u=31"', page)                                              # no My Timesheet or history in their menu
+        self.assertNotIn('href="/history?u=31', page)
+        self.assertIn('href="/approvals?u=31', page)                                                  # but they still approve what is theirs
+        self.assertIn("does not write time", self.get("/history?u=31"))
+        self.assertNotIn("Graeme Hogg", self.missing(29, w="2026-11-02", s="all")[1])
+        self.assertNotIn("Graeme Hogg", self.get("/monthend?u=29&m=2026-11").split("<h4>Still to chase")[1].split("<h4>Everyone")[0])
+        con = app.db()
+        try:
+            with self.assertRaises(pg.DatabaseError) as cm:                                      # and the database will not take hours for them
+                con.execute("insert into time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by) values (31,7,8,33,NULL,'2026-11-04',2,31)")
+            self.assertIn("does not write time", str(cm.exception))
+        finally:
+            con.close()
+
+    def test_admin_can_switch_a_person_to_not_writing_time_and_back(self):
+        uid = 5
+        save = {"t": "users", "id": uid, "name": "Ewan Shaw", "employment_type": "Contract", "role_id": "4", "permission": "user", "end_date": "", "line_manager_id": "", "email": ""}
+        self.assertIn("Writes time", self.get("/admin?u=%s&t=users" % self.IT_ADMIN))
+        self.admin_post("/admin/save", dict(save, books_time="0"))
+        self.assertEqual(self.one("select books_time from app_user where user_id=5")[0], 0)
+        self.assertNotIn("Ewan Shaw", self.missing(29, w="2026-11-02", s="all")[1])
+        self.assertIn("not set up to write time", self.get("/timesheet?u=5"))
+        self.admin_post("/admin/save", dict(save, books_time="1"))
+        self.assertIn("Ewan Shaw", self.missing(29, w="2026-11-02", s="all")[1])
+        self.assertNotIn("not set up to write time", self.get("/timesheet?u=5"))
+
+    def test_changes_to_people_are_recorded_with_who_made_them(self):
+        base = {"t": "users", "employment_type": "Staff", "role_id": "6", "permission": "user", "start_date": "2026-11-02", "end_date": "", "books_time": "1"}
+        self.admin_post("/admin/add", dict(base, nmc_id="A981", name="Audit Me", email="audit.me@nmcenergy.com"))
+        uid = self.one("select user_id from app_user where nmc_id='A981'")[0]
+        self.assertEqual(self.q_all("select changed_by, action, field, new_value from user_audit where user_id=?", uid), [(int(self.IT_ADMIN), "ADD", "Person", "Audit Me")])
+        save = {"t": "users", "id": uid, "name": "Audit Me", "employment_type": "Staff", "role_id": "6", "permission": "user", "end_date": "", "line_manager_id": "",
+                "email": "audit.me@nmcenergy.com", "books_time": "1"}
+        self.admin_post("/admin/save", dict(save))                                                      # nothing changed: nothing recorded
+        self.assertEqual(self.one("select count(*) from user_audit where user_id=?", uid)[0], 1)
+        self.admin_post("/admin/save", dict(save, permission="controller", books_time="0", email="new.address@nmcenergy.com", role_id="4", line_manager_id="7", end_date="2026-12-31"))
+        got = {r[0]: r[1:] for r in self.q_all("select field, old_value, new_value, changed_by from user_audit where user_id=? and action='CHANGE'", uid)}
+        self.assertEqual(got["Permission"], ("user", "controller", int(self.IT_ADMIN)))
+        self.assertEqual(got["Writes time"][:2], ("Yes", "No"))
+        self.assertEqual(got["Email"][:2], ("audit.me@nmcenergy.com", "new.address@nmcenergy.com"))
+        self.assertTrue(got["Role"][0].startswith("PM-06") and got["Role"][1].startswith("PM-04"))      # readable, not ids
+        self.assertEqual(got["Line manager"][:2], ("none", "Alisdair Woodhead"))
+        self.assertEqual(got["End date"][:2], ("none", "31/12/2026"))
+        page = self.get("/audit?u=%s" % self.IT_ADMIN)
+        self.assertIn("<h4>Changes to people</h4>", page)
+        self.assertIn("Audit Me", page.split("<h4>Changes to people</h4>")[1])
+        self.assertIn("Permission", page.split("<h4>Changes to people</h4>")[1])
+        self.assertIn("controller", self.get("/audit?u=29").split("<h4>Changes to people</h4>")[1])      # cost controllers can read it too
+        con = app.db()
+        try:
+            for sql in ("update user_audit set field='x'", "delete from user_audit"):
+                with self.assertRaises(pg.DatabaseError):                                           # append-only
+                    con.execute(sql)
+        finally:
+            con.close()
+        self.admin_post("/admin/save", dict(save, email="audit.me@nmcenergy.com"))
+        self.assertIsNone(self.one("select entra_object_id from app_user where user_id=?", uid)[0])
+
+    def test_the_demo_names_its_controllers_and_admins_and_records_it(self):
+        import load_users
+        self.assertEqual(load_users.CONTROLLERS, ("Abbi Murray", "Emma Noble", "Stephanie Apedaile", "Amanda Hogg"))
+        self.assertEqual(load_users.ADMINS, ("NMC Admin", "Kieran Kinnaird"))
+        con = build()
+        try:
+            con.execute("insert into app_user (nmc_id, employment_type, name, role_id, permission, start_date) values ('A990','Staff','Amanda Hogg',6,'user','2026-01-01')")
+            con.execute("insert into app_user (nmc_id, employment_type, name, role_id, permission, start_date) values ('A991','Staff','Kieran Kinnaird',6,'user','2026-01-01')")
+            out = {}
+            load_users.set_permissions(con, out)
+            self.assertEqual(sorted(out["permissions"]), ["Amanda Hogg: controller", "Kieran Kinnaird: admin"])
+            self.assertEqual(con.execute("select permission, books_time from app_user where name='Kieran Kinnaird'").fetchone(), ("admin", 0))   # an admin writes no time
+            self.assertEqual(con.execute("select permission, books_time from app_user where name='Amanda Hogg'").fetchone(), ("controller", 1))
+            self.assertEqual(con.execute("select count(*) from user_audit where changed_by is null and field='Permission'").fetchone()[0], 2)   # recorded, by the system
+            out = {}
+            load_users.set_permissions(con, out)
+            self.assertEqual(out, {})                                                                    # nothing left to change
         finally:
             con.close()
 
@@ -1869,10 +1980,12 @@ class TestApp(unittest.TestCase):
         try:
             for sql in ("update app_user set email='nobody' where user_id=1", "update app_user set email='a b@x.com' where user_id=1",
                         "update app_user set entra_object_id='too short' where user_id=1"):
-                with self.assertRaises(sqlite3.IntegrityError):
+                with self.assertRaises(pg.IntegrityError):
                     con.execute(sql)
-            con.execute("update app_user set email='One@X.com' where user_id=1")
-            with self.assertRaises(sqlite3.IntegrityError):                                                   # unique whatever the case
+            with self.assertRaises(pg.IntegrityError):                                                   # kept in lower case, so one address is one person
+                con.execute("update app_user set email='One@X.com' where user_id=1")
+            con.execute("update app_user set email='one@x.com' where user_id=1")
+            with self.assertRaises(pg.IntegrityError):                                                   # and unique
                 con.execute("update app_user set email='one@x.com' where user_id=2")
         finally:
             con.close()
@@ -1896,7 +2009,7 @@ class TestApp(unittest.TestCase):
         con = app.db()
         con.executemany("update app_user set employment_type='Staff' where user_id=?", [(x,) for x in users])
         # the demo has one allowance; these tests also need a few more kinds, which the system supports (they have no rate, so they are worth nothing)
-        con.execute("insert or ignore into allowance_type (allowance_id, name) values (2, 'Per Diem'), (3, 'Mob fee')")
+        con.execute("insert into allowance_type (allowance_id, name) values (2, 'Per Diem'), (3, 'Mob fee') on conflict do nothing")
         con.commit()
         con.close()
 
@@ -1949,7 +2062,7 @@ class TestApp(unittest.TestCase):
         self.staff(5)
         self.open_next_week()
         con = app.db()
-        con.execute("insert or ignore into period (week_start) values ('2026-11-16')")
+        con.execute("insert into period (week_start) values ('2026-11-16') on conflict do nothing")
         con.commit()
         con.close()
         self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Save draft", "h_1_4_2_0_2026-11-15": "8", "reason": ""})   # Sunday
@@ -2204,8 +2317,8 @@ class TestApp(unittest.TestCase):
             return [dict(r) for r in con.execute(
                 "select bu.name, t.user_id, sum(t.hours) as hrs, sum(case when t.status in ('Submitted','Edited') then t.hours else 0 end) as waiting "
                 "from time_entry t join scope s on s.scope_id=t.scope_id join app_user bu on bu.user_id=t.user_id "
-                "where exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=?) and t.user_id<>? and t.status<>'Draft' and t.work_date between ? and date(?, '+6 days') "
-                "group by t.user_id order by bu.name", (approver, approver, monday_iso, monday_iso))]
+                "where exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=?) and t.user_id<>? and t.status<>'Draft' and t.work_date between ? and to_char(?::date + 6, 'YYYY-MM-DD') "
+                "group by t.user_id, bu.name order by bu.name", (approver, approver, monday_iso, monday_iso))]
         finally:
             con.close()
 
@@ -2449,8 +2562,7 @@ class TestApp(unittest.TestCase):
         self.assertIn("No rows were found", self.admin_post("/admin/budgets", {"u": "30", "as_of": "2026-11-13", "data": "a\tb\tc\td\te\tf\tg\n"}, u="30"))
 
     def test_ctr_page(self):
-        con = sqlite3.connect(core.DB_PATH)
-        con.row_factory = sqlite3.Row
+        con = app.db()
         ph = con.execute("select phase_id from phase where name='Define' and scope_id=(select scope_id from scope where scope_code='BB0001')").fetchone()[0]
         fams = [r[0] for r in con.execute("select distinct r.family from time_entry t join rate rt on rt.rate_id=t.rate_id join role r on r.role_id=rt.role_id "
                                           "where t.phase_id=? and t.status<>'Draft'", (ph,))]

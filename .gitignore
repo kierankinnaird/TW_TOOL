@@ -1,5 +1,13 @@
-build/*.db
 __pycache__/
 *.pyc
-# Source documents (the SOR and similar) stay on this machine
+.vscode/
+.venv/
+venv/
+
+# Generated, and old SQLite copies from before the move to PostgreSQL: nothing in build/ is kept in git except the folder itself
+build/*
+!build/.gitkeep
+
+# Source documents (the SOR and similar) and the Microsoft 365 user exports stay on this machine
 docs/
+users_*.csv
