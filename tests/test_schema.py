@@ -195,19 +195,19 @@ class TestLifecycle(Base):
                          "last_edited_at='t2' WHERE entry_id=?", (eid,))
         self.assertEqual(self.scalar("select reason from time_entry_audit where entry_id=? and new_status='Draft'", eid), "No")
 
-    def test_only_the_named_scope_approver_can_approve(self):
-        eid = self.first("status='Submitted' and scope_id=1")  # scope 1 (Apache) approver = Alisdair Woodhead (7)
+    def test_only_the_persons_line_manager_can_approve(self):
+        eid = self.first("status='Submitted' and user_id in (select user_id from app_user where line_manager_id=7)")   # Alisdair Woodhead (7) manages them
         sql = "UPDATE time_entry SET status='Approved', approved_by=?, last_edited_by=?, last_edited_at='t1' WHERE entry_id=?"
-        self.blocked(sql, (5, 5, eid), "Only an approver of the scope")   # Ewan Shaw: not an approver
-        self.blocked(sql, (8, 8, eid), "Only an approver of the scope")   # Kenneth Nicolson approves the Spirit scopes, not this one
-        self.blocked(sql, (29, 29, eid), "Only an approver of the scope")  # the cost controller never approves
-        self.blocked(sql, (30, 30, eid), "Only an approver of the scope")  # nor does the IT admin
-        self.con.execute(sql, (7, 7, eid))                          # Alisdair: the named approver
+        self.blocked(sql, (5, 5, eid), "Only this person's approver")    # a colleague
+        self.blocked(sql, (8, 8, eid), "Only this person's approver")    # Kenneth Nicolson manages other people, not this one
+        self.blocked(sql, (29, 29, eid), "Only this person's approver")  # the cost controller approves only when nobody else can
+        self.blocked(sql, (30, 30, eid), "Only this person's approver")  # nor does the IT admin
+        self.con.execute(sql, (7, 7, eid))                               # their line manager
 
     def test_nobody_approves_their_own_entry(self):
         eid = self.scalar("select entry_id from time_entry where user_id=5 and status='Submitted' limit 1")
         self.blocked("UPDATE time_entry SET status='Approved', approved_by=5, last_edited_by=5, last_edited_at='t1' "
-                     "WHERE entry_id=?", (eid,), "not their own")
+                     "WHERE entry_id=?", (eid,), "never your own")
 
     def test_only_draft_entries_can_be_deleted(self):
         self.blocked("DELETE FROM time_entry WHERE status='Approved'", msg="Only Draft entries")
@@ -291,58 +291,60 @@ class TestPermissionLevels(Base):
         self.assertEqual(self.scalar("select count(*) from v_scope_approver va join app_user u on u.user_id=va.user_id where u.permission<>'user'"), 0)
         self.assertGreater(self.scalar("select count(*) from v_scope_approver"), 0)
 
-    def test_only_a_standard_user_can_be_named_as_an_approver(self):
-        self.blocked("UPDATE client SET approver_user_id=29 WHERE client_id=1", msg="standard user")        # the cost controller
-        self.blocked("UPDATE client SET approver_user_id=30 WHERE client_id=1", msg="standard user")        # the IT admin
-        self.blocked("INSERT INTO client (name, approver_user_id) VALUES ('Shell', 29)", msg="standard user")
-        self.blocked("INSERT INTO scope_approver (scope_id, user_id) VALUES (1, 29)", msg="standard user")
-        self.blocked("INSERT INTO scope_approver (scope_id, user_id) VALUES (1, 30)", msg="standard user")
-        self.con.execute("INSERT INTO scope_approver (scope_id, user_id) VALUES (1, 6)")                    # a standard user is fine
-        self.con.execute("INSERT INTO client (name, approver_user_id) VALUES ('Shell', 6)")
-
-    def test_a_scope_is_approved_by_its_clients_main_approver_and_its_secondary_approvers(self):
-        self.assertEqual({r[0] for r in self.con.execute("select user_id from v_scope_approver where scope_id=1")}, {7})
-        self.con.execute("INSERT INTO scope_approver (scope_id, user_id) VALUES (1, 6)")
-        self.assertEqual({r[0] for r in self.con.execute("select user_id from v_scope_approver where scope_id=1")}, {6, 7})
-        sql = "UPDATE time_entry SET status='Approved', approved_by=?, approved_at='t', last_edited_by=?, last_edited_at='t' WHERE entry_id=?"
-        eid = self.scalar("select entry_id from time_entry where status='Submitted' and scope_id=1 and user_id<>6 limit 1")
-        self.blocked(sql, (8, 8, eid), "Only an approver of the scope")        # Spirit's approver is not an approver here
-        self.con.execute(sql, (6, 6, eid))                                     # a secondary approver can approve
-        other = self.scalar("select entry_id from time_entry where status='Submitted' and scope_id=1 and user_id<>7 and status='Submitted' limit 1")
-        self.con.execute(sql, (7, 7, other))                                   # and so can the main approver
-        queue = {r[0] for r in self.con.execute("select distinct approver_user_id from v_approver_queue where entry_id in (select entry_id from time_entry where scope_id=1)")}
-        self.assertTrue(queue <= {6, 7})
+    def test_the_queue_shows_each_persons_waiting_hours_to_their_approver(self):
+        self.assertEqual({r[0] for r in self.con.execute("select distinct approver_user_id from v_approver_queue where entry_id in "
+                                                         "(select entry_id from time_entry where user_id=5)")}, {7})
+        self.con.execute("UPDATE app_user SET approver_id=8 WHERE user_id=5")
+        self.assertEqual({r[0] for r in self.con.execute("select distinct approver_user_id from v_approver_queue where entry_id in "
+                                                         "(select entry_id from time_entry where user_id=5)")}, {8})
 
     def test_the_approvers_can_book_to_the_client_they_approve(self):
         # Head of Projects (the approvers' job title) is priced on both rate cards, so Alisdair (Apache) and Kenneth (Spirit) can book
         self.assertEqual(self.scalar("select count(*) from rate r join role ro using(role_id) where ro.name='Head of Projects'"), 2)
 
-    def test_a_cost_controller_approves_hours_booked_by_the_only_approver_and_nothing_else(self):
-        # Kenneth (8) is Spirit's main approver and its only one; he books to A1500 (scope 5, phase 6) at the Head of Projects rate 60
-        eid = self.con.execute(NEW_ENTRY, (8, 5, 6, 30, 60, "2026-11-04", 4, 8)).fetchone()[0]
+    def test_a_cost_controller_approves_the_hours_of_someone_with_nobody_to_approve_for_them(self):
+        self.con.execute("UPDATE app_user SET line_manager_id=NULL WHERE user_id=9")                  # Daniel Evans: no line manager, no approver named
+        eid = self.con.execute(NEW_ENTRY, (9, 1, 1, 3, 3, "2026-11-04", 4, 9)).fetchone()[0]
         sql = "UPDATE time_entry SET status='Approved', approved_by=?, last_edited_by=?, last_edited_at='t1' WHERE entry_id=?"
-        self.blocked(sql, (8, 8, eid), "Only an approver of the scope")        # never their own
-        self.blocked(sql, (7, 7, eid), "Only an approver of the scope")        # another client's approver
-        self.blocked(sql, (30, 30, eid), "Only an approver of the scope")      # the admin never approves
-        self.con.execute(sql, (29, 29, eid))                                   # a cost controller does
+        self.blocked(sql, (9, 9, eid), "Only this person's approver")        # never their own
+        self.blocked(sql, (7, 7, eid), "Only this person's approver")        # his old line manager no longer is
+        self.blocked(sql, (30, 30, eid), "Only this person's approver")      # the admin never approves
+        self.con.execute(sql, (29, 29, eid))                                 # a cost controller does
         self.assertEqual(self.scalar("select approved_by from time_entry where entry_id=?", eid), 29)
-        # ...but a controller still cannot approve anyone else's hours (Ewan Shaw's on scope 1)
-        other = self.scalar("select entry_id from time_entry where status='Submitted' and scope_id=1 limit 1")
-        self.blocked(sql, (29, 29, other), "Only an approver of the scope")
+        # ...but a controller still cannot approve the hours of someone who has an approver
+        other = self.scalar("select entry_id from time_entry where status='Submitted' and user_id=5 limit 1")
+        self.blocked(sql, (29, 29, other), "Only this person's approver")
 
-    def test_with_a_secondary_approver_the_controller_no_longer_approves_the_main_approvers_hours(self):
-        eid = self.con.execute(NEW_ENTRY, (8, 5, 6, 30, 60, "2026-11-04", 4, 8)).fetchone()[0]
-        self.con.execute("INSERT INTO scope_approver (scope_id, user_id) VALUES (5, 6)")                   # Jamie Ireland is now a second approver of A1500
+    def test_an_approver_named_on_the_record_replaces_the_line_manager_for_approval(self):
+        eid = self.scalar("select entry_id from time_entry where user_id=5 and status='Submitted' limit 1")       # Ewan Shaw, managed by Alisdair (7)
         sql = "UPDATE time_entry SET status='Approved', approved_by=?, last_edited_by=?, last_edited_at='t1' WHERE entry_id=?"
-        self.blocked(sql, (29, 29, eid), "Only an approver of the scope")      # someone else can approve Kenneth's hours, so the controller does not
-        self.con.execute(sql, (6, 6, eid))
+        self.assertEqual(self.scalar("select approver_id from v_person_approver where user_id=5"), 7)
+        self.con.execute("UPDATE app_user SET approver_id=8 WHERE user_id=5")                                      # Kenneth makes more sense for Ewan's work
+        self.assertEqual(self.scalar("select approver_id from v_person_approver where user_id=5"), 8)
+        self.blocked(sql, (7, 7, eid), "Only this person's approver")                                              # the line manager no longer approves
+        self.con.execute(sql, (8, 8, eid))
+        self.con.execute("UPDATE app_user SET approver_id=NULL WHERE user_id=5")                                   # back to the line manager
+        self.assertEqual(self.scalar("select approver_id from v_person_approver where user_id=5"), 7)
 
-    def test_an_approver_cannot_be_made_a_controller_or_admin_while_still_named(self):
-        self.blocked("UPDATE app_user SET permission='controller' WHERE user_id=8", msg="Remove this person as an approver")
-        self.blocked("UPDATE app_user SET permission='admin' WHERE user_id=7", msg="Remove this person as an approver")
-        self.con.execute("UPDATE app_user SET permission='controller' WHERE user_id=5")  # Ewan Shaw approves nothing, so this is fine
-        self.con.execute("INSERT INTO scope_approver (scope_id, user_id) VALUES (1, 6)")
-        self.blocked("UPDATE app_user SET permission='controller' WHERE user_id=6", msg="Remove this person as an approver")
+    def test_a_person_cannot_be_their_own_approver_and_the_record_fields_are_checked(self):
+        self.blocked("UPDATE app_user SET approver_id=5 WHERE user_id=5", msg="check constraint")
+        self.blocked("UPDATE app_user SET employment_type='Contract' WHERE user_id=5", msg="check constraint")        # Staff, Contractor - LTD or Contractor - PAYE only
+        self.con.execute("UPDATE app_user SET employment_type='Contractor - PAYE' WHERE user_id=5")
+        self.blocked("UPDATE app_user SET hours_per_week=0 WHERE user_id=5", msg="check constraint")
+        self.blocked("UPDATE app_user SET hours_per_week=200 WHERE user_id=5", msg="check constraint")
+        self.blocked("UPDATE app_user SET default_location_id=99 WHERE user_id=5", msg="foreign key")
+        self.con.execute("UPDATE app_user SET default_location_id=2, hours_per_week=37.5 WHERE user_id=5")
+        self.assertEqual(self.scalar("select default_location_id from app_user where user_id=4"), 1)                  # everyone else starts On Shore, 40 hours
+        self.assertEqual(self.scalar("select hours_per_week from app_user where user_id=4"), 40)
+
+    def test_weekly_hours_are_there_to_work_overtime_out_from_later(self):
+        row = self.con.execute("select total_hours, submitted_hours, hours_per_week, hours_over_base from v_weekly_hours where user_id=5 and week_start='2026-11-02'").fetchone()
+        self.assertEqual(row[0], self.scalar("select sum(hours) from time_entry where user_id=5 and work_date between '2026-11-02' and '2026-11-08'"))
+        self.assertEqual(row[2], 40)
+        self.assertEqual(row[3], max(row[0] - 40, 0))
+        self.con.execute("UPDATE app_user SET hours_per_week=10 WHERE user_id=5")                                      # a part-timer: the same hours are now over base
+        again = self.con.execute("select hours_over_base from v_weekly_hours where user_id=5 and week_start='2026-11-02'").fetchone()[0]
+        self.assertEqual(again, row[0] - 10)
 
 
 class TestActiveDates(Base):
@@ -431,7 +433,7 @@ class TestOffshoreNights(Base):
         self.assertEqual(self.scalar("select count(*) from v_allowance_value where user_id=5 and work_date between '2026-11-09' and '2026-11-15'"), 3)
 
     def test_contractors_earn_no_allowance(self):
-        self.con.execute("UPDATE app_user SET employment_type='Contract' WHERE user_id=5")
+        self.con.execute("UPDATE app_user SET employment_type='Contractor - LTD' WHERE user_id=5")
         self.off("2026-11-09")
         self.off("2026-11-10")
         self.assertEqual(self.nights(), [])
@@ -726,7 +728,10 @@ class TestInternalHours(Base):
 
     def test_the_internal_client_and_its_codes_are_seeded_without_rates(self):
         self.assertEqual(self.scalar("select count(*) from client where is_internal=1"), 1)
-        self.assertEqual(self.scalar("select count(*) from scope s join client c using(client_id) where c.is_internal=1"), 3)
+        self.assertEqual(self.scalar("select count(*) from scope s join client c using(client_id) where c.is_internal=1"), 12)
+        self.assertEqual({r[0] for r in self.con.execute("select s.description from scope s join client c using(client_id) where c.is_internal=1")},
+                         {"Sick", "Compassionate", "Business Development / Strategy", "Executive Leadership", "Commercial / Business", "Training", "HSEQ",
+                          "Engineering", "Business Services", "Projects", "HR", "Other"})     # the company's list, without tender and bid support
         self.assertEqual(self.scalar("select count(*) from rate r join client c using(client_id) where c.is_internal=1"), 0)
 
     def test_anyone_can_book_internal_hours_with_no_rate(self):
@@ -753,9 +758,9 @@ class TestInternalHours(Base):
         ctr_before = self.scalar("select sum(hours) from v_ctr")
         period_before = self.scalar("select sum(hours) from v_period_report")
         eid = self.book().fetchone()[0]
-        # approved by the internal client approver (31), who is not the owner
-        self.con.execute("UPDATE time_entry SET status='Approved', approved_by=31, approved_at='2026-11-05 09:00', "
-                         "last_edited_by=31, last_edited_at='2026-11-05 09:00' WHERE entry_id=?", (eid,))
+        # approved by the person's line manager (Alisdair Woodhead, 7), who is not the owner
+        self.con.execute("UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-05 09:00', "
+                         "last_edited_by=7, last_edited_at='2026-11-05 09:00' WHERE entry_id=?", (eid,))
         self.assertEqual(self.scalar("select status from time_entry where entry_id=?", eid), "Approved")
         self.assertEqual(self.scalar("select sum(hours) from v_ctr"), ctr_before)
         self.assertEqual(self.scalar("select sum(hours) from v_period_report"), period_before)
@@ -802,7 +807,7 @@ class DemoHistory(unittest.TestCase):
     def test_it_spans_every_month_staff_and_contractors_and_has_corrections_in_the_audit_trail(self):
         months = [r[0] for r in self.con.execute("select distinct substr(work_date, 1, 7) from time_entry where work_date < '2026-10-26' order by 1")]
         self.assertEqual(months, ["2026-08", "2026-09", "2026-10"])
-        self.assertGreater(self.scalar("select count(*) from time_entry t join app_user p using(user_id) where p.employment_type='Contract' and work_date < '2026-10-26'"), 100)
+        self.assertGreater(self.scalar("select count(*) from time_entry t join app_user p using(user_id) where p.employment_type like 'Contractor%' and work_date < '2026-10-26'"), 100)
         self.assertGreater(self.scalar("select count(*) from time_entry_audit where reason like 'Corrected after a query%'"), 5)
         self.assertEqual(self.scalar("select count(*) from time_entry where work_date = '2026-08-03'"), 0)            # the bank holiday
 

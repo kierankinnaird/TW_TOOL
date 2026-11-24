@@ -14,4 +14,4 @@ EXPOSE 8000
 
 # The Flask object is flask_app inside app/app.py, hence --chdir app and app:flask_app.
 # Two workers with four threads each: every request opens its own database connection and closes it again, so they share nothing.
-CMD ["gunicorn", "--chdir", "app", "--bind", "0.0.0.0:8000", "--workers", "2", "--threads", "4", "--timeout", "120", "app:flask_app"]
+CMD ["gunicorn", "--chdir", "app", "--bind", "0.0.0.0:8000", "--workers", "2", "--threads", "4", "--timeout", "120", "--access-logfile", "-", "app:flask_app"]

@@ -17,14 +17,14 @@ BANK_HOLIDAYS = {"2026-08-03"}                   # Scottish summer bank holiday
 FULL_TIME = {1, 3, 5, 9, 10, 11, 13, 17, 18, 20, 21, 26}
 OFFSHORE_ROTA = {11: 0, 18: 2, 24: 1}            # user -> week offset in a four-week cycle: two weeks offshore, two weeks onshore
 INTERNAL_PHASES = {7: 8, 8: 9, 9: 10}            # internal scope -> its phase
-INTERNAL_APPROVER = 31
+COST_CONTROLLER = 29
 
 
 def derive_combos(con, combos, full_time, rnd):
     """Booking patterns for people the seed has no hours for (the company's people loaded from the tenant export): a billable role books to the
     open client scopes the client has a rate for (one or two of them), anything else books internal time. Approvers, cost controllers and the IT
     admin are left out: they do not book here, and nobody approves their own hours."""
-    skip = {r[0] for r in con.execute("select user_id from v_scope_approver")} | {r[0] for r in con.execute("select user_id from app_user where permission<>'user' or books_time=0")}
+    skip = {r[0] for r in con.execute("select user_id from app_user where permission<>'user' or books_time=0")}
     scopes = con.execute("select s.scope_id, s.client_id, (select min(phase_id) from phase p where p.scope_id=s.scope_id and p.status='Open') "
                          "from scope s join client c on c.client_id=s.client_id join project pr on pr.project_id=s.project_id "
                          "where c.is_internal=0 and s.status='Open' and pr.status='Open' order by s.scope_id").fetchall()
@@ -55,7 +55,7 @@ def add_history(con, first_monday=FIRST_MONDAY, weeks=WEEKS):
     for r in con.execute("select user_id, scope_id, phase_id, worked_role_id, rate_id, location_id, overtime, count(*) as n from time_entry "
                          "group by 1,2,3,4,5,6,7 order by user_id, n desc, scope_id"):
         combos.setdefault(r[0], []).append(r[1:])
-    approver = {r[0]: r[1] for r in con.execute("select scope_id, user_id from v_scope_approver")}
+    approver = {r[0]: r[1] for r in con.execute("select user_id, approver_id from v_person_approver")}      # each person's hours are approved by their approver (line manager)
     full_time = set(FULL_TIME)
     derived = derive_combos(con, combos, full_time, rnd)
     own_role = {r[0]: r[1] for r in con.execute("select user_id, role_id from app_user")}
@@ -110,7 +110,7 @@ def add_history(con, first_monday=FIRST_MONDAY, weeks=WEEKS):
                 made.append((cur.fetchone()[0], uid, scope, iso))
         approved_day = (sunday + datetime.timedelta(days=2)).isoformat()      # approved on the Tuesday after the week
         for i, (eid, uid, scope, iso) in enumerate(made):
-            who = INTERNAL_APPROVER if scope in INTERNAL_PHASES else approver[scope]
+            who = approver.get(uid) or COST_CONTROLLER                           # someone with nobody to approve for them: a cost controller
             at = "%s %02d:%02d:00" % (approved_day, 9 + i % 3, (i * 7) % 60)
             con.execute("update time_entry set status='Approved', approved_by=?, approved_at=?, last_edited_by=?, last_edited_at=? where entry_id=?", (who, at, who, at, eid))
             if i % 97 == 40 and scope not in INTERNAL_PHASES:                 # now and then a correction after approval

@@ -12,7 +12,7 @@ DB_URL = None   # the database to use; None means DATABASE_URL (see pg.database_
 
 
 # Databases built before this version lack columns and rules the app relies on. Matches the version in schema_info in db/schema.sql.
-REQUIRED_SCHEMA = 26
+REQUIRED_SCHEMA = 27
 
 
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
@@ -98,56 +98,52 @@ def permission_of(con, u):
     return me["permission"] if me else None
 
 
-# Who approves hours on a scope: the client's main approver and the scope's secondary approvers (view v_scope_approver).
-# SQL fragments for hours (entry t on scope s). "I may approve it" means: I am an approver of the
-# scope and it is not mine. A cost controller approves entries whose booker is the scope's only approver (nobody else could).
-def _may(alias):
-    return ("exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=?) and %s.user_id<>?" % alias)
+# Internal codes that are absence rather than work: they are shown by their own name, without "Internal - " in front.
+ABSENCE_CODES = ("Sick", "Compassionate")
 
 
-def _only_approver(alias):
-    return ("exists (select 1 from v_scope_approver va where va.scope_id=s.scope_id and va.user_id=%s.user_id) "
-            "and not exists (select 1 from v_scope_approver vb where vb.scope_id=s.scope_id and vb.user_id<>%s.user_id)" % (alias, alias))
-
-
+# Who approves whose hours: each person's whole timesheet goes to their approver if one is named on their record, otherwise to their line manager
+# (view v_person_approver). Someone with neither has no approver, and a cost controller approves their hours.
 def is_approver(con, u):
-    """Approver is not a permission: it means being a client's main approver or a secondary approver on at least one scope."""
-    return con.execute("select 1 from client where approver_user_id=? union all select 1 from scope_approver where user_id=? limit 1",
-                       (u, u)).fetchone() is not None
+    """Approver is not a permission: it means approving somebody's timesheet, as their line manager or as the approver named on their record."""
+    return con.execute("select 1 from v_person_approver where approver_id=? limit 1", (u,)).fetchone() is not None
+
+
+def has_team(con, u):
+    """Is this person a line manager, or the named approver, of anyone? (They can look at their people's timesheets.)"""
+    return con.execute("select 1 from app_user where line_manager_id=? or approver_id=? limit 1", (u, u)).fetchone() is not None
 
 
 def can_see_reports(con, u):
-    """Reports are for cost controllers and for approvers (their own scopes, hours only). A standard user has the timesheet and its history."""
-    return permission_of(con, u) == "controller" or is_approver(con, u)
+    """Reports are for cost controllers and for people with a team (hours only, their team's). A standard user has the timesheet and its history."""
+    return permission_of(con, u) == "controller" or has_team(con, u)
 
 
 def approval_queue(con, u):
-    """What this person approves, as SQL on time entries (t) and scopes (s) with its arguments, or None if they approve nothing.
-    An approver of a scope approves hours booked to it, but never their own. When the booker is the scope's only approver nobody else
-    could approve the hours, so a cost controller approves those."""
+    """What this person approves, as SQL on time entries (t) with its arguments, or None if they approve nothing: the hours of the people they approve
+    for, never their own. A cost controller also approves the hours of people who have nobody to approve for them."""
+    mine = "exists (select 1 from v_person_approver pa where pa.user_id=t.user_id and pa.approver_id=?)"
     if permission_of(con, u) == "controller":
-        return " and " + _only_approver("t"), ()
+        return " and (%s or not exists (select 1 from v_person_approver pn where pn.user_id=t.user_id)) and t.user_id<>?" % mine, (u, u)
     if is_approver(con, u):
-        return " and " + _may("t"), (u, u)
+        return " and %s and t.user_id<>?" % mine, (u, u)
     return None
 
 
 def may_action(con, u, eid):
-    """Can this person approve or reject this entry? An approver of its scope can (the database refuses their own hours);
-    a cost controller can, but only when the booker is the scope's only approver."""
+    """Can this person approve or reject this entry? Its person's approver can (the database refuses their own hours); a cost controller can when the
+    person has no approver."""
     q = approval_queue(con, u)
     if q is None:
         return False
-    return con.execute("select 1 from time_entry t join scope s on s.scope_id=t.scope_id where t.entry_id=?" + q[0], (eid,) + tuple(q[1])).fetchone() is not None
+    return con.execute("select 1 from time_entry t where t.entry_id=?" + q[0], (eid,) + tuple(q[1])).fetchone() is not None
 
 
 def pending_for(con, u):
     queue = approval_queue(con, u)
     if queue is None:
         return 0
-    n = con.execute("select count(*) from time_entry t join scope s on s.scope_id=t.scope_id "
-                    "where t.status in ('Submitted','Edited')" + queue[0], queue[1]).fetchone()[0]
-    return n
+    return con.execute("select count(*) from time_entry t where t.status in ('Submitted','Edited')" + queue[0], queue[1]).fetchone()[0]
 
 
 STYLE = """
@@ -198,6 +194,10 @@ table.ts td.bk b{font-weight:500}
 table.ts .sub{color:var(--grey-dark);font-size:.8rem}
 table.ts .chips{font-size:.8rem;color:var(--grey-dark)}
 table.ts .chips b{color:var(--orange);font-weight:500}
+table.ts .pill{display:inline-block;margin:.15rem .3rem 0 0;padding:0 .55rem;font-size:.75rem;line-height:1.5rem;border:1px solid var(--grey-light);background:var(--white);color:var(--ink);white-space:nowrap}
+table.ts .pill.ot{border-color:var(--orange);color:var(--orange)}
+.pick2{display:flex;flex-wrap:wrap;gap:.6rem 1.4rem;margin:.6rem 0}
+.pick2 label{display:flex;align-items:center;gap:.5rem;font-size:.85rem;color:var(--grey-dark)}
 table.ts .we{background:#f1f1f2}
 table.ts th.we{background:var(--ink)}
 table.ts td.c{width:4.2rem}
@@ -245,6 +245,39 @@ td.over{color:#b3261e}
 p.xl{margin:.3rem 0 .4rem}
 p.xl a{display:inline-block;padding:.2rem .7rem;font-size:.8rem;color:var(--grey-dark);border:1px solid var(--line);background:var(--white);text-decoration:none}
 p.xl a:hover{color:var(--orange);border-color:var(--orange)}
+.apnav{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem 1.2rem;margin:0 0 .5rem}
+.apnav form{margin:0;display:inline-flex;flex-wrap:wrap;align-items:center;gap:.4rem;font-size:.85rem;color:var(--grey-dark)}
+.apnav b{font-weight:500}
+.apsum{margin:.2rem 0 .7rem}
+table.ap{width:100%;margin:.2rem 0}
+table.ap th.dy,table.ap td.dy{text-align:center;width:3.6rem;padding-left:.2rem;padding-right:.2rem}
+table.ap td.zero{color:var(--grey-light)}
+table.ap .sub{display:block;font-size:.78rem;font-weight:400;color:var(--grey-dark)}
+table.ap td{vertical-align:top}
+table.ap tr.drow:hover td{background:#fafafa}
+table.ap tr.drow>td{background:#fafafa;padding:.2rem .6rem .8rem}
+table.ap tr.drow table{margin:0}
+.badge{display:inline-block;font-size:.75rem;padding:.05rem .5rem;border:1px solid var(--line);margin:0 .3rem .2rem 0;white-space:nowrap}
+.badge.wait{background:var(--tint);border-color:var(--orange)}
+.badge.done{color:var(--grey-dark)}
+.apact{position:sticky;bottom:0;background:var(--white);border-top:2px solid var(--black);padding:.6rem 0;display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1.6rem;margin-top:.6rem}
+.apact small{color:var(--grey-dark)}
+.scrollbox{max-height:27rem;overflow:auto;border:1px solid var(--line);margin:.3rem 0}
+.scrollbox table{margin:0;width:100%}
+.scrollbox th{position:sticky;top:0;z-index:1}
+p.pager{margin:.3rem 0 1rem}
+p.pager a,p.pager b{display:inline-block;min-width:1.6rem;text-align:center;padding:.1rem .3rem}
+p.pager b{background:var(--black);color:var(--white);font-weight:450}
+.picker{max-width:46rem}
+.pk-q{width:100%;max-width:22rem;margin:0 0 .5rem}
+.pk-chosen{display:flex;flex-wrap:wrap;gap:.3rem;margin:0 0 .5rem}
+.chip{font:inherit;font-size:.8rem;padding:.15rem .6rem;border:1px solid var(--orange);background:var(--tint);color:var(--ink);cursor:pointer}
+.chip:hover{background:var(--orange);color:var(--white)}
+.pk-none{font-size:.8rem;color:var(--grey-mid)}
+.pk-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(13rem,1fr));gap:.1rem .8rem;max-height:11rem;overflow:auto;border:1px solid var(--line);padding:.4rem .6rem;background:var(--white)}
+.pk-list label{display:flex;align-items:center;gap:.4rem;font-size:.85rem;padding:.1rem 0;cursor:pointer}
+.pk-list label[hidden]{display:none}
+.pk-list label:hover{color:var(--orange)}
 button[name=approve_person]{display:block;margin:.3rem 0 0;font:inherit;font-size:.78rem;padding:.15rem .6rem;border:1px solid rgba(30,30,36,.3);background:transparent;cursor:pointer;white-space:nowrap}
 button[name=approve_person]:hover{border-color:var(--orange);color:var(--orange)}
 .rgroup{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;margin:.3rem 0}
@@ -294,7 +327,7 @@ table.cal td.wt a{display:inline;padding:0;text-decoration:underline}
 
 
 NAV_KEY = {"My": "timesheet", "Timesheet": "history", "Approvals": "approvals", "Missing": "missing", "Reopen": "reopen", "Reports": "reports", "CTR": "reports",
-           "Admin": "admin", "Edit": "admin", "Audit": "audit", "Dashboard": "dashboard"}
+           "Admin": "admin", "Edit": "admin", "Audit": "audit", "Dashboard": "dashboard", "Team": "team"}
 
 
 # Long grey explanations (more than a couple of lines) fold away behind "What is this?", so a page leads with its figures. Nothing is removed.
@@ -319,7 +352,7 @@ if(f[i].tagName!=='INPUT'||!/^(hidden|submit|button|checkbox|radio)$/.test(f[i].
 function title(t){var e=t;while(e&&e!==main){var p=e.previousElementSibling;while(p){if(/^H[1-4]$/.test(p.tagName))return p.textContent.trim();p=p.previousElementSibling;}e=e.parentElement;}
 var h=main.querySelector('h1');return h?h.textContent.trim():'Table';}
 main.querySelectorAll('table').forEach(function(t){
-if(t.getAttribute('border')==='0'||t.classList.contains('ts')||t.classList.contains('cal')||t.querySelector('table')||t.rows.length<2||!t.querySelector('th')||t.rows[0].cells.length<2||editable(t))return;
+if(t.getAttribute('border')==='0'||t.classList.contains('ts')||t.classList.contains('cal')||t.classList.contains('ap')||t.querySelector('table')||t.rows.length<2||!t.querySelector('th')||t.rows[0].cells.length<2||editable(t))return;
 var panel=t.closest('.rpt');if(panel&&panel.querySelector('a[href*="/reports/export.xlsx"],a[href*="period.xlsx"]')&&panel.querySelectorAll('table').length===1)return;
 var name=title(t),p=document.createElement('p'),a=document.createElement('a');
 a.href='#';a.textContent='Download table as Excel';p.className='xl';p.appendChild(a);
@@ -348,7 +381,8 @@ def layout(con, u, title, body):
                                         ("history", "Timesheet history", "/history?u=%d" % u)]  # only people set up to write time have a timesheet (the shared IT account is not)
     if approval_queue(con, u) is not None:
         items.append(("approvals", "Approvals (%d)" % pending_for(con, u), "/approvals?u=%d" % u))
-    if perm == "controller" or is_approver(con, u):  # who has not completed a timesheet: everyone for cost controllers, their own people for approvers
+    if perm == "controller" or has_team(con, u):  # who has not completed a timesheet: everyone for cost controllers, their own people for line managers and approvers
+        items.append(("team", "My team", "/team?u=%d" % u))
         items.append(("missing", "Missing timesheets", "/missing?u=%d" % u))
     if perm == "controller":  # reopening a person's submitted or approved timesheet
         items.append(("reopen", "Reopen timesheet", "/reopen?u=%d" % u))
@@ -472,8 +506,33 @@ def opts_users(con):
 
 
 def opts_approvers(con):
-    """Only standard users can be named as an approver (cost controllers and admins never approve)."""
-    return [tuple(r) for r in con.execute("select user_id, name from app_user where permission='user' order by name")]
+    """Anyone can be a line manager or be named as someone's approver."""
+    return [tuple(r) for r in con.execute("select user_id, name from app_user order by name")]
+
+
+PICKER_JS = r"""<script>
+(function(){if(window.__pk)return;window.__pk=1;
+document.querySelectorAll('.picker').forEach(function(box){
+var list=box.querySelector('.pk-list'),labels=[].slice.call(list.children),chips=box.querySelector('.pk-chosen'),q=box.querySelector('.pk-q');
+q.hidden=false;chips.hidden=false;
+function nm(l){return l.textContent.trim();}
+function refresh(){chips.textContent='';var n=0,term=q.value.trim().toLowerCase();
+labels.forEach(function(l){var c=l.querySelector('input');
+if(c.checked){n++;var b=document.createElement('button');b.type='button';b.className='chip';b.title='Remove';b.textContent=nm(l)+' ×';b.onclick=function(){c.checked=false;refresh();};chips.appendChild(b);}
+l.hidden=c.checked||(term&&nm(l).toLowerCase().indexOf(term)<0);});
+if(!n){var e=document.createElement('span');e.className='pk-none';e.textContent=box.getAttribute('data-none')||'Nobody chosen';chips.appendChild(e);}}
+list.addEventListener('change',refresh);q.addEventListener('input',refresh);
+q.addEventListener('keydown',function(ev){if(ev.key==='Enter'){ev.preventDefault();var v=labels.filter(function(l){return !l.hidden;});if(v.length===1){v[0].querySelector('input').checked=true;q.value='';refresh();}}});
+refresh();});})();
+</script>"""
+
+
+def people_picker(name, people, chosen, none="Nobody chosen"):
+    """A list of people to tick (checkboxes posted under name). With scripting it becomes a search box: type to find someone, click to add them,
+    and the people chosen show above as buttons that remove them. Without scripting it is the plain list of tick boxes."""
+    boxes = "".join('<label><input type="checkbox" name="%s" value="%d"%s> %s</label>' % (name, pid, " checked" if pid in chosen else "", esc(pname)) for pid, pname in people)
+    return ('<div class="picker" data-none="%s"><input type="text" class="pk-q" placeholder="Search people to add" autocomplete="off" aria-label="Search people" hidden>'
+            '<div class="pk-chosen" hidden></div><div class="pk-list">%s</div></div>%s' % (esc(none), boxes, PICKER_JS))
 
 
 def need_date(value, label, required=True):
@@ -497,7 +556,8 @@ def need_text(value, label):
 
 
 USER_AUDIT_FIELDS = (("name", "Name"), ("email", "Email"), ("employment_type", "Employment"), ("role_id", "Role"), ("permission", "Permission"),
-                     ("start_date", "Start date"), ("end_date", "End date"), ("line_manager_id", "Line manager"), ("books_time", "Writes time"),
+                     ("start_date", "Start date"), ("end_date", "End date"), ("line_manager_id", "Line manager"), ("approver_id", "Approver"),
+                     ("default_location_id", "Default location"), ("hours_per_week", "Hours per week"), ("books_time", "Writes time"),
                      ("entra_object_id", "Microsoft account"))
 
 
@@ -508,9 +568,14 @@ def user_audit_text(con, field, value):
     if field == "role_id":
         r = con.execute("select skill_code || ' ' || name from role where role_id=?", (value,)).fetchone()
         return r[0] if r else str(value)
-    if field == "line_manager_id":
+    if field in ("line_manager_id", "approver_id"):
         r = con.execute("select name from app_user where user_id=?", (value,)).fetchone()
         return r[0] if r else str(value)
+    if field == "default_location_id":
+        r = con.execute("select name from location where location_id=?", (value,)).fetchone()
+        return r[0] if r else str(value)
+    if field == "hours_per_week":
+        return fmt(value)
     if field == "books_time":
         return "Yes" if value else "No"
     if field == "entra_object_id":
@@ -538,6 +603,24 @@ def audit_user_changes(con, actor, uid, old):
         if old[field] != new[field]:
             con.execute("insert into user_audit (user_id, changed_by, action, field, old_value, new_value) values (?,?,'CHANGE',?,?,?)",
                         (uid, actor, label, user_audit_text(con, field, old[field]), user_audit_text(con, field, new[field])))
+
+
+def need_choice(value, options, label):
+    """value when it is one of the options (value, label pairs), otherwise a message for the person."""
+    if value not in {o[0] for o in options}:
+        raise ValueError("Choose %s from the list." % label.lower())
+    return value
+
+
+def need_hours(value):
+    """Contracted hours a week: a number above 0 and up to 168."""
+    try:
+        h = float((value or "40").strip())
+    except ValueError:
+        raise ValueError("Hours per week must be a number.")
+    if not 0 < h <= 168:
+        raise ValueError("Hours per week must be more than 0 and at most 168.")
+    return h
 
 
 def need_email(value):

@@ -19,10 +19,12 @@ from nmc.timesheet import copy_week, save_timesheet, view_history, view_timeshee
 from nmc.monthend import month_bounds, month_sheet, view_monthend
 from nmc.approvals import act_approval, reopen_week, view_approvals, view_missing, view_reopen
 from nmc.reports import (
-    aaa_parse, aaa_sheet, ctr_sheet, grid_data, grid_sheet, manhour_data, manhour_sheet,
+    aaa_parse, aaa_sheet, weekly_sheet, ctr_sheet, grid_data, grid_sheet, manhour_data, manhour_sheet,
     period_sheet, report_sheet, report_view, view_ctr, view_grid,
     view_manhours, view_reports, xlsx_bytes)
 from nmc.dashboard import view_dashboard
+from nmc.team import view_person_timesheet, view_team
+from nmc.pdf import manhour_pdf
 from nmc.admin import act_allowance_rates, act_budgets, act_period, admin_add, admin_save, view_admin, view_admin_edit, view_audit
 from nmc import core, pg
 from nmc.core import REQUIRED_SCHEMA, db, fmt, monday  # noqa: F401  (kept importable from here: the tests and scripts use app.db, app.fmt and so on)
@@ -96,7 +98,8 @@ def security_headers(resp):
     lets the page load its own resources (the page's own inline style and script are the only inline code it has)."""
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
-    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    # same-origin, not no-referrer: Azure's sign-in layer refuses a form post that arrives with no Referer (it reads that as a forged request), and this still sends nothing to other sites
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
     resp.headers.setdefault("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
                             "img-src 'self' data:; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
     resp.headers.setdefault("Cache-Control", "no-store")
@@ -178,6 +181,8 @@ page("/admin/edit")(lambda con, u, q: view_admin_edit(con, u, q.get("t", [""])[0
 
 
 page("/audit")(lambda con, u, q: view_audit(con, u, q))
+page("/team")(lambda con, u, q: view_team(con, u, q))
+page("/team/timesheet")(lambda con, u, q: view_person_timesheet(con, u, q))
 
 
 @flask_app.route("/monthend.xlsx")
@@ -204,6 +209,21 @@ def aaa_download(con):
     return Response(xlsx_bytes(sheet, rows, (1, len(rows)) if len(rows) > 1 else (1,), title, sub),
                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": 'attachment; filename="aaa-consulting-%s-%s-to-%s.xlsx"' % (who, first.isoformat(), last.isoformat())})
+
+
+@flask_app.route("/reports/weekly.xlsx")
+@with_db
+def weekly_download(con):
+    """Each person's hours per week against their contracted hours. Cost controllers only: it covers everyone."""
+    q = query()
+    u = user_id(con, q)
+    if permission_of(con, u) != "controller":
+        return html_response(no_access(con, u, "Reports"), 403)
+    rows, sheet, title, sub = weekly_sheet(con, q)
+    first, last, _ = aaa_parse(q)
+    return Response(xlsx_bytes(sheet, rows, (1, len(rows)) if len(rows) > 1 else (1,), title, sub),
+                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="weekly-hours-%s-to-%s.xlsx"' % (first.isoformat(), last.isoformat())})
 
 
 @flask_app.route("/reports/export.xlsx")
@@ -257,6 +277,23 @@ def ctr_download(con):
     rows, sheet = got
     return Response(xlsx_bytes(sheet, rows, (1,)), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": 'attachment; filename="ctr-%s.xlsx"' % re.sub(r"[^A-Za-z0-9]+", "-", sheet).strip("-")})
+
+
+@flask_app.route("/reports/manhours.pdf")
+@with_db
+def manhours_pdf(con):
+    """The man-hour report for a client as a PDF with approval boxes, to sign or to send for signature."""
+    q = query()
+    u = user_id(con, q)
+    if not can_see_reports(con, u):
+        return html_response(no_access(con, u, "Reports"), 403)
+    data = manhour_data(con, u, q)
+    if data is None:
+        return html_response(no_access(con, u, "Reports"), 403)
+    me = con.execute("select name from app_user where user_id=?", (u,)).fetchone()
+    name = "%s-%s-to-%s" % (re.sub(r"[^A-Za-z0-9]+", "-", data["client"]).strip("-"), data["from"], data["to"])
+    return Response(manhour_pdf(data, me[0] if me else ""), mimetype="application/pdf",
+                    headers={"Content-Disposition": 'attachment; filename="manhours-%s.pdf"' % name})
 
 
 @flask_app.route("/reports/grid.xlsx")

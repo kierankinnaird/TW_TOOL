@@ -107,12 +107,16 @@ INSERT INTO rate (rate_id, client_id, role_id, sales_rate) VALUES
  (59,1,30,114.00),
  (60,2,30,120.00);
 
+-- Hour types: where hours are worked. A person's default location (On Shore unless set) is where new timesheet rows start.
+-- The choices are On Shore, Offshore and Site visit; the IT admin can add more on the Locations tab.
+INSERT INTO location (location_id, name, earns_allowance) VALUES (1,'On Shore',0),(2,'Offshore',1),(3,'Site visit',0);
+
 INSERT INTO app_user (user_id, nmc_id, employment_type, name, role_id, permission, start_date, end_date) VALUES
  (1, 'A001','Staff',   'Emma Noble',        6,'controller','2026-01-01',NULL),
  (2, 'A002','Staff',   'Abbi Murray',       6,'controller','2026-01-01',NULL),
- (3, 'A003','Contract','Stuart Sherwood',   5,'user', '2026-01-01',NULL),
+ (3, 'A003','Contractor - LTD','Stuart Sherwood',   5,'user', '2026-01-01',NULL),
  (4, 'A004','Staff',   'David Hart',        4,'user', '2026-01-01',NULL),
- (5, 'A005','Contract','Ewan Shaw',         4,'user', '2026-03-01',NULL),
+ (5, 'A005','Contractor - LTD','Ewan Shaw',         4,'user', '2026-03-01',NULL),
  (6, 'A006','Staff',   'Jamie Ireland',     1,'user', '2026-01-01',NULL),
  (7, 'A007','Staff',   'Alisdair Woodhead', 2,'user', '2026-01-01',NULL),
  (8, 'A008','Staff',   'Kenneth Nicolson',  30,'user','2026-01-01',NULL),
@@ -120,20 +124,20 @@ INSERT INTO app_user (user_id, nmc_id, employment_type, name, role_id, permissio
  (10,'A010','Staff',   'Ajin Sabu',         4,'user', '2026-02-01',NULL),
  (11,'A011','Staff','Louis Ducharme',7,'user','2026-01-01',NULL),
  (12,'A012','Staff','Gary Martin',15,'user','2026-01-01',NULL),
- (13,'A013','Contract','Ken Smart',16,'user','2026-01-01',NULL),
+ (13,'A013','Contractor - LTD','Ken Smart',16,'user','2026-01-01',NULL),
  (14,'A014','Staff','Andy Gray',17,'user','2026-01-01',NULL),
  (15,'A015','Staff','Peter McConnachie',19,'user','2026-01-01',NULL),
  (16,'A016','Staff','Craig Mahoney',18,'user','2026-01-01',NULL),
- (17,'A017','Contract','Barry Philp',20,'user','2026-01-01',NULL),
+ (17,'A017','Contractor - LTD','Barry Philp',20,'user','2026-01-01',NULL),
  (18,'A018','Staff','Lloyd Quinn',21,'user','2026-01-01',NULL),
  (19,'A019','Staff','Janis Watt',23,'user','2026-01-01',NULL),
- (20,'A020','Contract','Gary Davidson',22,'user','2026-01-01',NULL),
+ (20,'A020','Contractor - LTD','Gary Davidson',22,'user','2026-01-01',NULL),
  (21,'A021','Staff','Neil Pennock',11,'user','2026-01-01',NULL),
  (22,'A022','Staff','Jason Pang',13,'user','2026-01-01',NULL),
  (23,'A023','Staff','Arlene Chalmers',10,'user','2026-01-01',NULL),
  (24,'A024','Staff','Rob Millman',24,'user','2026-01-01',NULL),
  (25,'A025','Staff','Gary Bridge',9,'user','2026-01-01',NULL),
- (26,'A026','Contract','Greig McAndrew',8,'user','2026-01-01',NULL),
+ (26,'A026','Contractor - LTD','Greig McAndrew',8,'user','2026-01-01',NULL),
  (27,'A027','Staff','Jai Hart',10,'user','2026-01-01',NULL),
  (28,'A028','Staff','Jamie McNab',25,'user','2026-01-01',NULL),
  -- Permission levels. Cost controllers manage codes, scopes and rates and see all reports with values; they do not have to be
@@ -144,12 +148,12 @@ INSERT INTO app_user (user_id, nmc_id, employment_type, name, role_id, permissio
  -- The managing director approves the overhead (internal) time, and can delegate it by naming secondary approvers on the internal codes.
  (31,'A031','Staff','Graeme Hogg',33,'user','2026-01-01',NULL);
 
--- Approvers: each client has a main approver. Secondary approvers on a scope (scope_approver) are added in Admin when a scope needs more
--- than one person. Alisdair Woodhead is the Apache and Internal main approver and Kenneth Nicolson the Spirit one (both standard users).
-UPDATE client SET approver_user_id = 7 WHERE client_id = 1;
+-- Line managers. A person's timesheet is approved by their line manager (or by the approver named on their record, see app_user.approver_id).
+-- Graeme Hogg (managing director) manages the heads and the commercial team; Alisdair Woodhead and Kenneth Nicolson manage the engineers and planners.
+UPDATE app_user SET line_manager_id = 31 WHERE user_id IN (1, 2, 6, 7, 8, 29);
+UPDATE app_user SET line_manager_id = 7 WHERE user_id IN (3, 4, 5, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
+UPDATE app_user SET line_manager_id = 8 WHERE user_id = 10;
 UPDATE app_user SET books_time = 0 WHERE user_id IN (30, 31);   -- the IT admin account and the managing director do not write time
-UPDATE client SET approver_user_id = 31 WHERE client_id = 3;   -- the Internal client: Graeme Hogg, managing director
-UPDATE client SET approver_user_id = 8 WHERE client_id = 2;
 
 INSERT INTO project (project_id, project_code, name, client_id) VALUES
  (1,'APJ-01','Wellbay Decommissioning',1),
@@ -167,16 +171,22 @@ INSERT INTO scope (scope_id, scope_code, client_id, project_id, description, sta
  -- Internal codes (no rate)
  (7,'INT01',3,4,'Business Services',   'Open'),
  (8,'INT02',3,4,'Training',            'Open'),
- (9,'INT03',3,4,'Business Development','Open');
+ (9,'INT03',3,4,'Business Development / Strategy','Open'),
+ (10,'INT04',3,4,'Sick',                'Open'),
+ (11,'INT05',3,4,'Compassionate',       'Open'),
+ (12,'INT06',3,4,'Executive Leadership','Open'),
+ (13,'INT07',3,4,'Commercial / Business','Open'),
+ (14,'INT08',3,4,'HSEQ',                'Open'),
+ (15,'INT09',3,4,'Engineering',         'Open'),
+ (16,'INT10',3,4,'Projects',            'Open'),
+ (17,'INT11',3,4,'HR',                  'Open'),
+ (18,'INT12',3,4,'Other',               'Open');
 
 -- Phases. Hours are booked to a phase. Every scope has at least one.
 INSERT INTO phase (phase_id, scope_id, name) VALUES
  (1,1,'Define'),(2,1,'Execute'),(3,2,'Define'),(4,3,'Define'),(5,4,'Define'),(6,5,'Define'),(7,6,'Define'),
- (8,7,'General'),(9,8,'General'),(10,9,'General');
-
--- Hour types: where hours are worked. Entries default to location 1 (On Shore) and normal time; overtime is a flag on the entry.
--- The choices are On Shore, Offshore and Site visit; the IT admin can add more on the Locations tab.
-INSERT INTO location (location_id, name, earns_allowance) VALUES (1,'On Shore',0),(2,'Offshore',1),(3,'Site visit',0);
+ (8,7,'General'),(9,8,'General'),(10,9,'General'),(11,10,'General'),(12,11,'General'),(13,12,'General'),(14,13,'General'),(15,14,'General'),
+ (16,15,'General'),(17,16,'General'),(18,17,'General'),(19,18,'General');
 
 -- Weekly periods: week of 26 Oct (to be closed later) and week of 2 Nov.
 INSERT INTO period (week_start) VALUES ('2026-10-26'),('2026-11-02');
@@ -251,19 +261,19 @@ INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, wo
 
 -- Approvals are edits, so they name who did it (and are written to time_entry_audit).
 -- Week of 26 Oct: approved by each scope's approver.
-UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-02 09:00',
-       last_edited_by=7, last_edited_at='2026-11-02 09:00' WHERE scope_id=1 AND work_date < '2026-11-02';
-UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-02 09:05',
-       last_edited_by=7, last_edited_at='2026-11-02 09:05' WHERE scope_id=2 AND work_date < '2026-11-02';
-UPDATE time_entry SET status='Approved', approved_by=8, approved_at='2026-11-02 09:10',
-       last_edited_by=8, last_edited_at='2026-11-02 09:10' WHERE scope_id=5 AND work_date < '2026-11-02';
+UPDATE time_entry SET status='Approved', approved_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), approved_at='2026-11-02 09:00',
+       last_edited_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), last_edited_at='2026-11-02 09:00' WHERE scope_id=1 AND work_date < '2026-11-02';
+UPDATE time_entry SET status='Approved', approved_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), approved_at='2026-11-02 09:05',
+       last_edited_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), last_edited_at='2026-11-02 09:05' WHERE scope_id=2 AND work_date < '2026-11-02';
+UPDATE time_entry SET status='Approved', approved_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), approved_at='2026-11-02 09:10',
+       last_edited_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), last_edited_at='2026-11-02 09:10' WHERE scope_id=5 AND work_date < '2026-11-02';
 
 -- Week of 2 Nov: partly approved.
-UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-06 09:00',
-       last_edited_by=7, last_edited_at='2026-11-06 09:00'
+UPDATE time_entry SET status='Approved', approved_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), approved_at='2026-11-06 09:00',
+       last_edited_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), last_edited_at='2026-11-06 09:00'
  WHERE scope_id=1 AND work_date IN ('2026-11-02','2026-11-03');
-UPDATE time_entry SET status='Approved', approved_by=8, approved_at='2026-11-06 09:15',
-       last_edited_by=8, last_edited_at='2026-11-06 09:15'
+UPDATE time_entry SET status='Approved', approved_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), approved_at='2026-11-06 09:15',
+       last_edited_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), last_edited_at='2026-11-06 09:15'
  WHERE scope_id=5 AND work_date >= '2026-11-02';
 
 -- Close the week of 26 Oct.
@@ -274,8 +284,8 @@ UPDATE time_entry SET hours=7.5, status='Edited', edit_count=edit_count+1,
        last_change_reason='Hours corrected after Apache query on 27 Oct',
        last_edited_by=7, last_edited_at='2026-11-04 10:00'
  WHERE user_id=5 AND work_date='2026-10-27';
-UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-04 14:00',
-       last_edited_by=7, last_edited_at='2026-11-04 14:00'
+UPDATE time_entry SET status='Approved', approved_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), approved_at='2026-11-04 14:00',
+       last_edited_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), last_edited_at='2026-11-04 14:00'
  WHERE user_id=5 AND work_date='2026-10-27';
 
 -- Owner corrects an approved entry this week: now Edited, waiting for re-approval.
@@ -328,14 +338,9 @@ INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, wo
  (18,1,1,21,27,'2026-11-04',8,18,2,0),
  (18,1,1,21,27,'2026-11-05',8,18,2,0),
  (18,1,1,21,27,'2026-11-06',8,18,2,0);
-UPDATE time_entry SET status='Approved', approved_by=7, approved_at='2026-11-05 10:00', last_edited_by=7, last_edited_at='2026-11-05 10:00'
+UPDATE time_entry SET status='Approved', approved_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), approved_at='2026-11-05 10:00', last_edited_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), last_edited_at='2026-11-05 10:00'
  WHERE user_id=11 AND scope_id=2 AND status='Submitted' AND work_date BETWEEN '2026-11-02' AND '2026-11-04';
 
--- Line managers. Graeme Hogg (managing director) manages the heads and the commercial team; Alisdair Woodhead and Kenneth Nicolson manage
--- the engineers and planners of their clients; the IT admin has none.
-UPDATE app_user SET line_manager_id = 31 WHERE user_id IN (1, 2, 6, 7, 8, 29);
-UPDATE app_user SET line_manager_id = 7 WHERE user_id IN (3, 4, 5, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
-UPDATE app_user SET line_manager_id = 8 WHERE user_id = 10;
 
 -- Budget hours per CTR, as loaded from P6 on 6 Nov 2026 (hours only). BB0002 Define is at 90% of its budget and A1500 is over.
 INSERT INTO ctr_budget (phase_id, hours, as_of, loaded_by) VALUES

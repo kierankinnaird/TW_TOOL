@@ -7,8 +7,8 @@ from nmc import pg
 from nmc.core import (
     date_input, dmy, edit_link, esc, fmt,
     fmt_time, hidden, layout, msgs_html,
-    audit_user_added, audit_user_changes, need_date, need_email, need_text, no_access, opts_approvers,
-    opts_clients, opts_projects, opts_roles, opts_scopes,
+    audit_user_added, audit_user_changes, need_choice, need_date, need_email, need_hours, need_text, no_access,
+    locations, opts_clients, opts_projects, opts_roles, opts_scopes, people_picker,
     opts_users, permission_of, sel,
     stamp, table, txt)
 
@@ -47,6 +47,7 @@ def payment_terms(g):
 
 
 BOOKS_TIME_OPTIONS = [("1", "Yes"), ("0", "No (a director, for example: no timesheet, never chased)")]
+EMPLOYMENT_OPTIONS = [("Staff", "Staff"), ("Contractor - LTD", "Contractor - LTD"), ("Contractor - PAYE", "Contractor - PAYE")]
 PERMISSION_OPTIONS = [("user", "user"), ("controller", "controller (cost controller)"), ("admin", "admin (IT)")]
 
 
@@ -84,20 +85,25 @@ def admin_body(con, u, t, q=None):
         b.append('<form method="get" action="/admin">%s<p>Find a person (name, email or NMC ID) <input type="text" name="f_q" size="20" value="%s"> '
                  '<input type="submit" value="Search"> <input type="button" value="Clear" onclick="location.href=\'/admin?u=%d&amp;t=users\'"></p></form>' % (
                      hidden(u=u, t="users"), esc(needle), u))
-        rows = [[r["nmc_id"], r["name"], r["email"] or "", r["employment_type"], r["skill_code"] + " " + r["role"], r["manager"] or "", r["permission"], "Yes" if r["books_time"] else "No", dmy(r["start_date"]),
+        rows = [[r["nmc_id"], r["name"], r["email"] or "", r["employment_type"], r["skill_code"] + " " + r["role"], r["manager"] or "", r["approver"] or "", r["permission"], "Yes" if r["books_time"] else "No", dmy(r["start_date"]),
                  dmy(r["end_date"]), edit_link(u, "users", r["user_id"])]
-                for r in con.execute("select u.*, r.skill_code, r.name as role, m.name as manager from app_user u join role r on r.role_id=u.role_id "
-                                     "left join app_user m on m.user_id=u.line_manager_id "
+                for r in con.execute("select u.*, r.skill_code, r.name as role, m.name as manager, ap.name as approver from app_user u join role r on r.role_id=u.role_id "
+                                     "left join app_user m on m.user_id=u.line_manager_id left join app_user ap on ap.user_id=u.approver_id "
                                      "where (? = '' or u.name ilike '%' || ? || '%' or u.nmc_id ilike '%' || ? || '%' or u.email ilike '%' || ? || '%') order by u.nmc_id", (needle, needle, needle, needle))]
-        b.append(table(["NMC ID", "Name", "Email", "Employment", "Role", "Line manager", "Permission", "Writes time", "Start", "End", ""], rows, raw_cols=(10,)))
+        b.append(table(["NMC ID", "Name", "Email", "Employment", "Role", "Line manager", "Approver", "Permission", "Writes time", "Start", "End", ""], rows, raw_cols=(11,)))
+        b.append("<p><small>A person's timesheet is approved by their line manager. Name an Approver only when someone else makes more sense (a manager who works on a different client, say): "
+                 "an empty Approver means the line manager.</small></p>")
         b.append('<h4>Add a user</h4><form method="post" action="/admin/add">%s<table border="0" cellpadding="2">'
                  "<tr><td>NMC ID</td><td>%s</td></tr><tr><td>Name</td><td>%s</td></tr><tr><td>Work email (the Microsoft account they sign in with)</td><td>%s</td></tr>"
                  "<tr><td>Employment</td><td>%s</td></tr><tr><td>Role</td><td>%s</td></tr><tr><td>Line manager</td><td>%s</td></tr>"
+                 "<tr><td>Approver (only if not the line manager)</td><td>%s</td></tr>"
+                 "<tr><td>Default location</td><td>%s</td></tr><tr><td>Hours per week</td><td>%s</td></tr>"
                  "<tr><td>Permission</td><td>%s</td></tr><tr><td>Writes time</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr>"
                  "<tr><td>End date (optional)</td><td>%s</td></tr></table><input type=\"submit\" value=\"Add user\"></form>"
                  % (hidden(u=u, t="users"), txt("nmc_id", "", 8), txt("name", "", 30), txt("email", "", 34),
-                    sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")]), sel("role_id", opts_roles(con)),
-                    sel("line_manager_id", opts_users(con), None, True, "None"),
+                    sel("employment_type", EMPLOYMENT_OPTIONS), sel("role_id", opts_roles(con)),
+                    sel("line_manager_id", opts_users(con), None, True, "None"), sel("approver_id", opts_users(con), None, True, "The line manager"),
+                    sel("default_location_id", locations(con), "1"), txt("hours_per_week", "40", 5),
                     sel("permission", PERMISSION_OPTIONS), sel("books_time", BOOKS_TIME_OPTIONS), date_input("start_date", datetime.date.today().isoformat()),
                     date_input("end_date")))
     elif t == "roles":
@@ -128,14 +134,12 @@ def admin_body(con, u, t, q=None):
                      'Skill code %s Job title %s <input type="submit" value="Add role"></form>' % (
                          hidden(u=u, t="roles"), "".join('<option value="%s">' % esc(f["family"]) for f in fams), txt("skill_code", "", 8), txt("name", "", 30)))
     elif t == "clients":
-        rows = [[r["name"], "Internal (not billed)" if r["is_internal"] else "Client", r["approver"] or "none yet", edit_link(u, "clients", r["client_id"])]
-                for r in con.execute("select c.client_id, c.name, c.is_internal, a.name as approver from client c "
-                                     "left join app_user a on a.user_id=c.approver_user_id order by c.is_internal, c.name")]
-        b.append("<p><small>Each client has a main approver, who approves hours booked to any of its scopes. A scope can also have secondary approvers "
-                 "(Projects / scopes / CTRs tab). Nobody approves their own hours; if the booker is a scope's only approver, a cost controller approves them.</small></p>")
-        b.append(table(["Client", "Type", "Main approver", ""], rows, raw_cols=(3,)))
-        b.append('<h4>Add a client</h4><form method="post" action="/admin/add">%s Name %s Main approver %s <input type="submit" value="Add client"></form>'
-                 % (hidden(u=u, t="clients"), txt("name", "", 30), sel("approver_user_id", opts_approvers(con), None, True, "Choose an approver")))
+        rows = [[r["name"], "Internal (not billed)" if r["is_internal"] else "Client", r["framework_ref"] or "", edit_link(u, "clients", r["client_id"])]
+                for r in con.execute("select c.client_id, c.name, c.is_internal, c.framework_ref from client c order by c.is_internal, c.name")]
+        b.append("<p><small>Hours are approved by each person's line manager (or the approver named on their record, set on the Users tab), not by client.</small></p>")
+        b.append(table(["Client", "Type", "Framework agreement", ""], rows, raw_cols=(3,)))
+        b.append('<h4>Add a client</h4><form method="post" action="/admin/add">%s Name %s <input type="submit" value="Add client"></form>'
+                 % (hidden(u=u, t="clients"), txt("name", "", 30)))
     elif t == "rates":
         try:
             f_client = int((q or {}).get("f_client", [""])[0])
@@ -186,7 +190,7 @@ def admin_body(con, u, t, q=None):
                 for r in con.execute("select * from v_ctr_budget where budget_hours is not null order by phase")]
         b.append("<h4>Budgets now held</h4>" + (table(["CTR No", "Client", "Budget hrs", "As of", "Actual hrs (approved)"], rows) if rows else "<p>None loaded yet.</p>"))
     elif t == "locations":
-        b.append("<p><small>Where hours are worked. People pick one on each timesheet row (and tick Overtime for overtime). "
+        b.append("<p><small>Where hours are worked. People pick one on each timesheet row (it starts at their default location, set on their user record). "
                  "Rename a location or switch it off to stop new bookings to it; hours already booked keep it. At least one must stay active. "
                  "A location that <b>earns the allowance</b> (Offshore) pays the allowance for each night spent there: a night is earned when a member of staff has hours there that day and the next.</small></p>")
         rows = [[r["name"], "Yes" if r["active"] else "No", "Yes" if r["earns_allowance"] else "No", edit_link(u, "locations", r["location_id"])]
@@ -196,22 +200,18 @@ def admin_body(con, u, t, q=None):
                  % (hidden(u=u, t="locations"), txt("name", "", 24)))
     elif t == "internal":
         b.append("<p><small>Internal codes are for hours NMC pays for itself, such as Business Services or Training. People pick one in their "
-                 "timesheet (shown as Internal - name). They have no rate, and they are kept out of the client reports. "
-                 "Each code has an approver, who approves the hours booked to it. Close a code to stop new bookings to it.</small></p>")
-        rows = [[r["scope_code"], r["description"], r["status"], r["approvers"] or "", edit_link(u, "internal", r["scope_id"])]
-                for r in con.execute("select s.scope_id, s.scope_code, s.description, s.status, "
-                                     "(select string_agg(x.name, ', ') from (select au.name from v_scope_approver va join app_user au on au.user_id=va.user_id "
-                                     "where va.scope_id=s.scope_id order by au.name) x) as approvers from scope s "
+                 "timesheet (shown as Internal - name; Sick and Compassionate are shown as they are). They have no rate, and they are kept out of the client reports. "
+                 "Close a code to stop new bookings to it.</small></p>")
+        rows = [[r["scope_code"], r["description"], r["status"], edit_link(u, "internal", r["scope_id"])]
+                for r in con.execute("select s.scope_id, s.scope_code, s.description, s.status from scope s "
                                      "join client c on c.client_id=s.client_id where c.is_internal=1 order by s.scope_code")]
-        b.append(table(["Code", "Name", "Status", "Approvers", ""], rows, raw_cols=(4,)))
+        b.append(table(["Code", "Name", "Status", ""], rows, raw_cols=(3,)))
         b.append('<h4>Add an internal code</h4><form method="post" action="/admin/add">%s<table border="0" cellpadding="2">'
                  "<tr><td>Name</td><td>%s</td></tr></table>"
-                 '<input type="submit" value="Add internal code"></form><p><small>The Internal client\'s main approver (set on the Clients tab) approves its hours; '
-                 'add secondary approvers on the code\'s Edit page.</small></p>'
+                 '<input type="submit" value="Add internal code"></form>'
                  % (hidden(u=u, t="internal"), txt("description", "", 40)))
     elif t == "scopes":
-        b.append("<p><small>Structure: client &gt; project &gt; scope &gt; CTR. A CTR is the booking code hours are booked to. Hours are approved by the client's main approver "
-                 "(set on the Clients tab) or a secondary approver named on the scope.</small></p>")
+        b.append("<p><small>Structure: client &gt; project &gt; scope &gt; CTR. A CTR is the booking code hours are booked to.</small></p>")
         b.append("<h4>Projects</h4>")
         rows = [[r["client"], r["project_code"], r["name"], r["status"], edit_link(u, "projects", r["project_id"])]
                 for r in con.execute("select p.*, c.name as client from project p join client c on c.client_id=p.client_id order by c.name, p.name")]
@@ -219,15 +219,12 @@ def admin_body(con, u, t, q=None):
         b.append('<form method="post" action="/admin/add">%s Client %s Code %s Name %s <input type="submit" value="Add project"></form>'
                  % (hidden(u=u, t="projects"), sel("client_id", opts_clients(con)), txt("project_code", "", 10), txt("name", "", 30)))
         b.append("<h4>Scopes</h4>")
-        rows = [[r["client"], r["project"], r["scope_code"], r["description"], r["status"], r["secondary"] or "none", edit_link(u, "scopes", r["scope_id"])]
-                for r in con.execute("select s.scope_id, c.name as client, pr.name as project, s.scope_code, s.description, s.status, "
-                                     "(select string_agg(x.name, ', ') from (select au.name from scope_approver sa join app_user au on au.user_id=sa.user_id "
-                                     "where sa.scope_id=s.scope_id order by au.name) x) as secondary "
+        rows = [[r["client"], r["project"], r["scope_code"], r["description"], r["status"], edit_link(u, "scopes", r["scope_id"])]
+                for r in con.execute("select s.scope_id, c.name as client, pr.name as project, s.scope_code, s.description, s.status "
                                      "from scope s join client c on c.client_id=s.client_id join project pr on pr.project_id=s.project_id "
                                      "order by c.name, pr.name, s.scope_code")]
-        b.append(table(["Client", "Project", "Scope", "Description", "Status", "Secondary approvers", ""], rows, raw_cols=(6,)))
-        b.append('<p><b>Add a scope</b> <small>A CTR called General is created automatically; add or rename CTRs below. The client\'s main approver approves the scope\'s hours; '
-                 'name secondary approvers on the scope\'s Edit page.</small></p>'
+        b.append(table(["Client", "Project", "Scope", "Description", "Status", ""], rows, raw_cols=(5,)))
+        b.append('<p><b>Add a scope</b> <small>A CTR called General is created automatically; add or rename CTRs below.</small></p>'
                  '<form method="post" action="/admin/add">%s<table border="0" cellpadding="2">'
                  "<tr><td>Project</td><td>%s</td></tr><tr><td>Scope code</td><td>%s</td></tr>"
                  "<tr><td>Description</td><td>%s</td></tr><tr><td>Status</td><td>%s</td></tr></table>"
@@ -275,15 +272,20 @@ def view_admin_edit(con, u, t, i, msgs=None):
             return layout(con, u, "Admin", "<p>Not found.</p>")
         form = ("<tr><td>NMC ID</td><td>%s</td></tr><tr><td>Name</td><td>%s</td></tr><tr><td>Work email</td><td>%s</td></tr>"
                 "<tr><td>Microsoft account</td><td>%s</td></tr><tr><td>Last signed in</td><td>%s</td></tr><tr><td>Employment</td><td>%s</td></tr>"
-                "<tr><td>Role</td><td>%s</td></tr><tr><td>Line manager</td><td>%s</td></tr><tr><td>Permission</td><td>%s</td></tr><tr><td>Writes time</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr>"
+                "<tr><td>Role</td><td>%s</td></tr><tr><td>Line manager</td><td>%s</td></tr><tr><td>Approver (only if not the line manager)</td><td>%s</td></tr>"
+                "<tr><td>Default location</td><td>%s</td></tr><tr><td>Hours per week</td><td>%s</td></tr>"
+                "<tr><td>Permission</td><td>%s</td></tr><tr><td>Writes time</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr>"
                 "<tr><td>End date</td><td>%s</td></tr>" % (
                     esc(r["nmc_id"]), txt("name", r["name"], 30), txt("email", r["email"] or "", 34),
                     "Linked" if r["entra_object_id"] else "Not linked yet (linked on first sign-in, or by the user import)", esc(dmy(r["last_login_at"]) or "Never"),
-                    sel("employment_type", [("Staff", "Staff"), ("Contract", "Contract")], r["employment_type"]),
+                    sel("employment_type", EMPLOYMENT_OPTIONS, r["employment_type"]),
                     sel("role_id", opts_roles(con, active_only=False), r["role_id"]),
                     sel("line_manager_id", [x for x in opts_users(con) if x[0] != i], r["line_manager_id"], True, "None"),
+                    sel("approver_id", [x for x in opts_users(con) if x[0] != i], r["approver_id"], True, "The line manager"),
+                    sel("default_location_id", locations(con, active_only=False), str(r["default_location_id"])), txt("hours_per_week", fmt(r["hours_per_week"]), 5),
                     sel("permission", PERMISSION_OPTIONS, r["permission"]), sel("books_time", BOOKS_TIME_OPTIONS, str(r["books_time"])), esc(dmy(r["start_date"])), date_input("end_date", r["end_date"] or "")))
-        note = "<p><small>Changing someone's role does not change their booked hours.</small></p>"
+        note = ("<p><small>Changing someone's role does not change their booked hours. Their timesheet is approved by their line manager; name an Approver only when "
+                "someone else makes more sense. New timesheet rows start at their default location.</small></p>")
     elif t == "roles":
         r = con.execute("select * from role where role_id=?", (i,)).fetchone()
         if not r:
@@ -299,28 +301,21 @@ def view_admin_edit(con, u, t, i, msgs=None):
             txt("name", r["name"], 24), sel("active", [("1", "Yes"), ("0", "No")], str(r["active"])), sel("earns_allowance", [("1", "Yes"), ("0", "No")], str(r["earns_allowance"]))))
         note = "<p><small>Switching a location off stops new bookings to it. Hours already booked keep it.</small></p>"
     elif t == "clients":
-        r = con.execute("select c.*, a.name as approver from client c left join app_user a on a.user_id=c.approver_user_id where c.client_id=?", (i,)).fetchone()
+        r = con.execute("select c.* from client c where c.client_id=?", (i,)).fetchone()
         if not r:
             return layout(con, u, "Admin", "<p>Not found.</p>")
-        form = ("<tr><td>Client</td><td>%s</td></tr><tr><td>Main approver</td><td>%s</td></tr><tr><td>Framework agreement ref</td><td>%s</td></tr>" % (
-            esc(r["name"]), sel("approver_user_id", opts_approvers(con), r["approver_user_id"], True, "None"), txt("framework_ref", r["framework_ref"] or "", 40)))
-        note = ("<p><small>The main approver approves hours booked to any scope of this client (never their own). Changing it moves the waiting entries to the new "
-                "approver's queue.</small></p>")
+        form = ("<tr><td>Client</td><td>%s</td></tr><tr><td>Framework agreement ref</td><td>%s</td></tr>" % (
+            esc(r["name"]), txt("framework_ref", r["framework_ref"] or "", 40)))
+        note = "<p><small>The framework agreement reference is shown on each of this client's CTR sheets.</small></p>"
     elif t in ("scopes", "internal"):  # an internal code is a scope of the Internal client
-        r = con.execute("select s.*, c.name as client, a.name as main_approver from scope s join client c on c.client_id=s.client_id "
-                        "left join app_user a on a.user_id=c.approver_user_id where scope_id=?", (i,)).fetchone()
+        r = con.execute("select s.*, c.name as client from scope s join client c on c.client_id=s.client_id where scope_id=?", (i,)).fetchone()
         if not r:
             return layout(con, u, "Admin", "<p>Not found.</p>")
-        chosen = {x[0] for x in con.execute("select user_id from scope_approver where scope_id=?", (i,))}
-        boxes = " ".join('<label><input type="checkbox" name="secondary" value="%d"%s> %s</label>' % (
-            p[0], " checked" if p[0] in chosen else "", esc(p[1])) for p in opts_approvers(con))
         form = ("<tr><td>Client</td><td>%s</td></tr><tr><td>Scope code</td><td>%s</td></tr><tr><td>Description</td><td>%s</td></tr>"
-                "<tr><td>Status</td><td>%s</td></tr><tr><td>Main approver (from the client)</td><td>%s</td></tr><tr><td>Secondary approvers</td><td>%s</td></tr>" % (
+                "<tr><td>Status</td><td>%s</td></tr>" % (
                     esc(r["client"]), esc(r["scope_code"]), txt("description", r["description"], 40),
-                    sel("status", [("Open", "Open"), ("Pipeline", "Pipeline"), ("Closed", "Closed")], r["status"]),
-                    esc(r["main_approver"] or "none"), boxes))
-        note = ("<p><small>Hours on this scope are approved by the client's main approver or any secondary approver ticked here (never their own). "
-                "Closing a scope stops new bookings.</small></p>")
+                    sel("status", [("Open", "Open"), ("Pipeline", "Pipeline"), ("Closed", "Closed")], r["status"])))
+        note = "<p><small>Closing a scope stops new bookings.</small></p>"
     elif t == "projects":
         r = con.execute("select p.*, c.name as client from project p join client c on c.client_id=p.client_id where project_id=?", (i,)).fetchone()
         if not r:
@@ -333,9 +328,7 @@ def view_admin_edit(con, u, t, i, msgs=None):
         if not r:
             return layout(con, u, "Admin", "<p>Not found.</p>")
         allowed = {x[0] for x in con.execute("select user_id from phase_person where phase_id=?", (i,))}
-        people = " ".join('<label><input type="checkbox" name="person" value="%d"%s> %s</label>' % (
-            p["user_id"], " checked" if p["user_id"] in allowed else "", esc(p["name"]))
-            for p in con.execute("select user_id, name from app_user order by name"))
+        people = people_picker("person", [tuple(r) for r in con.execute("select user_id, name from app_user order by name")], allowed, "Nobody listed")
         def area(name, value, rows=3):
             return '<textarea name="%s" rows="%d" cols="70">%s</textarea>' % (name, rows, esc(value or ""))
         form = ("<tr><td>Scope</td><td>%s</td></tr><tr><td>CTR name</td><td>%s</td></tr><tr><td>Status</td><td>%s</td></tr>"
@@ -378,10 +371,12 @@ def admin_add(con, form):
     g = lambda k: form.get(k, [""])[0].strip()
     try:
         if t == "users":
-            cur = con.execute("insert into app_user (nmc_id, employment_type, name, role_id, permission, start_date, end_date, line_manager_id, email, books_time) values (?,?,?,?,?,?,?,?,?,?) returning user_id",
-                        (need_text(g("nmc_id"), "NMC ID"), g("employment_type"), need_text(g("name"), "Name"), int(g("role_id")),
+            cur = con.execute("insert into app_user (nmc_id, employment_type, name, role_id, permission, start_date, end_date, line_manager_id, email, books_time, approver_id, "
+                        "default_location_id, hours_per_week) values (?,?,?,?,?,?,?,?,?,?,?,?,?) returning user_id",
+                        (need_text(g("nmc_id"), "NMC ID"), need_choice(g("employment_type"), EMPLOYMENT_OPTIONS, "Employment"), need_text(g("name"), "Name"), int(g("role_id")),
                          g("permission"), need_date(g("start_date"), "Start date"), need_date(g("end_date"), "End date", False),
-                         int(g("line_manager_id")) if g("line_manager_id") else None, need_email(g("email")), 0 if g("books_time") == "0" else 1))
+                         int(g("line_manager_id")) if g("line_manager_id") else None, need_email(g("email")), 0 if g("books_time") == "0" else 1,
+                         int(g("approver_id")) if g("approver_id") else None, int(g("default_location_id") or 1), need_hours(g("hours_per_week"))))
             audit_user_added(con, u, cur.fetchone()[0])
             msg = "User added."
         elif t == "roles":
@@ -391,9 +386,7 @@ def admin_add(con, form):
             con.commit()
             return view_admin(con, u, t, [msg], ok=True, q={"f_family": [g("family")]})
         elif t == "clients":
-            if not g("approver_user_id"):
-                raise ValueError("Choose a main approver for the client.")
-            con.execute("insert into client (name, approver_user_id) values (?,?)", (need_text(g("name"), "Client name"), int(g("approver_user_id"))))
+            con.execute("insert into client (name) values (?)", (need_text(g("name"), "Client name"),))
             msg = "Client added."
         elif t == "rates":
             try:
@@ -461,10 +454,15 @@ def admin_save(con, form):
                 raise ValueError("A person cannot be their own line manager.")
             email = need_email(g("email"))
             before = con.execute("select * from app_user where user_id=?", (i,)).fetchone()
+            approver = int(g("approver_id")) if g("approver_id") else None
+            if approver == i:
+                raise ValueError("A person cannot approve their own timesheet.")
             con.execute("update app_user set name=?, employment_type=?, role_id=?, permission=?, end_date=?, line_manager_id=?, email=?, books_time=?, "
+                        "approver_id=?, default_location_id=?, hours_per_week=?, "
                         "entra_object_id=case when email is distinct from ? then null else entra_object_id end where user_id=?",
-                        (need_text(g("name"), "Name"), g("employment_type"), int(g("role_id")), g("permission"),
-                         need_date(g("end_date"), "End date", False), manager, email, 0 if g("books_time") == "0" else 1, email, i))
+                        (need_text(g("name"), "Name"), need_choice(g("employment_type"), EMPLOYMENT_OPTIONS, "Employment"), int(g("role_id")), g("permission"),
+                         need_date(g("end_date"), "End date", False), manager, email, 0 if g("books_time") == "0" else 1,
+                         approver, int(g("default_location_id") or 1), need_hours(g("hours_per_week")), email, i))
             audit_user_changes(con, u, i, before)
         elif t == "roles" and g("old_family"):
             if not g("new_family"):
@@ -485,13 +483,9 @@ def admin_save(con, form):
             con.execute("update location set name=?, active=?, earns_allowance=? where location_id=?",
                         (need_text(g("name"), "Location name"), int(g("active")), 1 if g("earns_allowance") == "1" else 0, i))
         elif t == "clients":
-            con.execute("update client set approver_user_id=?, framework_ref=? where client_id=?",
-                        (int(g("approver_user_id")) if g("approver_user_id") else None, g("framework_ref") or None, i))
+            con.execute("update client set framework_ref=? where client_id=?", (g("framework_ref") or None, i))
         elif t in ("scopes", "internal"):
             con.execute("update scope set description=?, status=? where scope_id=?", (need_text(g("description"), "Description"), g("status"), i))
-            con.execute("delete from scope_approver where scope_id=?", (i,))
-            for person in form.get("secondary", []):
-                con.execute("insert into scope_approver (scope_id, user_id) values (?,?) on conflict do nothing", (i, int(person)))
         elif t == "projects":
             con.execute("update project set name=?, status=? where project_id=?", (need_text(g("name"), "Project name"), g("status"), i))
         elif t == "phases":
@@ -732,34 +726,80 @@ def nowrap(v):
     return '<span style="white-space:nowrap">%s</span>' % esc(v if v is not None else "")
 
 
+AUDIT_PAGE = 50      # rows on one page of the audit trail
+
+
+def pager(href, page, pages, total, size):
+    """Page numbers under a table: Showing 51-100 of 640, then Previous, 1 ... 4 5 6 ... 13, Next. href(n) is the address of page n."""
+    if total == 0:
+        return ""
+    shown = sorted({1, pages} | {n for n in range(page - 2, page + 3) if 1 <= n <= pages})
+    out, last = [], 0
+    for n in shown:
+        if n - last > 1:
+            out.append("&hellip;")
+        out.append("<b>%d</b>" % n if n == page else '<a href="%s">%d</a>' % (href(n), n))
+        last = n
+    first_row, last_row = (page - 1) * size + 1, min(page * size, total)
+    return ('<p class="pager"><small>Showing %d&ndash;%d of %d</small>%s</p>' % (
+        first_row, last_row, total,
+        (" &nbsp; " + ('<a href="%s">&lsaquo; Previous</a> ' % href(page - 1) if page > 1 else "") + " ".join(out) +
+         (' <a href="%s">Next &rsaquo;</a>' % href(page + 1) if page < pages else "")) if pages > 1 else ""))
+
+
+def page_number(q, key, pages):
+    try:
+        n = int((q or {}).get(key, ["1"])[0])
+    except ValueError:
+        n = 1
+    return max(1, min(n, pages))
+
+
 def view_audit(con, u, q=None):
+    """Who changed what: the hours (every create, edit, status change and deletion) and changes to people, each newest first, 50 to a page."""
     if permission_of(con, u) not in ("controller", "admin"):  # who owns the audit trail is still to be confirmed with the cost team
         return no_access(con, u, "Audit trail")
+    q = q or {}
     try:
-        person = int((q or {}).get("person", [""])[0])
+        person = int(q.get("person", [""])[0])
     except ValueError:
         person = None
+    n_hours = con.execute("select count(*) from time_entry_audit a join time_entry t on t.entry_id=a.entry_id where (? is null or t.user_id=?)", (person, person)).fetchone()[0]
+    n_people = con.execute("select count(*) from user_audit a where (? is null or a.user_id=?)", (person, person)).fetchone()[0]
+    pages_h, pages_p = max(1, -(-n_hours // AUDIT_PAGE)), max(1, -(-n_people // AUDIT_PAGE))
+    page_h, page_p = page_number(q, "page", pages_h), page_number(q, "cpage", pages_p)
+
+    link_h = lambda n: "/audit?u=%d%s&amp;page=%d&amp;cpage=%d" % (u, "&amp;person=%d" % person if person else "", n, page_p)
+    link_p = lambda n: "/audit?u=%d%s&amp;page=%d&amp;cpage=%d" % (u, "&amp;person=%d" % person if person else "", page_h, n)
+
     rows = con.execute(
         "select a.audit_id, a.changed_at, ch.name as changed_by, a.action, bu.name as booked_by, s.scope_code, t.work_date, "
         "a.old_status, a.new_status, a.old_hours, a.new_hours, a.reason from time_entry_audit a "
         "join time_entry t on t.entry_id=a.entry_id join app_user bu on bu.user_id=t.user_id "
         "left join app_user ch on ch.user_id=a.changed_by join scope s on s.scope_id=t.scope_id "
-        "where (? is null or t.user_id=?) order by a.audit_id desc limit 200", (person, person)).fetchall()
+        "where (? is null or t.user_id=?) order by a.audit_id desc limit ? offset ?", (person, person, AUDIT_PAGE, (page_h - 1) * AUDIT_PAGE)).fetchall()
     heads = ["#", "When", "Changed by", "Action", "Booked by", "Scope", "Date", "Old status", "New status", "Old hours", "New hours", "Reason"]
     body = ('<form method="get" action="/audit">%s<p>Person whose hours changed %s <input type="submit" value="Filter"> '
-            '<small>Showing the latest 200 changes%s.</small></p></form>' % (
-                hidden(u=u), sel("person", opts_users(con), person, True, "Everyone"), " for this person" if person else "")) +         table(heads, [[fmt(v) if i in (9, 10) else nowrap(fmt_time(v)) if i == 1 else nowrap(dmy(v)) if i == 6 else str(v).capitalize() if i == 3 else v
-                                                                                   for i, v in enumerate(r)] for r in rows], raw_cols=(1, 6))
+            '<small>Newest first, %d to a page%s.</small></p></form>' % (
+                hidden(u=u), sel("person", opts_users(con), person, True, "Everyone"), AUDIT_PAGE, " &middot; this person only" if person else ""))
+    body += "<h4>Changes to hours</h4>"
+    if rows:
+        body += '<div class="scrollbox">%s</div>' % table(heads, [[fmt(v) if i in (9, 10) else nowrap(fmt_time(v)) if i == 1 else nowrap(dmy(v)) if i == 6 else str(v).capitalize() if i == 3 else v
+                                                                   for i, v in enumerate(r)] for r in rows], raw_cols=(1, 6))
+        body += pager(link_h, page_h, pages_h, n_hours, AUDIT_PAGE)
+    else:
+        body += "<p>No changes to hours yet.</p>"
     changes = con.execute(
         "select a.changed_at, coalesce(ch.name, 'System') as by_whom, p.name as person, a.action, a.field, a.old_value, a.new_value from user_audit a "
         "join app_user p on p.user_id=a.user_id left join app_user ch on ch.user_id=a.changed_by "
-        "where (? is null or a.user_id=?) order by a.audit_id desc limit 200", (person, person)).fetchall()
+        "where (? is null or a.user_id=?) order by a.audit_id desc limit ? offset ?", (person, person, AUDIT_PAGE, (page_p - 1) * AUDIT_PAGE)).fetchall()
     body += "<h4>Changes to people</h4>"
     if changes:
-        body += table(["When", "Changed by", "Person", "What", "Old", "New"],
+        body += '<div class="scrollbox">%s</div>' % table(["When", "Changed by", "Person", "What", "Old", "New"],
                       [[nowrap(fmt_time(r["changed_at"])), r["by_whom"], r["person"], "Added" if r["action"] == "ADD" else r["field"], r["old_value"] or "", r["new_value"] or ""] for r in changes],
                       raw_cols=(0,))
-        body += "<p><small>Who was added, and each change to a person's email, permission, role, dates, line manager, whether they write time, or their linked Microsoft account. The latest 200.</small></p>"
+        body += pager(link_p, page_p, pages_p, n_people, AUDIT_PAGE)
+        body += "<p><small>Who was added, and each change to a person's email, permission, role, dates, line manager, whether they write time, or their linked Microsoft account.</small></p>"
     else:
         body += "<p>No changes to people yet.</p>"
     return layout(con, u, "Audit trail", body)

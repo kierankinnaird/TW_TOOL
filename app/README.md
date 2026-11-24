@@ -20,7 +20,7 @@ app/
 scripts/
   build.py        fills the PostgreSQL database in DATABASE_URL from schema + seed (emptying it first)
   export_schema_tables.py   writes build/schema_tables.csv (columns as a table)
-  load_cmap.py    loads the people from CMAP's user grid (build.py --cmap grid.csv --users tenant-export.csv): ids, Staff or Contract, dates, line managers, roles; anyone not in the grid is left out
+  load_cmap.py    loads the people from CMAP's user grid (build.py --cmap grid.csv --users tenant-export.csv): ids, Staff / Contractor - LTD / Contractor - PAYE, contracted hours, dates, line managers, roles; anyone not in the grid is left out
   import_users.py, load_users.py   link and load people from the Microsoft 365 user export alone
   seed_history.py demo timesheet history (used by build.py --history)
 tests/
@@ -58,35 +58,36 @@ python app/app.py                            # then open http://localhost:8000
 
 The app checks the database's schema version when it starts (the `schema_info` row in `db/schema.sql`, `REQUIRED_SCHEMA` in `app/nmc/core.py`; raise both together when a schema change would break older databases). If it says the database was built with an older schema, run `python scripts/build.py` to rebuild the demo database (this empties the database in `DATABASE_URL`, so it is for demo data only; a database holding real hours needs the change applied to it as a migration instead).
 
-Pages: My Timesheet (weekly grid), Approvals (approvers and cost controllers), Missing timesheets (approvers and cost controllers), Reports (CTR and weekly period reports), Admin and Audit trail (cost controllers and the IT admin, each seeing their own tabs). Rebuilding the database resets the data.
+Pages: My Timesheet (weekly grid), My team, Approvals and Missing timesheets (line managers, approvers and cost controllers), Reports (CTR and weekly period reports), Admin and Audit trail (cost controllers and the IT admin, each seeing their own tabs). Rebuilding the database resets the data.
 
 ## Roles
 
-Each person has one permission level: `user`, `controller` (cost controller) or `admin` (IT). Everyone can enter, save and submit their own time. Approver is not a level: it means being a client's main approver or a secondary approver on a scope, and only standard users can be named. Approvers book their own time like anyone else, including to the scopes they approve; nobody approves their own hours, so a cost controller approves the hours an approver books to their own scope. Apart from that, cost controllers and admins never approve hours.
+Each person has one permission level: `user`, `controller` (cost controller) or `admin` (IT). Everyone can enter, save and submit their own time. **Approving is not a level, and it is per person, not per client or scope:** a person's whole timesheet is approved by their **line manager** (Admin, Users), or, when someone else makes more sense (a line manager who only works on Spirit, say, and a person on Apache scopes), by the **Approver** named on that person's record, which replaces the line manager for approval. Nobody approves their own hours. Someone with neither a line manager nor an approver has nobody to approve for them, so a cost controller does. The database enforces this (an approval by anyone else is refused). Anyone can be a line manager or an approver.
 
-| | Standard user | Approver (a user named on a scope) | Cost controller | Admin (IT) |
+| | Standard user | Line manager / approver (of at least one person) | Cost controller | Admin (IT) |
 |---|---|---|---|---|
 | Own timesheet | Yes | Yes | Yes | Yes |
-| Approvals page, approve or reject | No | Yes, for their scopes only, never their own hours | Only hours an approver booked to their own scope | No |
-| Missing timesheets (who has not submitted, by week) | No | Their own people: anyone who booked to a scope they approve in the last 8 weeks (internal codes included) | Everyone active that week | No |
-| Reports | Own hours only, no values | Own hours plus everyone's hours on their scopes, no values | Everything, with £ values and sales rates | No |
+| My team: any week of their people's timesheets (read-only; drafts stay private) | No | Yes | Yes, anyone | No |
+| Approvals page, approve or reject | No | Yes, for the people they approve for, never their own hours | Yes, for people with nobody set to approve | No |
+| Missing timesheets (who has not submitted, by week) | No | Their own people: the people they manage or approve for | Everyone active that week | No |
+| Reports | Own hours only, no values | Their own and their team's hours, no values | Everything, with £ values and sales rates | No |
 | £ values and sales rates | No | No | Yes | No |
 | Admin tabs | None | None | Weekly periods, clients, rate cards, projects / scopes / CTRs, internal codes, allowance rates | Weekly periods, users, job roles, locations, budgets (P6, parked for v1) |
 | Audit trail | No | No | Yes | Yes |
 
-In the demo data, Alisdair Woodhead approves for Apache and Kenneth Nicolson for Spirit (both standard users), and Graeme Hogg, the managing director, approves the Internal (overhead) codes. Cost engineers book to projects like anyone else, so their hours get the standard approval from the scope's approver. Each user has an optional **line manager** (Admin, Users); it is recorded only for now, with no workflow attached. The cost controllers are the two cost engineers, Emma Noble and Abbi Murray, and Stephanie Apedaile (commercial lead), who is not a cost engineer: cost permission is set per person on the Users tab, never taken from a job title, so anyone can be given it when the system goes live. NMC Admin is the IT account. Sales rates and £ values are never put in the page for anyone but a cost controller; the reports, their filters and the CTR page only show other people what they may see. Still to come from the roles matrix: reopening a timesheet, transaction controls, and more. Who owns weekly periods and the audit trail is still to be confirmed with the cost team, so for now both controllers and admins can use them.
+In the demo data, Alisdair Woodhead manages most of the engineers and planners, Kenneth Nicolson one person, and Graeme Hogg, the managing director, the heads and the commercial team. **My team** (a line manager's or approver's menu) lists their people with last week and this week at a glance and opens any week of any of their timesheets, read-only; a cost controller can find anyone. A person's record also holds their **default location** (On Shore unless changed, for an offshore rep say: new timesheet rows start there), their **contracted hours a week** and their **employment**: Staff, Contractor - LTD or Contractor - PAYE.
 
-Admin tabs: weekly periods (close a week, or open a missed one), users, roles / skill codes, clients, client rate cards, projects, scopes (secondary approvers are named on the scope) and CTRs, internal codes, and locations (the hour types). Users, roles, scopes, internal codes and locations can be edited; rates are never edited, you add a new one with a later effective date.
+Admin tabs: weekly periods (close a week, or open a missed one), users, roles / skill codes, clients, client rate cards, projects, scopes and CTRs, internal codes, and locations (the hour types). Users, roles, scopes, internal codes and locations can be edited; rates are never edited, you add a new one with a later effective date.
 
 Weekly periods open themselves: the first request in a new week creates that week's period, so nobody has to open it by hand. A week an admin has closed stays closed. The admin tab can still open a week that was missed, for example after the app was not used for a while.
 
-On the timesheet, the row, day and week totals update as hours are typed, before saving. Under the grid there are three lines: Normal time, Overtime and Total.
+On the timesheet, the row, day and week totals update as hours are typed, before saving. Each row shows its skill code and location as small labels.
 
 **Sent back:** when an approver (or, for an approver's own hours, a cost controller) rejects an entry, it goes back to the person as a draft with the reason. The person sees it three ways: a "Sent back for correction" notice on that week's timesheet (the entry, the reason, who sent it back and when), a hover note on the box itself, and "My Timesheet (n sent back)" in the menu on every page, plus a pointer to any other weeks that have some. The notice disappears when the week is submitted again. Reasons are shown as plain text. No email is sent: users have no email address stored.
 
-**Manhour report by client:** on Reports, a client's project manager (its main approver, or anyone who approves one of its scopes) and the cost controllers can open the Manhour report by client and download it as Excel. It shows one client's approved hours broken down by job family, role and the people who worked in that role, one column per week commencing, with subtotals for roles that have several people, for each job family and for the client, plus a Pending hrs column. It is hours only, never money, and a project manager only ever gets their own client's people (a cost controller can pick any client). People who approve nothing, and the IT admin, do not get it.
+**Manhour report by client:** on Reports, line managers and approvers (limited to their own people's hours) and the cost controllers (everything) can open the Manhour report by client and download it as Excel. It shows one client's approved hours broken down by job family, role and the people who worked in that role, one column per week commencing, with subtotals for roles that have several people, for each job family and for the client, plus a Pending hrs column. It is hours only, never money, and a project manager only ever gets their own client's people (a cost controller can pick any client). People who approve nothing, and the IT admin, do not get it. The report can also be downloaded as a **PDF**: landscape A4 with the NMC logo, a table by job family, role and person (a column per week, or per month for a long period), and boxes at the end for the preparer, NMC and the client to sign (name, signature, date), ready to send to DocuSign.
 
-**Adding rows and overtime (CMAP-style):** the **+ Add timesheet row** button above the grid opens a popup with a CTR list you can search by typing, an Add row button and a Cancel; a different skill code or location is in a collapsed section inside it. Overtime is no longer a tick box: every booking shows its normal-time row with a **+ Overtime** link, which reveals an overtime row directly under it (an overtime row that already has hours is shown automatically). The data is unchanged: overtime hours are still their own entries flagged as overtime.
+**Adding rows:** the **+ Add timesheet row** button above the grid opens a popup with a CTR list you can search by typing, the skill code and location (filled in with the person's own skill code and default location, and always visible), an Add row button and a Cancel. **Overtime is no longer flagged on a timesheet.** Each person's contracted hours a week are on their record, and the view `v_weekly_hours` (and the Weekly hours export on Reports) gives every person's total hours each week against them, so overtime can be worked out later.
 
 **Deleting a row:** each booking row has a small × at its right while the sheet can be edited. It deletes the row and its draft hours (asking first if there are hours, and writing the removals to the audit trail); hours typed on the other rows are saved first. A row with submitted or approved hours has no ×, and the server refuses a hand-made request to delete it.
 
@@ -123,7 +124,7 @@ In NMC's P6 plans each CTR is a WBS element named like `Process Engineering - A0
 
 **Rate:** hours are priced at the client's rate card line for the skill code booked (the person's own job title unless they cover another role), at the rate in force on the work date.
 
-**Structure and approvers:** Client > Project > Scope > CTR. A CTR is the booking code hours are booked to (it was called a phase; internally the table is still `phase`). Each client has a **main approver** (Admin, Clients) who approves hours booked to any of its scopes, and each scope can have **secondary approvers** (Admin, Projects / scopes / CTRs, the scope's Edit page). Any of them can approve; nobody approves their own hours. If the booker is a scope's only approver, nobody else could approve, so a cost controller does (once a second approver is named, the controller no longer does). **CTR settings:** a cost controller opens a CTR on Admin, Projects / scopes / CTRs. Besides its name and status each CTR has a description, optional WBS, CBS and ABS references, and transaction controls: either anyone who may book to the client, or only the people ticked, and optionally a Bookable from / until date window. The database enforces the list and the window on new bookings; the timesheet's Add row list leaves out CTRs the person cannot book that week. Hours already booked are not affected.
+**Structure:** Client > Project > Scope > CTR. A CTR is the booking code hours are booked to (it was called a phase; internally the table is still `phase`). Who approves hours has nothing to do with the client or scope: see Roles above.
 
 **Timesheet grid and Excel:** Reports links to the Timesheet grid: hours by person, booking code and day. Choose a ready-made layout (person by code by day, person by day, person by week, code by person total, code by week, location and type by week), tailor the columns, show each day, each week or one total, and narrow by dates, client, scope or person. "Download as Excel" gives a real .xlsx of exactly what is on screen, and the period report has its own download. Cost controllers also get a Value column; everyone else sees only the hours they are allowed to see.
 
@@ -131,22 +132,22 @@ In NMC's P6 plans each CTR is a WBS element named like `Process Engineering - A0
 
 **Copy last week:** when last week has hours, this week is open and nothing in this week has been submitted or approved yet, the timesheet offers one button, "Copy last week". It replaces whatever is in this week with last week's rows and hours: the draft hours already there are cleared (and audited, and the browser asks first), then last week's hours are saved as drafts on the same weekdays, with the same code, skill code, location and overtime flag. If any hours in the week are already submitted or approved, the week cannot be replaced (a cost controller has to reopen it first). Anything that cannot be copied (for example a day outside your start and end dates) is reported, not skipped silently. Copying uses the same booking rules as saving, so rates are looked up for the new date.
 
-## Hour types: location and overtime
+## Hour types: location
 
-Every timesheet row has a **location** (On Shore, Offshore or Site visit by default; the IT admin can add more) and a **type** (Normal or Overtime), so one person can book the same code on the same day as normal time, as overtime, on shore and offshore, each on its own row. "Add row" has a Location dropdown and an Overtime tick box. Every entry stores both (`location_id` and `overtime`); once hours are submitted or approved they are locked, and the audit trail keeps the old values if a cost controller reopens and changes them.
+Every timesheet row has a **location** (On Shore, Offshore or Site visit by default; the IT admin can add more), starting at the person's default location, so one person can book the same code on the same day on shore and offshore, each as its own row. The location decides the offshore allowance (see below).
 
 - The list of locations is managed by the IT admin on the Locations tab (add, rename, switch off). A location that is switched off stops new bookings; hours already booked keep it. At least one must stay active.
-- **Overtime has no separate rate yet**, so overtime hours are valued at the normal rate in the CTR and weekly report totals. When the cost team has overtime rates they will need a place on the rate card (a second rate or a multiplier).
-- Approvers see the location and type on the Approvals page, the CTR page lists them for each entry, and Reports has an "Hours by location and overtime" section (hours only, limited to what the person may see).
-- Cell names on the timesheet form are `h_<phase>_<skill code>_<location>_<overtime>_<date>`.
+- **Overtime is not flagged any more.** Older hours that were booked as overtime still show on a row of their own; the database column stays (always 0 for new hours).
+- Approvers see the location on the Approvals page, the CTR page lists it for each entry, and Reports has an "Hours by location" section (hours only, limited to what the person may see).
+- Cell names on the timesheet form are `h_<phase>_<skill code>_<location>_<overtime>_<date>`; the overtime part is always 0 for new rows.
 
 ## Internal hours
 
-Hours NMC pays for itself rather than bills to a client are booked to an internal code, shown as `Internal - Business Services`. An internal code is a scope under the Internal client (a client flagged `is_internal`), with a General phase. Internal time is an overhead, so Graeme Hogg (managing director) is the Internal client's main approver; he can delegate by naming secondary approvers on a code. Admin adds, renames, closes and reassigns approvers for codes on the Internal codes tab; each code is numbered for you (INT01, INT02, ...).
+Hours NMC pays for itself rather than bills to a client are booked to an internal code, shown as `Internal - Business Services`. An internal code is a scope under the Internal client (a client flagged `is_internal`), with a General phase. The seeded codes are the company's list: Sick, Compassionate (shown as they are, as absence) and Internal - Business Development / Strategy, Executive Leadership, Commercial / Business, Training, HSEQ, Engineering, Business Services, Projects, HR and Other. Internal hours are approved like any others, by the person's line manager. The cost team adds, renames and closes codes on the Internal codes tab; each new code is numbered for you (INT13, INT14, ...).
 
 - Anyone can book to an open code, internal or client.
 - Internal hours have no sales rate (`rate_id` is empty on the entry), and the Internal client cannot be given a rate card.
-- Everything else is the same as client hours: draft, submit, approve by an approver of the scope, controlled edits, audit trail, open weekly period.
+- Everything else is the same as client hours: draft, submit, approval by the person's line manager (or approver), controlled edits, audit trail, open weekly period.
 - They are left out of the CTR and the weekly period report, which are about billable value. Reports has a separate Internal hours section for the chosen date range.
 
 Connect to the database with any PostgreSQL client (VS Code's PostgreSQL extension, pgAdmin, `psql`). Useful queries:
@@ -162,7 +163,7 @@ SELECT * FROM v_period_report
 
 - Booking is to a phase and needs an Open project, scope and phase, a rate that matches the client and worked role, and an Open weekly period. Internal codes need no rate and cannot carry one. The work date must also fall between the person's start and end dates (no end date means still employed; the last day counts). On the timesheet, days outside a person's dates have no box.
 - Lifecycle: Draft, Submitted, Approved. Only Draft hours can be typed over: submitted and approved hours show as plain text, and the server refuses a changed or cleared value for them too. Reject returns to Draft with a reason. A cost controller can reopen a submitted or approved week (Reopen timesheet in the menu, a reason is required, audited, never their own timesheet); it goes back to the person as drafts with the reason shown, and has to be submitted and approved again. Hours changed after approval by other means are marked Edited and need re-approval.
-- Approval is by the client's main approver or a secondary approver of the scope, never the entry owner. The one exception: hours booked by the scope's only approver are approved by a cost controller. Admins never approve, and neither controllers nor admins can be named as an approver.
+- Approval is by the person's approver (the approver named on their record, otherwise their line manager), never the entry owner. When a person has neither, a cost controller approves their hours. Admins never approve.
 - Every edit names its editor; every create, edit, status change and deletion is audited. Only Draft entries can be deleted (clear draft).
 
 ## CTR page

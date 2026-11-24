@@ -1,7 +1,7 @@
 """The weekly timesheet: showing it, saving hours, booking rules and copying last week. Allowances are not claimed here (payroll sets them by location)."""
 import datetime
 from nmc import pg
-from nmc.core import date_input, dmy, esc, fmt, layout, locations, me_row, monday, msgs_html, parse_adds, stamp, table
+from nmc.core import ABSENCE_CODES, date_input, dmy, esc, fmt, layout, locations, me_row, monday, msgs_html, parse_adds, stamp, table
 
 
 TIMESHEET_JS = """<script>
@@ -133,10 +133,8 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
         if s and r and loc and ot in (0, 1):
             rows[(pid, rid, lid, ot)] = {"client": s["client"], "project": s["project"], "scope": "%s %s" % (s["scope_code"], s["description"]),
                                          "phase": s["phase"], "skill": r["skill_code"], "location": loc[0], "overtime": ot, "cells": {}}
-    # every booking shows its normal-time row and, directly under it, an overtime row: hidden until it has hours or "+ Overtime" is clicked
-    for (pid, rid, lid, ot) in list(rows):
-        if (pid, rid, lid, 1 - ot) not in rows:
-            rows[(pid, rid, lid, 1 - ot)] = dict(rows[(pid, rid, lid, ot)], overtime=1 - ot, cells={}, auto=True)
+    # (Overtime is no longer entered: a week's total hours are compared with the person's contracted hours instead. Hours booked as overtime before that
+    # still show, on a row of their own.)
     ordered = {}
     for k in rows:
         for ot in (0, 1):
@@ -224,7 +222,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
                      ' onsubmit="return confirm(\'This clears the draft hours already in this week. Continue?\');"' if has_drafts else "",
                      u, d0, prev_d.strftime("%d/%m/%Y"), prev_n, "y" if prev_n == 1 else "ies"))
 
-    adds_hidden = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"] and not rows[k].get("auto"))
+    adds_hidden = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"])
     b.append('<form id="tsform" method="post" action="/timesheet/save">'
              '<input type="hidden" name="u" value="%d"><input type="hidden" name="w" value="%s">%s' % (u, d0, adds_hidden))
     head = ["Booking"] + [d.strftime("%a %d/%m") for d in days] + ["Total", ""]
@@ -232,16 +230,11 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
     day_tot = {d.isoformat(): 0.0 for d in days}
     day_norm, day_ot = dict(day_tot), dict(day_tot)  # the same, split into normal time and overtime
     for (pid, rid, lid, ot), r in rows.items():
-        ot_hidden = bool(ot and not r["cells"] and r.get("auto"))  # an overtime line nobody has asked for yet
-        link = ""
-        if not ot and can_edit and rows.get((pid, rid, lid, 1), {}).get("auto") and not rows[(pid, rid, lid, 1)]["cells"]:
-            link = ' <a href="#" class="addot" onclick="return showOt(this)">+ Overtime</a>'
-        if ot:
-            tds = ['<td class="bk"><span class="sub">%s</span><br><span class="chips">%s &middot; %s &middot; <b>Overtime</b></span></td>' % (
-                esc(r["phase"]), esc(r["skill"]), esc(r["location"]))]
-        else:
-            tds = ['<td class="bk"><b>%s</b><br><span class="sub">%s &rsaquo; %s &rsaquo; %s</span><br><span class="chips">%s &middot; %s &middot; Normal%s</span></td>' % (
-                esc(r["phase"]), esc(r["client"]), esc(r["project"]), esc(r["scope"]), esc(r["skill"]), esc(r["location"]), link)]
+        ot_hidden = False
+        pills = '<span class="pill" title="Skill code">%s</span><span class="pill" title="Location">%s</span>%s' % (
+            esc(r["skill"]), esc(r["location"]), '<span class="pill ot" title="Booked as overtime before overtime was removed">Overtime</span>' if ot else "")
+        tds = ['<td class="bk"><b>%s</b><br><span class="sub">%s &rsaquo; %s &rsaquo; %s</span><br><span class="chips">%s</span></td>' % (
+            esc(r["phase"]), esc(r["client"]), esc(r["project"]), esc(r["scope"]), pills)]
         rt = 0.0
         for d in days:
             iso = d.isoformat()
@@ -263,7 +256,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
                     cell = '<input type="text" size="4" name="%s" value="%s"%s>' % (name, esc(typed.get(name, fmt(e["hours"]))), why)
             tds.append('<td align="center" class="c%s" data-day="%s"%s>%s</td>' % (" we" if d.weekday() >= 5 else "", iso, fixed, cell))
         tds.append('<td align="right" class="rt">%s</td>' % fmt(rt))
-        mine = [rows[(pid, rid, lid, o)]["cells"].values() for o in (0, 1)]
+        mine = [rows[(pid, rid, lid, o)]["cells"].values() for o in (0, 1) if (pid, rid, lid, o) in rows]
         if not ot and can_edit and not any(e["status"] != "Draft" for cells in mine for e in cells):  # a booking with submitted or approved hours cannot be deleted
             has_hours = any(cells for cells in mine)
             tds.append('<td class="del"><button type="submit" name="delrow" value="h:%d:%d:%d" class="delrow" title="Delete this row"%s>&times;</button></td>' % (
@@ -280,9 +273,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
             row_cls, label, "".join('<td align="center" class="%s" data-day="%s"><b>%s</b></td>' % (day_cls, d.isoformat(), fmt(per_day[d.isoformat()])) for d in days),
             week_cls, fmt(sum(per_day.values())))
     has_ot = any(k[3] and (rows[k]["cells"] or not rows[k].get("auto")) for k in rows)  # the normal time and overtime lines only matter once there is overtime
-    foot = ((sum_row("Normal time", "dn", "gn", day_norm, "sum") + sum_row("Overtime", "do", "go", day_ot, "sum")) if has_ot else
-            '<tr style="display:none"><td></td>%s<td class="gn"></td></tr><tr style="display:none"><td></td>%s<td class="go"></td></tr>' % (
-                "".join('<td class="dn" data-day="%s"><b>0</b></td>' % d.isoformat() for d in days), "".join('<td class="do" data-day="%s"><b>0</b></td>' % d.isoformat() for d in days)))
+    foot = (sum_row("Normal time", "dn", "gn", day_norm, "sum") + sum_row("Overtime", "do", "go", day_ot, "sum")) if has_ot else ""
     foot += sum_row("Total", "dt", "gt", day_tot, "tot")
     hdr = "".join('<th class="%s">%s</th>' % ("bkh" if i == 0 else ("we" if 1 <= i <= 7 and days[i - 1].weekday() >= 5 else ""), esc(h).replace(" ", "<br>", 1) if 1 <= i <= 7 else esc(h))
                   for i, h in enumerate(head))
@@ -338,21 +329,22 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
         pass  # the notes above say why nothing can be added
     elif scopes:
         def label(s):
-            if s["is_internal"]:  # e.g. "Internal - Business Services"
-                return "%s - %s%s" % (esc(s["client"]), esc(s["description"]), "" if s["phase_name"] == "General" else " &gt; %s" % esc(s["phase"]))
+            if s["is_internal"]:  # e.g. "Internal - Business Services"; absence (Sick, Compassionate) is shown as it is
+                lead = "" if s["description"] in ABSENCE_CODES else "%s - " % esc(s["client"])
+                return "%s%s%s" % (lead, esc(s["description"]), "" if s["phase_name"] == "General" else " &gt; %s" % esc(s["phase"]))
             return "%s &gt; %s &gt; %s %s &gt; %s" % (esc(s["client"]), esc(s["project"]), esc(s["scope_code"]), esc(s["description"]), esc(s["phase"]))
         so = "".join('<option value="%d">%s</option>' % (s["phase_id"], label(s)) for s in scopes)
         ro = "".join('<option value="%d"%s>%s %s</option>' % (r["role_id"], " selected" if r["role_id"] == me["role_id"] else "", esc(r["skill_code"]), esc(r["name"])) for r in roles)
-        lo = "".join('<option value="%d">%s</option>' % (lid, esc(name)) for lid, name in locations(con))
+        lo = "".join('<option value="%d"%s>%s</option>' % (lid, " selected" if lid == me["default_location_id"] else "", esc(name)) for lid, name in locations(con))
         so_list = "".join('<option value="%d"%s>%s</option>' % (s["phase_id"], " selected" if i == 0 else "", label(s)) for i, s in enumerate(scopes))
         dlg = ['<dialog id="addrow" class="dlg"><div class="dlg-in"><h4>Add a timesheet row</h4>'
-               '<p><small>Choose a CTR, typing in the box to search. Hours you have typed are saved first. Overtime is added on the row itself, with <b>+ Overtime</b>.</small></p>'
+               '<p><small>Choose a CTR, typing in the box to search. Hours you have typed are saved first.</small></p>'
                '<p><input type="text" id="addq" placeholder="Search by client, project, scope or CTR No" autocomplete="off" oninput="filterCtr(this.value)"></p>'
                '<p><select form="tsform" name="add_phase" id="addphase" size="8">%s</select></p>'
-               '<details><summary>Different skill code or location</summary>'
-               '<p>Skill code <select form="tsform" name="add_role">%s</select> Location <select form="tsform" name="add_loc">%s</select></p>'
-               "<p><small>Your own skill code is pre-selected. Choose a different one if you are covering another role. "
-               "Hours NMC pays for itself (not billed to a client) go to an Internal code, for example Internal - Business Services.</small></p></details>"
+               '<div class="pick2"><label>Skill code <select form="tsform" name="add_role">%s</select></label> '
+               '<label>Location <select form="tsform" name="add_loc">%s</select></label></div>'
+               "<p><small>Your own skill code and usual location are filled in. Change them if you are covering another role or working somewhere else. "
+               "Hours NMC pays for itself (not billed to a client) go to an Internal code, for example Internal - Business Services.</small></p>"
                '<p class="dlg-actions"><input form="tsform" type="submit" name="action" value="Add row"> '
                '<input type="button" value="Cancel" onclick="this.closest(\'dialog\').close()"></p>' % (so_list, ro, lo)]
         dlg.append("</div></dialog>")

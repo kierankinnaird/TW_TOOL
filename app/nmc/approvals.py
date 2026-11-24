@@ -5,7 +5,7 @@ from nmc import pg
 from nmc.core import (
     dmy,
     approval_queue, date_input, esc,
-    fmt, hidden, is_approver, layout,
+    fmt, has_team, hidden, layout,
     may_action, monday, msgs_html,
     no_access, permission_of, sel, stamp,
     table, txt)
@@ -28,12 +28,12 @@ function tickAll(c){var e=document.getElementsByName('entry_ids'), p=document.qu
 
 
 def view_approvals(con, u, msgs=None, ok=False, q=None):
-    """The approver's week: one line per person with each weekday, a way to open a line to see everything booked against them, and
-    previous and next weeks (approved hours stay visible). Cost controllers see the hours booked by approvers to the scopes they approve."""
+    """The approver's week: one line per person they approve for, with each weekday, a way to open a line to see everything booked against them, and
+    previous and next weeks (approved hours stay visible). Cost controllers also see the hours of people who have nobody to approve for them."""
     queue = approval_queue(con, u)
     if queue is None:
-        return layout(con, u, "Approvals", msgs_html(msgs, ok) + "<p>Hours are approved by the approver named on each booking code. "
-                      "You are not named as an approver on any code, so there is nothing for you to approve.</p>")
+        return layout(con, u, "Approvals", msgs_html(msgs, ok) + "<p>A timesheet is approved by the person's line manager, or by the approver named on their record. "
+                      "You are not the line manager or approver of anyone, so there is nothing for you to approve.</p>")
     where, wargs = queue
     q = q or {}
     waiting = con.execute(
@@ -47,12 +47,12 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
     d0 = w.isoformat()
     days = [w + datetime.timedelta(days=i) for i in range(7)]
     entries = con.execute(
-        "select t.entry_id, t.user_id, bu.name as booked_by, c.name as client, pr.name as project, s.scope_code, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, ro.skill_code, "
-        "lo.name as location, t.overtime, t.work_date, t.hours, t.status, t.last_change_reason, "
+        "select t.entry_id, t.user_id, bu.name as booked_by, bu.nmc_id, jt.name as job_title, c.name as client, pr.name as project, s.scope_code, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, ro.skill_code, "
+        "lo.name as location, t.work_date, t.hours, t.status, t.last_change_reason, "
         "(select old_hours from time_entry_audit a where a.entry_id=t.entry_id and a.new_status='Edited' order by a.audit_id desc limit 1) as was "
         "from time_entry t join scope s on s.scope_id=t.scope_id join phase ph on ph.phase_id=t.phase_id "
         "join project pr on pr.project_id=s.project_id join client c on c.client_id=s.client_id "
-        "join app_user bu on bu.user_id=t.user_id join role ro on ro.role_id=t.worked_role_id join location lo on lo.location_id=t.location_id "
+        "join app_user bu on bu.user_id=t.user_id join role jt on jt.role_id=bu.role_id join role ro on ro.role_id=t.worked_role_id join location lo on lo.location_id=t.location_id "
         "where t.status<>'Draft' and t.work_date between ? and ?" + where + " order by bu.name, t.work_date, s.scope_code, ph.name, ro.skill_code",
         [d0, days[-1].isoformat()] + list(wargs)).fetchall()
     people = {}
@@ -63,25 +63,33 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
 
     body = msgs_html(msgs, ok)
     if permission_of(con, u) == "controller":
-        body += ("<p><small>These are hours booked by approvers to the scopes they approve. Nobody else may approve them "
-                 "(not even the approver, who never approves their own hours), so a cost controller does.</small></p>")
+        body += ("<p><small>You approve the timesheets of anyone you manage or are named as approver for, and of people who have nobody to approve "
+                 "for them (no line manager or approver set on their record).</small></p>")
     n_wait = sum(r["n"] for r in waiting)
-    body += '<p>%s &nbsp; <b>Week commencing %s</b> &nbsp; %s &nbsp; %s</p>' % (
-        link(w - datetime.timedelta(days=7), "&lt;&lt; Previous week"), w.strftime("%d/%m/%Y"),
-        link(w + datetime.timedelta(days=7), "Next week &gt;&gt;"), link(monday(datetime.date.today()), "This week"))
-    body += '<form method="get" action="/approvals">%s<p>Week containing %s <input type="submit" value="Show"></p></form>' % (hidden(u=u), date_input("w", d0))
+    body += ('<div class="apnav">%s <b>Week commencing %s</b> %s %s'
+             '<form method="get" action="/approvals">%s<span>Go to the week containing</span> %s <input type="submit" value="Show"></form></div>' % (
+                 link(w - datetime.timedelta(days=7), "&lsaquo; Previous week"), w.strftime("%d/%m/%Y"),
+                 link(w + datetime.timedelta(days=7), "Next week &rsaquo;"), link(monday(datetime.date.today()), "This week"),
+                 hidden(u=u), date_input("w", d0)))
     if n_wait:
-        body += "<p><b>%d entr%s waiting for your approval</b>: %s.</p>" % (n_wait, "y" if n_wait == 1 else "ies", ", ".join(
-            link(datetime.date.fromisoformat(r["wk"]), "%s (%d)" % (datetime.date.fromisoformat(r["wk"]).strftime("%d/%m/%Y"), r["n"])) for r in waiting))
+        body += "<p class=\"apsum\"><b>%d entr%s waiting for your approval</b>" % (n_wait, "y" if n_wait == 1 else "ies")
+        elsewhere = [r for r in waiting if r["wk"] != d0]
+        if elsewhere:
+            body += " &middot; waiting in: %s" % ", ".join(
+                link(datetime.date.fromisoformat(r["wk"]), "w/c %s (%d)" % (datetime.date.fromisoformat(r["wk"]).strftime("%d/%m"), r["n"])) for r in waiting)
+        body += "</p>"
     else:
-        body += "<p>Nothing waiting for your approval.</p>"
+        body += '<p class="apsum">Nothing waiting for your approval.</p>'
     if not people:
         return layout(con, u, "Approvals", body + "<p>No submitted or approved hours in this week from the people you approve.</p>")
 
-    head = ('<tr><th><input type="checkbox" title="Select all" onclick="tickAll(this)"></th><th>Person</th>%s<th>Total</th><th>Waiting</th><th>Approved</th></tr>' %
-            "".join("<th>%s</th>" % d.strftime("%a %d/%m") for d in days))
-    ncol = 2 + 7 + 3
-    day_tot = {d.isoformat(): 0.0 for d in days}
+    weekend = any(e["work_date"] >= days[5].isoformat() for es in people.values() for e in es)     # Saturday and Sunday only when someone worked them
+    shown = days if weekend else days[:5]
+    head = ('<tr><th><input type="checkbox" title="Select all" onclick="tickAll(this)"></th><th>Person</th>%s<th>Total</th><th>Status</th></tr>' %
+            "".join('<th class="dy">%s</th>' % d.strftime("%a %d/%m") for d in shown))
+    ncol = 2 + len(shown) + 2
+    day_cells = lambda vals: "".join('<td class="dy%s" align="center">%s</td>' % ("" if vals.get(d.isoformat()) else " zero", fmt(vals[d.isoformat()]) if vals.get(d.isoformat()) else "&ndash;") for d in shown)
+    all_wait = all_appr = 0.0
     trs = []
     for uid, es in people.items():
         per_day = {d.isoformat(): 0.0 for d in days}
@@ -89,43 +97,43 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
         n_pending = 0
         for e in es:
             per_day[e["work_date"]] += e["hours"]
-            day_tot[e["work_date"]] += e["hours"]
             if e["status"] in ("Submitted", "Edited"):
                 wait_h += e["hours"]
                 n_pending += 1
             else:
                 appr_h += e["hours"]
+        all_wait += wait_h
+        all_appr += appr_h
         drow = "d%d" % uid
-        trs.append('<tr><td align="center">%s</td><td><b>%s</b> <a href="#" class="js" style="display:none" data-r="%s" onclick="return openRow(this)">detail</a> %s</td>%s'
-                   '<td align="right"><b>%s</b></td><td align="right">%s</td><td align="right">%s</td></tr>' % (
+        badges = "".join(x for x in (('<span class="badge wait">%s h waiting</span>' % fmt(wait_h)) if wait_h else "",
+                                     ('<span class="badge done">%s h approved</span>' % fmt(appr_h)) if appr_h else "") if x)
+        trs.append('<tr><td align="center">%s</td><td><b>%s</b> <a href="#" class="js" style="display:none" data-r="%s" onclick="return openRow(this)">detail</a>'
+                   '<span class="sub">%s</span></td>%s<td align="right"><b>%s</b></td><td>%s%s</td></tr>' % (
                        '<input type="checkbox" class="pp js" style="display:none" data-p="%d" onclick="tickPerson(this)">' % uid if n_pending else "",
-                       esc(es[0]["booked_by"]), drow,
-                       ('<button type="submit" name="approve_person" value="%d" title="Approve everything waiting for this person this week">Approve all waiting</button>' % uid) if n_pending else "",
-                       "".join('<td align="center">%s</td>' % (fmt(per_day[d.isoformat()]) if per_day[d.isoformat()] else "&ndash;") for d in days),
-                       fmt(wait_h + appr_h), fmt(wait_h) if wait_h else "", fmt(appr_h) if appr_h else ""))
-        # one line per booking (scope, CTR, skill code, location, normal or overtime) with a column per day, not a line per day
+                       esc(es[0]["booked_by"]), drow, esc("%s, %s" % (es[0]["job_title"], es[0]["nmc_id"])),
+                       day_cells(per_day), fmt(wait_h + appr_h), badges,
+                       ('<button type="submit" name="approve_person" value="%d" title="Approve everything waiting for this person this week">Approve all waiting</button>' % uid) if n_pending else ""))
+        # one line per booking (scope, CTR, skill code, location) with a column per day, not a line per day
         bookings = {}
         for e in es:
-            bookings.setdefault((e["scope_code"], e["phase"], e["skill_code"], e["location"], e["overtime"], e["client"], e["project"]), []).append(e)
+            bookings.setdefault((e["scope_code"], e["phase"], e["skill_code"], e["location"], e["client"], e["project"]), []).append(e)
         lines = []
-        for (scope, phase, skill, loc, ot, client, project), bes in bookings.items():
+        for (scope, phase, skill, loc, client, project), bes in bookings.items():
             pend_ids = [x["entry_id"] for x in bes if x["status"] in ("Submitted", "Edited")]
-            cells = {x["work_date"]: x for x in bes}
+            cells = {x["work_date"]: x["hours"] for x in bes}
             statuses = sorted({x["status"] for x in bes})
             was = ", ".join("%s: %s" % (datetime.date.fromisoformat(x["work_date"]).strftime("%a"), fmt(x["was"])) for x in bes if x["was"] is not None)
             reasons = "; ".join(dict.fromkeys(x["last_change_reason"] for x in bes if x["last_change_reason"]))
-            lines.append("<tr><td align=\"center\">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>%s"
-                         "<td align=\"right\"><b>%s</b></td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            notes = " ".join(x for x in (("was %s" % esc(was)) if was else "", ("reason: %s" % esc(reasons)) if reasons else "") if x)
+            status = esc(", ".join(statuses)) if len(statuses) == 1 else "Part approved"
+            lines.append('<tr><td align="center">%s</td><td><b>%s</b><span class="sub">%s &rsaquo; %s &middot; %s &middot; %s</span></td>%s'
+                         '<td align="right"><b>%s</b></td><td>%s%s</td></tr>' % (
                              '<input type="checkbox" name="entry_ids" value="%s" data-p="%d">' % (",".join(str(i) for i in pend_ids), uid) if pend_ids else "",
-                             esc(client), esc(project), esc(scope), esc(phase), esc(skill), esc(loc), "<b>Overtime</b>" if ot else "Normal",
-                             "".join('<td align="center">%s</td>' % (fmt(cells[d.isoformat()]["hours"]) if d.isoformat() in cells else "&ndash;") for d in days),
-                             fmt(sum(x["hours"] for x in bes)), esc(", ".join(statuses)) if len(statuses) == 1 else "Part approved", esc(was), esc(reasons)))
-        trs.append('<tr class="drow" id="%s"><td></td><td colspan="%d"><table border="1" cellpadding="3" cellspacing="0">'
-                   "<tr><th></th><th>Client</th><th>Project</th><th>Scope</th><th>CTR</th><th>Skill code</th><th>Location</th><th>Type</th>%s"
-                   "<th>Total</th><th>Status</th><th>Was</th><th>Edit reason</th></tr>%s</table></td></tr>" % (
-                       drow, ncol - 2, "".join("<th>%s</th>" % d.strftime("%a %d/%m") for d in days), "".join(lines)))
-    foot = ('<tr><td></td><td align="right"><b>All people</b></td>%s<td align="right"><b>%s</b></td><td></td><td></td></tr>' % (
-        "".join('<td align="center"><b>%s</b></td>' % (fmt(day_tot[d.isoformat()]) if day_tot[d.isoformat()] else "&ndash;") for d in days), fmt(sum(day_tot.values()))))
+                             esc(phase), esc(client), esc(project), esc(skill), esc(loc),
+                             day_cells(cells), fmt(sum(x["hours"] for x in bes)), status, ('<span class="sub">%s</span>' % notes) if notes else ""))
+        trs.append('<tr class="drow" id="%s"><td></td><td colspan="%d"><table border="1" cellpadding="3" cellspacing="0" class="ap">'
+                   "<tr><th></th><th>Booking</th>%s<th>Total</th><th>Status</th></tr>%s</table></td></tr>" % (
+                       drow, ncol - 2, "".join('<th class="dy">%s</th>' % d.strftime("%a %d/%m") for d in shown), "".join(lines)))
     body += ('<form method="post" action="/approvals/act">%s<p><small>One line per person, with the submitted and approved hours for each day. '
              '<a href="#" class="js" style="display:none" onclick="return openAll(true)">Show all detail</a>'
              '<span class="js" style="display:none"> | </span>'
@@ -133,12 +141,14 @@ def view_approvals(con, u, msgs=None, ok=False, q=None):
              'Open a line to see everything booked against that person. Tick the boxes (a person, or single entries in their detail) to action them, '
              'or tick the box in the header to select all and then untick any you have an issue with. Entries left unticked stay in your queue. '
              'Use Previous week to see earlier approved hours.</small></p>'
+             '<p class="apsum">This week: <b>%s h</b> waiting &middot; <b>%s h</b> approved</p>'
              '%s%s'
-             '<p><input type="submit" name="action" value="Approve selected"></p>'
-             '<p>Reason (needed to reject) %s <input type="submit" name="action" value="Reject selected"> '
-             '<small>Rejected entries go back to the person as drafts. Edited entries can only be approved.</small></p></form>'
-             % (hidden(u=u, w=d0), ('<table border="1" cellpadding="3" cellspacing="0">%s%s%s</table>' % (head, "".join(trs), foot)) if people else "",
-                APPROVALS_JS, txt("reason", "", 40)))
+             '<div class="apact"><input type="submit" name="action" value="Approve selected">'
+             '<span>Reason (needed to reject) %s <input type="submit" name="action" value="Reject selected"></span>'
+             '<small>Rejected entries go back to the person as drafts. Edited entries can only be approved.</small></div></form>'
+             % (hidden(u=u, w=d0), fmt(all_wait) or "0", fmt(all_appr) or "0",
+                '<table border="1" cellpadding="3" cellspacing="0" class="ap">%s%s</table>' % (head, "".join(trs)),
+                APPROVALS_JS, txt("reason", "", 32)))
     return layout(con, u, "Approvals", body)
 
 
@@ -169,8 +179,8 @@ def act_approval(con, form):
     done, msgs = 0, []
     for eid in ids:
         if not may_action(con, u, eid):
-            msgs.append("Entry %d: only an approver of its scope can approve or reject it "
-                        "(a cost controller can, when the booker is the scope's only approver)." % eid)
+            msgs.append("Entry %d: only this person's approver (their line manager, or the approver named on their record) can approve or reject it "
+                        "(a cost controller can when nobody is set)." % eid)
             continue
         try:
             if approve:
@@ -208,15 +218,13 @@ def week_status(n_submitted, n_draft):
     return "Partly submitted" if n_draft else "Submitted"
 
 
-PEOPLE_WEEKS = 8  # how far back an approver's booking history reaches to work out who their people are
 
 
 def view_missing(con, u, q):
-    """Who has not completed their timesheet for a week. Cost controllers see everyone who is active that week. An approver sees
-    their own people: anyone who has booked to a scope they approve (the scopes of a client they are main approver of, or scopes they are named
-    on), internal codes included, in the last PEOPLE_WEEKS weeks up to the week shown."""
+    """Who has not completed their timesheet for a week. Cost controllers see everyone who is active that week. A line manager or approver sees their own
+    people: the people they manage or approve for."""
     perm = permission_of(con, u)
-    if perm != "controller" and not is_approver(con, u):
+    if perm != "controller" and not has_team(con, u):
         return no_access(con, u, "Missing timesheets")
     try:
         w = monday(datetime.date.fromisoformat(q["w"][0]))
@@ -229,10 +237,8 @@ def view_missing(con, u, q):
 
     scope_sql, scope_args = "", []
     if perm != "controller":
-        since = (w - datetime.timedelta(weeks=PEOPLE_WEEKS)).isoformat()
-        scope_sql = (" and p.user_id<>? and p.user_id in (select t.user_id from time_entry t join v_scope_approver va on va.scope_id=t.scope_id "
-                     "where va.user_id=? and t.work_date between ? and ?)")
-        scope_args = [u, u, since, d6]
+        scope_sql = " and p.user_id<>? and (p.line_manager_id=? or p.approver_id=?)"
+        scope_args = [u, u, u]
     # everyone who is active at some point in the week (start and end dates)
     people = con.execute(
         "select p.user_id, p.nmc_id, p.name, p.employment_type, r.name as title from app_user p join role r on r.role_id=p.role_id "
@@ -269,7 +275,7 @@ def view_missing(con, u, q):
             hidden(u=u), date_input("w", d0), sel("s", MISSING_FILTERS, show, False, "-", ' onchange="this.form.submit()"'))]
     if not people:
         b.append("<p>Nobody is expected to submit a timesheet in this week from your list.%s</p>" % (
-            "" if perm == "controller" else " Your people are those who have booked to your scopes in the last %d weeks." % PEOPLE_WEEKS))
+            "" if perm == "controller" else " Your people are the ones you manage or approve for."))
         return layout(con, u, "Missing timesheets", "".join(b))
     b.append("<p><b>%d</b> expected: %s.</p>" % (len(people), ", ".join(
         link(w, st, "%d %s" % (counts[st], st.lower())) for st in order)))
@@ -277,7 +283,7 @@ def view_missing(con, u, q):
              "Sent back counts entries an approver rejected or a cost controller reopened that have not been submitted again. "
              "Everyone whose start and end dates cover any part of the week is expected, including the weeks still in progress.</small></p>" % (
                  "Everyone who is active that week." if perm == "controller" else
-                 "Your people: anyone who has booked to a scope you approve in the last %d weeks." % PEOPLE_WEEKS))
+                 "Your people: the ones you manage or approve for."))
     if rows:
         b.append('<table border="1" cellpadding="3" cellspacing="0"><tr><th>Person</th><th>NMC ID</th><th>Job title</th><th>Employment</th>'
                  '<th>Status</th><th>Submitted hrs</th><th>Draft hrs</th><th>Sent back</th>%s</tr>%s</table>' % (
@@ -327,9 +333,8 @@ def view_reopen(con, u, q, msgs=None, ok=False):
     if not ents:
         b.append("<p>%s has no hours in this week.</p>" % esc(name))
         return layout(con, u, "Reopen timesheet", "".join(b))
-    b.append(table(["Date", "Code", "Skill code", "Location", "Type", "Hours", "Status", "Approved by"],
-                   [[dmy(e["work_date"]), e["phase"], e["skill_code"], e["location_name"],
-                     "Overtime" if e["overtime"] else "Normal", fmt(e["hours"]), e["status"], e["approved_name"] or ""] for e in ents]))
+    b.append(table(["Date", "Code", "Skill code", "Location", "Hours", "Status", "Approved by"],
+                   [[dmy(e["work_date"]), e["phase"], e["skill_code"], e["location_name"], fmt(e["hours"]), e["status"], e["approved_name"] or ""] for e in ents]))
     reopenable = [e for e in ents if e["status"] != "Draft"]
     period = con.execute("select status from period where week_start=?", (d0,)).fetchone()
     closed = period is None or period["status"] != "Open"
