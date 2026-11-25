@@ -196,6 +196,9 @@ table.ts .chips{font-size:.8rem;color:var(--grey-dark)}
 table.ts .chips b{color:var(--orange);font-weight:500}
 table.ts .pill{display:inline-block;margin:.15rem .3rem 0 0;padding:0 .55rem;font-size:.75rem;line-height:1.5rem;border:1px solid var(--grey-light);background:var(--white);color:var(--ink);white-space:nowrap}
 table.ts .pill.ot{border-color:var(--orange);color:var(--orange)}
+table.ts td.rs{width:9.5rem;white-space:nowrap}
+table.ts select.rowsel.chg{border-color:var(--orange);box-shadow:0 0 0 1px var(--orange)}
+table.ts select.rowsel{width:9rem;max-width:9rem;height:1.9rem;font-size:.8rem;padding:0 .2rem;text-overflow:ellipsis}
 .pick2{display:flex;flex-wrap:wrap;gap:.6rem 1.4rem;margin:.6rem 0}
 .pick2 label{display:flex;align-items:center;gap:.5rem;font-size:.85rem;color:var(--grey-dark)}
 table.ts .we{background:#f1f1f2}

@@ -72,7 +72,7 @@ Each person has one permission level: `user`, `controller` (cost controller) or 
 | Missing timesheets (who has not submitted, by week) | No | Their own people: the people they manage or approve for | Everyone active that week | No |
 | Reports | Own hours only, no values | Their own and their team's hours, no values | Everything, with £ values and sales rates | No |
 | £ values and sales rates | No | No | Yes | No |
-| Admin tabs | None | None | Weekly periods, clients, rate cards, projects / scopes / CTRs, internal codes, allowance rates | Weekly periods, users, job roles, locations, budgets (P6, parked for v1) |
+| Admin tabs | None | None | All of them: weekly periods, users, job roles, clients, rate cards, projects / scopes / CTRs, internal codes, locations, allowance rates, budgets (P6). They maintain the system day to day; the one thing they cannot do is change their own permission level | Weekly periods, users, job roles, locations, budgets (P6) |
 | Audit trail | No | No | Yes | Yes |
 
 In the demo data, Alisdair Woodhead manages most of the engineers and planners, Kenneth Nicolson one person, and Graeme Hogg, the managing director, the heads and the commercial team. **My team** (a line manager's or approver's menu) lists their people with last week and this week at a glance and opens any week of any of their timesheets, read-only; a cost controller can find anyone. A person's record also holds their **default location** (On Shore unless changed, for an offshore rep say: new timesheet rows start there), their **contracted hours a week** and their **employment**: Staff, Contractor - LTD or Contractor - PAYE.

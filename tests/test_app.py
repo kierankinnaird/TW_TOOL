@@ -271,7 +271,13 @@ class TestApp(unittest.TestCase):
         page = self.get("/timesheet?u=4&w=2026-11-09&add_phase=8&add_role=4&add_loc=1")
         self.assertEqual(page.count('class="row"'), 1)
         self.assertNotIn('data-ot="1"', page)
-        self.assertIn('<span class="pill" title="Skill code">PM-04</span><span class="pill" title="Location">On Shore</span>', page)
+        row = page.split('name="rs_8_4_1_0"')[1].split("</tr>")[0]                           # the skill code and location are dropdowns on the row, beside the hours
+        self.assertIn('<option value="4" selected>PM-04 Planner</option>', row)
+        self.assertIn('name="ls_8_4_1_0"', row)
+        self.assertIn('<option value="1" selected>On Shore</option>', row)
+        self.assertLess(row.index('name="ls_8_4_1_0"'), row.index('name="h_8_4_1_0_2026-11-09"'))   # before the first day's box
+        self.assertIn("Skill code</th>", page)
+        self.assertIn("Location</th>", page)
         self.post("/timesheet/save", {"u": "4", "w": "2026-11-09", "action": "Save draft", "h_8_4_1_0_2026-11-10": "7"})
         self.assertEqual(self.hours_of(4, "2026-11-10"), [(1, 0, 7, "Draft")])
         self.assertNotIn("Overtime", self.get("/timesheet?u=4&w=2026-11-09").split("<main>")[1].split("<script>")[0])      # no overtime line under the grid
@@ -665,7 +671,8 @@ class TestApp(unittest.TestCase):
         # David Hart (4) books INT01 (phase 8) as a Planner (role 4): on shore, and a day offshore
         page = self.get("/timesheet?u=4&w=2026-11-02&add_phase=8&add_role=4&add_loc=2")
         self.assertIn("h_8_4_2_0_2026-11-02", page)                                       # an offshore row was added
-        self.assertIn('<span class="pill" title="Location">Offshore</span>', page)        # the booking cell names the location
+        self.assertIn('name="ls_8_4_2_0"', page)                                          # the row has its own location dropdown, set to Offshore
+        self.assertIn('<option value="2" selected>Offshore</option>', page.split('name="ls_8_4_2_0"')[1].split("</select>")[0])
         self.assertIn("3 entries saved", self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft", "reason": "",
                                                               "h_8_4_1_0_2026-11-03": "6", "h_8_4_1_0_2026-11-05": "2", "h_8_4_2_0_2026-11-04": "4"}))
         self.assertEqual(self.hours_of(4, "2026-11-03"), [(1, 0, 6, "Draft")])
@@ -674,6 +681,47 @@ class TestApp(unittest.TestCase):
         self.assertEqual(page.count('class="row"'), 2)                                     # two bookings: on shore and offshore
         self.assertIn('class="dt" data-day="2026-11-03"><b>6</b>', page)
         self.assertIn('class="gt"><b>12</b>', page)                                        # the week's total: 6 + 2 + 4
+
+    def test_changing_a_rows_skill_code_or_location_moves_its_draft_hours_and_reprices_them(self):
+        base = {"u": "5", "w": "2026-11-09", "action": "Save draft", "reason": ""}
+        self.open_next_week()
+        # Ewan Shaw (5) books BB0001 (phase 1) as a Planner (role 4, client rate 4): two draft days
+        self.post("/timesheet/save", dict(base, **{"h_1_4_1_0_2026-11-10": "6", "h_1_4_1_0_2026-11-11": "5"}))
+        self.assertEqual(self.q_all("select worked_role_id, location_id, rate_id from time_entry where user_id=5 and work_date between '2026-11-09' and '2026-11-15' order by work_date"),
+                         [(4, 1, 4), (4, 1, 4)])
+        # he changes the row to Project Controls Manager (role 5) and Offshore, and types a new figure for one day, all in one Save
+        page = self.post("/timesheet/save", dict(base, **{"rs_1_4_1_0": "5", "ls_1_4_1_0": "2", "h_1_4_1_0_2026-11-10": "7", "h_1_4_1_0_2026-11-11": "5"}))
+        rows = self.q_all("select work_date, hours, worked_role_id, location_id, rate_id, status from time_entry where user_id=5 and work_date between '2026-11-09' and '2026-11-15' order by work_date")
+        rate5 = self.one("select rate_id from rate where client_id=1 and role_id=5")[0]
+        self.assertEqual(rows, [("2026-11-10", 7, 5, 2, rate5, "Draft"), ("2026-11-11", 5, 5, 2, rate5, "Draft")])     # moved, repriced, and the typed hours saved
+        self.assertEqual(self.one("select count(*) from time_entry where user_id=5 and work_date between '2026-11-09' and '2026-11-15'")[0], 2)    # no duplicates left behind
+        self.assertIn('name="rs_1_5_2_0"', page)                                                                       # the row now carries its new key
+        self.assertIn('<option value="5" selected>', page.split('name="rs_1_5_2_0"')[1].split("</select>")[0])
+        self.assertIn("UPDATE", "".join(r[0] for r in self.q_all("select action from time_entry_audit where entry_id in (select entry_id from time_entry where user_id=5 and work_date='2026-11-10')")))   # and audited
+        # a skill code the client has no rate for is refused, and the hours stay where they were
+        page = self.post("/timesheet/save", dict(base, **{"rs_1_5_2_0": "31", "h_1_5_2_0_2026-11-10": "7", "h_1_5_2_0_2026-11-11": "5"}))
+        self.assertIn("no rate for that skill code on this client", page)
+        self.assertEqual(self.one("select worked_role_id from time_entry where user_id=5 and work_date='2026-11-10'")[0], 5)
+        # moving onto a row that already has hours on the same days is refused
+        self.post("/timesheet/save", dict(base, **{"h_1_4_1_0_2026-11-10": "1"}))                                      # a second row: Planner, On Shore
+        page = self.post("/timesheet/save", dict(base, **{"rs_1_4_1_0": "5", "ls_1_4_1_0": "2", "h_1_4_1_0_2026-11-10": "1"}))
+        self.assertIn("already have a row with that skill code and location", page)
+        self.assertEqual(self.one("select worked_role_id from time_entry where user_id=5 and work_date='2026-11-10' and hours=1")[0], 4)
+        # submitted hours are fixed: no dropdowns on that row, and a hand-made request to change it is refused
+        self.post("/timesheet/save", dict(base, action="Submit week"))
+        page = self.get("/timesheet?u=5&w=2026-11-09")
+        self.assertNotIn('name="rs_1_5_2_0"', page)
+        refused = self.post("/timesheet/save", dict(base, **{"rs_1_5_2_0": "4"}))
+        self.assertIn("locked", refused)
+        self.assertEqual(self.one("select worked_role_id from time_entry where user_id=5 and work_date='2026-11-10' and hours=7")[0], 5)
+
+    def test_an_empty_new_row_can_have_its_skill_code_and_location_changed_before_any_hours_are_typed(self):
+        self.open_next_week()
+        page = self.get("/timesheet?u=4&w=2026-11-09&add_phase=8&add_role=4&add_loc=1")
+        self.assertIn('name="rs_8_4_1_0"', page)
+        # the person picks Offshore on the new row and types hours in the same Save: the hours land on the Offshore row
+        self.post("/timesheet/save", {"u": "4", "w": "2026-11-09", "action": "Save draft", "reason": "", "add": "8:4:1:0", "ls_8_4_1_0": "2", "h_8_4_1_0_2026-11-10": "4"})
+        self.assertEqual(self.hours_of(4, "2026-11-10"), [(2, 0, 4, "Draft")])
 
     def test_the_default_locations_are_on_shore_offshore_and_site_visit(self):
         page = self.get("/timesheet?u=4&w=2026-11-02")
@@ -688,7 +736,7 @@ class TestApp(unittest.TestCase):
         self.assertEqual(self.hours_of(4, "2026-11-03"), [(3, 0, 7.5, "Draft")])
         page = self.get("/timesheet?u=4&w=2026-11-02&add_phase=8&add_role=4&add_loc=3")  # a Site visit row from the dropdown
         self.assertIn("h_8_4_3_0_2026-11-05", page)
-        self.assertIn('<span class="pill" title="Location">Site visit</span>', page)
+        self.assertIn('<option value="3" selected>Site visit</option>', page.split('name="ls_8_4_3_0"')[1].split("</select>")[0])
         # they show up in the report by location once approved
         eid = self.one("select entry_id from time_entry where user_id=4 and work_date='2026-11-03'")[0]
         self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Submit week", "reason": ""})
@@ -735,20 +783,19 @@ class TestApp(unittest.TestCase):
         self.assertIn("<td>Offshore</td>", own)                       # Rob Millman's offshore hours on an Apache scope
         self.assertNotIn("&pound;", own)
 
-    def test_the_it_admin_manages_the_locations(self):
+    def test_the_it_admin_and_the_cost_controllers_manage_the_locations(self):
         self.open_next_week()
-        self.assertIn("Location added", self.admin_post("/admin/add", {"t": "locations", "name": "Remote"}))
-        self.assertIn("already exists", self.admin_post("/admin/add", {"t": "locations", "name": "Remote"}))
+        self.assertIn("Location added", self.admin_post("/admin/add", {"t": "locations", "name": "Remote"}, u="29"))      # cost controllers manage locations too
+        self.assertIn("already exists", self.admin_post("/admin/add", {"t": "locations", "name": "Remote"}))            # and so does the IT admin
         rid = self.one("select location_id from location where name='Remote'")[0]
         self.assertIn('>Remote</option>', self.get("/timesheet?u=5&w=2026-11-09"))                    # offered on the timesheet
-        self.assertIn("not available to your role", self.get("/admin?u=29&t=locations"))              # the cost controller does not manage them
-        self.admin_post("/admin/add", {"t": "locations", "name": "Sneaky"}, u="29")
-        self.assertIsNone(self.one("select 1 from location where name='Sneaky'"))
+        self.admin_post("/admin/add", {"t": "locations", "name": "Sneaky"}, u="5")
+        self.assertIsNone(self.one("select 1 from location where name='Sneaky'"))                      # a standard user cannot
         # switched off: no longer offered, new bookings refused, but hours already booked keep it
         self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Save draft", "reason": "", "h_8_4_%d_0_2026-11-13" % rid: "2"})
         self.assertEqual(self.hours_of(5, "2026-11-13"), [(rid, 0, 2, "Draft")])
         self.assertIn("Saved", self.admin_post("/admin/save", {"t": "locations", "id": str(rid), "name": "Remote", "active": "0"}))
-        self.assertNotIn('>Remote</option>', self.get("/timesheet?u=5&w=2026-11-09"))
+        self.assertNotIn('>Remote</option>', self.get("/timesheet?u=5&w=2026-11-09").split('<dialog id="addrow"')[1].split("</dialog>")[0])   # no longer offered for a new row (a row already booked there still shows it)
         self.assertIn("not available", self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Save draft", "reason": "",
                                                                     "h_8_4_%d_0_2026-11-12" % rid: "2"}))
         self.assertEqual(self.hours_of(5, "2026-11-13"), [(rid, 0, 2, "Draft")])
@@ -1245,9 +1292,9 @@ class TestApp(unittest.TestCase):
         self.assertIn("not available to your role", self.get("/admin/edit?u=5&t=users&id=1"))
 
     def test_each_admin_tab_is_limited_to_its_role(self):
-        # The IT admin manages users and job roles only; the cost controller manages codes, clients and rates.
-        # Neither can use the other's tabs, and a standard user has none.
-        for who, allowed in (("30", {"periods", "users", "roles"}), ("29", {"periods", "clients", "rates", "scopes", "internal"}), ("5", set())):
+        # The cost controllers have every tab (they maintain the system day to day). The IT admin keeps periods, users, job roles, locations and budgets,
+        # and a standard user has none.
+        for who, allowed in (("30", {"periods", "users", "roles"}), ("29", {"periods", "users", "roles", "clients", "rates", "scopes", "internal"}), ("5", set())):
             page = self.get("/admin?u=%s" % who)
             for tab in ("periods", "users", "roles", "clients", "rates", "scopes", "internal"):
                 self.assertEqual("t=%s\"" % tab in page, tab in allowed, (who, tab))
@@ -1255,10 +1302,29 @@ class TestApp(unittest.TestCase):
                 if tab not in allowed:
                     self.assertIn("not available to your role", self.get("/admin?u=%s&t=%s" % (who, tab)), (who, tab))
         before = self.one("select count(*) from client")[0], self.one("select count(*) from app_user")[0]
-        self.admin_post("/admin/add", {"t": "clients", "name": "FromIT"}, u="30")
-        self.admin_post("/admin/add", {"t": "users", "nmc_id": "A950", "name": "FromController", "employment_type": "Staff", "role_id": "6",
-                                       "permission": "user", "start_date": "2026-11-01", "end_date": ""}, u="29")
+        self.admin_post("/admin/add", {"t": "clients", "name": "FromIT"}, u="30")                       # the IT admin cannot add a client
+        self.admin_post("/admin/add", {"t": "users", "nmc_id": "A950", "name": "FromStandardUser", "employment_type": "Staff", "role_id": "6",
+                                       "permission": "user", "start_date": "2026-11-01", "end_date": ""}, u="5")   # nor can a standard user add a person
         self.assertEqual((self.one("select count(*) from client")[0], self.one("select count(*) from app_user")[0]), before)
+        self.assertIn("User added", self.admin_post("/admin/add", {"t": "users", "nmc_id": "A950", "name": "FromController", "employment_type": "Staff", "role_id": "6",
+                                                                   "permission": "user", "start_date": "2026-11-01", "end_date": ""}, u="29"))   # but a cost controller can
+
+    def test_cost_controllers_have_every_admin_tab_and_can_maintain_people_roles_and_locations(self):
+        for tab in ("periods", "users", "roles", "clients", "rates", "scopes", "internal", "locations", "allowance_rates", "budgets"):
+            self.assertNotIn("not available to your role", self.get("/admin?u=29&t=%s" % tab), tab)
+        self.assertNotIn("not available to your role", self.get("/admin/edit?u=29&t=users&id=5"))
+        base = {"t": "users", "id": "5", "name": "Ewan Shaw", "employment_type": "Staff", "role_id": "4", "permission": "user", "end_date": "", "line_manager_id": "7", "email": "", "books_time": "1"}
+        # a cost controller can make another person a cost controller, and add a job title
+        self.assertIn("Saved", self.admin_post("/admin/save", dict(base, permission="controller"), u="29"))
+        self.assertEqual(self.one("select permission from app_user where user_id=5")[0], "controller")
+        self.assertIn("Role added", self.admin_post("/admin/add", {"t": "roles", "skill_code": "ZZ-01", "name": "Test Title", "family": "Quality"}, u="29"))
+        # but not change their own level (that would lock them out): someone else has to
+        own = {"t": "users", "id": "29", "name": "Stephanie Apedaile", "employment_type": "Staff", "role_id": "32", "permission": "user", "end_date": "", "line_manager_id": "31", "email": "", "books_time": "1"}
+        self.assertIn("cannot change your own permission", self.admin_post("/admin/save", own, u="29"))
+        self.assertEqual(self.one("select permission from app_user where user_id=29")[0], "controller")
+        self.assertIn("Saved", self.admin_post("/admin/save", dict(own, permission="controller", name="Stephanie Apedaile"), u="29"))     # other edits to themselves are fine
+        # the permission change is recorded like any other
+        self.assertIn(("Permission", "user", "controller"), self.q_all("select field, old_value, new_value from user_audit where user_id=5 and action='CHANGE'"))
 
     def test_menus_follow_the_role(self):
         def menu(u):
@@ -2634,7 +2700,7 @@ class TestApp(unittest.TestCase):
 
     def test_budget_hours_from_p6_are_loaded_and_compared_with_the_approved_hours(self):
         self.assertIn("not available to your role", self.get("/admin?u=5&t=budgets"))
-        self.assertIn("not available to your role", self.get("/admin?u=29&t=budgets"))   # P6 is parked for v1: the IT admin only
+        self.assertIn("P6, which holds hours only", self.get("/admin?u=29&t=budgets"))   # cost controllers load the budgets (and so can the IT admin)
         page = self.get("/admin?u=30&t=budgets")
         self.assertIn("P6, which holds hours only", page)
         self.assertIn("BB0001-PM-D-001", page)                                     # the seeded budgets are listed

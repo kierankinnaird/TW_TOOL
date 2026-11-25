@@ -20,11 +20,11 @@ ADMIN_TABS = [("periods", "Weekly periods"), ("users", "Users"), ("roles", "Job 
               ("budgets", "Budgets (from P6)")]
 
 
-# Who may use each Admin tab. IT manages users and job roles; cost controllers manage clients, rate cards, scopes and internal codes.
-# Weekly periods is open to both controllers and admins until the cost team confirms who owns it (the audit trail is handled the same way).
-TAB_ACCESS = {"periods": ("controller", "admin"), "users": ("admin",), "roles": ("admin",), "clients": ("controller",),
+# Who may use each Admin tab. Cost controllers have every tab: they maintain the system day to day (people, job roles, locations, clients, rate cards,
+# scopes, internal codes, allowance rates, periods and budgets). The IT admin keeps the tabs it always had (periods, users, job roles, locations, budgets).
+TAB_ACCESS = {"periods": ("controller", "admin"), "users": ("controller", "admin"), "roles": ("controller", "admin"), "clients": ("controller",),
               "rates": ("controller",), "scopes": ("controller",), "internal": ("controller",),
-              "locations": ("admin",), "allowance_rates": ("controller",), "budgets": ("admin",)}  # budgets (P6) are parked for v1: IT only
+              "locations": ("controller", "admin"), "allowance_rates": ("controller",), "budgets": ("controller", "admin")}  # budgets (P6) are parked for v1
 
 
 PAYMENT_TERMS = [("Reimbursable", "Reimbursable"), ("Budget", "Budget"), ("Lump Sum", "Lump Sum"), ("Non-reimbursable", "Non-reimbursable")]
@@ -454,6 +454,8 @@ def admin_save(con, form):
                 raise ValueError("A person cannot be their own line manager.")
             email = need_email(g("email"))
             before = con.execute("select * from app_user where user_id=?", (i,)).fetchone()
+            if i == u and g("permission") != before["permission"]:
+                raise ValueError("You cannot change your own permission level. Ask another cost controller or the IT admin.")
             approver = int(g("approver_id")) if g("approver_id") else None
             if approver == i:
                 raise ValueError("A person cannot approve their own timesheet.")

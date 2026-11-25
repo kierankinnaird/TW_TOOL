@@ -41,6 +41,7 @@ function filterCtr(q){q=q.toLowerCase();var s=document.getElementById('addphase'
   for(i=0;i<o.length;i++){var m=o[i].text.toLowerCase().indexOf(q)>=0;o[i].hidden=!m;o[i].disabled=!m;if(m&&!first){first=o[i];}}
   if(first&&(s.selectedIndex<0||o[s.selectedIndex].disabled)){first.selected=true;}}
 document.addEventListener('input',function(e){if(e.target.name&&e.target.name.indexOf('h_')===0){recalc();}});
+document.addEventListener('change',function(e){if(e.target.classList&&e.target.classList.contains('rowsel')){e.target.classList.add('chg');}});
 window.addEventListener('load',recalc);
 </script>"""
 
@@ -225,16 +226,33 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
     adds_hidden = "".join('<input type="hidden" name="add" value="%d:%d:%d:%d">' % k for k in rows if not rows[k]["cells"])
     b.append('<form id="tsform" method="post" action="/timesheet/save">'
              '<input type="hidden" name="u" value="%d"><input type="hidden" name="w" value="%s">%s' % (u, d0, adds_hidden))
-    head = ["Booking"] + [d.strftime("%a %d/%m") for d in days] + ["Total", ""]
+    head = ["Booking", "Skill code", "Location"] + [d.strftime("%a %d/%m") for d in days] + ["Total", ""]
+    role_rows = con.execute("select role_id, skill_code, name, active from role order by skill_code").fetchall()
+    loc_rows = con.execute("select location_id, name, active from location order by location_id").fetchall()
+
+    def role_select(key, current):
+        opts = "".join('<option value="%d"%s>%s %s</option>' % (r["role_id"], " selected" if r["role_id"] == current else "", esc(r["skill_code"]), esc(r["name"]))
+                       for r in role_rows if r["active"] or r["role_id"] == current)
+        return '<select class="rowsel" name="rs_%s" title="Skill code for this row">%s</select>' % (key, opts)
+
+    def loc_select(key, current):
+        opts = "".join('<option value="%d"%s>%s</option>' % (r["location_id"], " selected" if r["location_id"] == current else "", esc(r["name"]))
+                       for r in loc_rows if r["active"] or r["location_id"] == current)
+        return '<select class="rowsel" name="ls_%s" title="Location for this row">%s</select>' % (key, opts)
     trs = []
     day_tot = {d.isoformat(): 0.0 for d in days}
     day_norm, day_ot = dict(day_tot), dict(day_tot)  # the same, split into normal time and overtime
     for (pid, rid, lid, ot), r in rows.items():
         ot_hidden = False
-        pills = '<span class="pill" title="Skill code">%s</span><span class="pill" title="Location">%s</span>%s' % (
-            esc(r["skill"]), esc(r["location"]), '<span class="pill ot" title="Booked as overtime before overtime was removed">Overtime</span>' if ot else "")
-        tds = ['<td class="bk"><b>%s</b><br><span class="sub">%s &rsaquo; %s &rsaquo; %s</span><br><span class="chips">%s</span></td>' % (
-            esc(r["phase"]), esc(r["client"]), esc(r["project"]), esc(r["scope"]), pills)]
+        legacy = '<br><span class="chips"><span class="pill ot" title="Booked as overtime before overtime was removed">Overtime</span></span>' if ot else ""
+        tds = ['<td class="bk"><b>%s</b><br><span class="sub">%s &rsaquo; %s &rsaquo; %s</span>%s</td>' % (
+            esc(r["phase"]), esc(r["client"]), esc(r["project"]), esc(r["scope"]), legacy)]
+        # the skill code and location are chosen on the row, next to the hours: changing one moves the row's draft hours (when the row has any that are not drafts, it is fixed)
+        key = "%d_%d_%d_%d" % (pid, rid, lid, ot)
+        if can_edit and not ot and all(e["status"] == "Draft" for e in r["cells"].values()):
+            tds.append('<td class="rs">%s</td><td class="rs">%s</td>' % (role_select(key, rid), loc_select(key, lid)))
+        else:
+            tds.append('<td class="rs"><span class="sub">%s</span></td><td class="rs"><span class="sub">%s</span></td>' % (esc(r["skill"]), esc(r["location"])))
         rt = 0.0
         for d in days:
             iso = d.isoformat()
@@ -269,13 +287,13 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
             len(head), " Click <b>+ Add timesheet row</b> above to choose a CTR, then enter your hours." if can_edit else ""))
 
     def sum_row(label, day_cls, week_cls, per_day, row_cls=""):  # Normal time, Overtime and Total lines under the grid
-        return '<tr class="%s"><td align="right"><b>%s</b></td>%s<td align="right" class="%s"><b>%s</b></td><td></td></tr>' % (
+        return '<tr class="%s"><td align="right" colspan="3"><b>%s</b></td>%s<td align="right" class="%s"><b>%s</b></td><td></td></tr>' % (
             row_cls, label, "".join('<td align="center" class="%s" data-day="%s"><b>%s</b></td>' % (day_cls, d.isoformat(), fmt(per_day[d.isoformat()])) for d in days),
             week_cls, fmt(sum(per_day.values())))
     has_ot = any(k[3] and (rows[k]["cells"] or not rows[k].get("auto")) for k in rows)  # the normal time and overtime lines only matter once there is overtime
     foot = (sum_row("Normal time", "dn", "gn", day_norm, "sum") + sum_row("Overtime", "do", "go", day_ot, "sum")) if has_ot else ""
     foot += sum_row("Total", "dt", "gt", day_tot, "tot")
-    hdr = "".join('<th class="%s">%s</th>' % ("bkh" if i == 0 else ("we" if 1 <= i <= 7 and days[i - 1].weekday() >= 5 else ""), esc(h).replace(" ", "<br>", 1) if 1 <= i <= 7 else esc(h))
+    hdr = "".join('<th class="%s">%s</th>' % ("bkh" if i == 0 else ("we" if 3 <= i <= 9 and days[i - 3].weekday() >= 5 else ""), esc(h).replace(" ", "<br>", 1) if 3 <= i <= 9 else esc(h))
                   for i, h in enumerate(head))
     b.append('<div class="tools"><!--ADDROW--></div>')
     b.append('<table class="ts" border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s%s</table>' % (hdr, "".join(trs), foot))
@@ -292,7 +310,8 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
         b.append("<p><small><b>Offshore allowance:</b> %d night%s this week (a night is earned when you are offshore that day and the next, so the last offshore day of a trip earns none). "
                  "It is worked out from your hours, so there is nothing to claim.</small></p>" % (nights, "" if nights == 1 else "s"))
     if not locked:
-        b.append("<p><small>To clear a draft entry, empty its box and click Save draft.</small></p>")
+        b.append("<p><small>To clear a draft entry, empty its box and click Save draft. To change a row's skill code or location, pick the new one and click Save draft: "
+                 "the row's draft hours move with it.</small></p>")
     if len(parts) == 2 and not locked:
         m = lambda iso: datetime.date.fromisoformat(iso).strftime("%d/%m")
         month, upto = datetime.date.fromisoformat(parts[0][1]).strftime("%B"), m(parts[0][1])
@@ -381,6 +400,69 @@ def book_entry(con, u, pid, rid, lid, ot, date, hours):
     return None
 
 
+def move_rows(con, u, form, d0, d6, msgs):
+    """Rows whose skill code or location was changed on the page (fields rs_<row> and ls_<row>, the row being phase_skill_location_overtime as it was
+    when the page was drawn). Each row's draft hours for the week move to the new skill code and location, with the client's rate for the new skill
+    code. Returns {old row: new row}. A row is left as it was, with a message, when it has hours that are not drafts, when it would land on a row that
+    already has hours on the same days, or when the client has no rate for the new skill code."""
+    changes = {}
+    for name, vals in form.items():
+        if name[:3] in ("rs_", "ls_"):
+            try:
+                pid, rid, lid, ot = (int(x) for x in name[3:].split("_"))
+                value = int(vals[0])
+            except ValueError:
+                continue
+            c = changes.setdefault((pid, rid, lid, ot), {})
+            c["role" if name.startswith("rs_") else "loc"] = value
+    moved = {}
+    for (pid, rid, lid, ot), c in changes.items():
+        new_rid, new_lid = c.get("role", rid), c.get("loc", lid)
+        if (new_rid, new_lid) == (rid, lid) or ot:
+            continue
+        if not con.execute("select 1 from role where role_id=? and active=1", (new_rid,)).fetchone() or not con.execute("select 1 from location where location_id=? and active=1", (new_lid,)).fetchone():
+            msgs.append("That skill code or location is not available.")
+            continue
+        info = con.execute("select s.client_id, cl.is_internal, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase from phase ph join scope s on s.scope_id=ph.scope_id "
+                           "join client cl on cl.client_id=s.client_id where ph.phase_id=?", (pid,)).fetchone()
+        if not info:
+            continue
+        mine = con.execute("select * from time_entry where user_id=? and phase_id=? and worked_role_id=? and location_id=? and overtime=? and work_date between ? and ?",
+                           (u, pid, rid, lid, ot, d0, d6)).fetchall()
+        if any(e["status"] != "Draft" for e in mine):
+            msgs.append("%s: that row has submitted or approved hours, so its skill code and location cannot be changed." % info["phase"])
+            continue
+        taken = {e["work_date"] for e in con.execute("select work_date from time_entry where user_id=? and phase_id=? and worked_role_id=? and location_id=? and overtime=? and work_date between ? and ?",
+                                                    (u, pid, new_rid, new_lid, ot, d0, d6)).fetchall()}
+        if taken & {e["work_date"] for e in mine}:
+            msgs.append("%s: you already have a row with that skill code and location on the same days. Put the hours on that row instead." % info["phase"])
+            continue
+        rates = {}
+        problem = None
+        for e in mine:
+            if info["is_internal"]:
+                rates[e["entry_id"]] = None
+                continue
+            r = con.execute("select rate_id from rate where client_id=? and role_id=? and effective_from<=? order by effective_from desc limit 1",
+                            (info["client_id"], new_rid, e["work_date"])).fetchone()
+            if not r:
+                problem = "no rate for that skill code on this client."
+                break
+            rates[e["entry_id"]] = r[0]
+        if problem:
+            msgs.append("%s: %s" % (info["phase"], problem))
+            continue
+        try:
+            for e in mine:
+                con.execute("update time_entry set worked_role_id=?, location_id=?, rate_id=?, last_edited_by=?, last_edited_at=? where entry_id=?",
+                            (new_rid, new_lid, rates[e["entry_id"]], u, stamp(), e["entry_id"]))
+        except pg.DatabaseError as ex:
+            msgs.append("%s: %s" % (info["phase"], friendly(pg.error_text(ex))))
+            continue
+        moved[(pid, rid, lid, ot)] = (pid, new_rid, new_lid, ot)
+    return moved
+
+
 def friendly(problem):
     """The database's booking-rule messages, put the way a person would say them."""
     return str(problem).replace("A person cannot book more than 24 hours in one day", "you cannot book more than 24 hours in one day")
@@ -395,11 +477,17 @@ def save_timesheet(con, form):
     if sheet_locked(con, u, d0, d6):  # nothing at all can be added to or changed on a submitted sheet
         return view_timesheet(con, u, w, [LOCKED_MSG])
     frozen = locked_days(con, u, d0, d6)  # days in an already submitted stretch (a month end inside the week)
+    remap = move_rows(con, u, form, d0, d6, msgs)   # a row whose skill code or location was changed moves its draft hours first
+    adds = [remap.get(tuple(a), tuple(a)) for a in adds]
     delete = form.get("delrow", [""])[0].split(":")  # "h:phase:role:location"
     try:
         del_h = tuple(int(x) for x in delete[1:4]) if delete[0] == "h" and len(delete) == 4 else None
     except ValueError:
         del_h = None
+    if del_h:
+        moved = next((v for k, v in remap.items() if k[:3] == del_h), None)
+        if moved:
+            del_h = moved[:3]
     for key, vals in form.items():
         if not key.startswith("h_"):
             continue
@@ -408,6 +496,9 @@ def save_timesheet(con, form):
             pid, rid, lid, ot = int(pid), int(rid), int(lid), int(ot)
         except ValueError:
             continue
+        if (pid, rid, lid, ot) in remap:                       # typed on a row that has just been moved: the same row under its new skill code / location
+            _p, rid, lid, _o = remap[(pid, rid, lid, ot)]
+            key = "h_%d_%d_%d_%d_%s" % (pid, rid, lid, ot, date)
         if del_h == (pid, rid, lid):  # the row being deleted is not saved first
             continue
         raw = vals[0].strip()
