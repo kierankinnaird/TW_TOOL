@@ -20,6 +20,15 @@ INTERNAL_PHASES = {7: 8, 8: 9, 9: 10}            # internal scope -> its phase
 COST_CONTROLLER = 29
 
 
+def ensure_paaf(con, uid, scope, role, seen):
+    """Hold a PAAF for the project of this client scope and this role, so the hours can be booked (internal codes need none)."""
+    key = (uid, scope, role)
+    if key not in seen:
+        seen.add(key)
+        con.execute("insert into paaf (project_id, role_id, user_id, start_date) select s.project_id, ?, ?, '2026-01-01' from scope s join client c on c.client_id=s.client_id "
+                    "where s.scope_id=? and c.is_internal=0 on conflict do nothing", (role, uid, scope))
+
+
 def derive_combos(con, combos, full_time, rnd):
     """Booking patterns for people the seed has no hours for (the company's people loaded from the tenant export): a billable role books to the
     open client scopes the client has a rate for (one or two of them), anything else books internal time. Approvers, cost controllers and the IT
@@ -51,6 +60,7 @@ def derive_combos(con, combos, full_time, rnd):
 def add_history(con, first_monday=FIRST_MONDAY, weeks=WEEKS):
     rnd = random.Random(2026)
     day = datetime.date.fromisoformat
+    paafs = set()
     combos = {}
     for r in con.execute("select user_id, scope_id, phase_id, worked_role_id, rate_id, location_id, overtime, count(*) as n from time_entry "
                          "group by 1,2,3,4,5,6,7 order by user_id, n desc, scope_id"):
@@ -98,6 +108,7 @@ def add_history(con, first_monday=FIRST_MONDAY, weeks=WEEKS):
                 pool = [c for c in mine if (c[4] == 2) == offshore] or mine if rota is not None else mine
                 weights = [c[6] for c in pool]
                 scope, phase, role, rate, loc, ot, _ = rnd.choices(pool, weights=weights)[0]
+                ensure_paaf(con, uid, scope, role, paafs)
                 hours = 12 if offshore else rnd.choice((8, 8, 8, 8, 7.5)) if uid in full_time or rota is not None else rnd.choice((4, 6, 8))
                 if not offshore and rnd.random() < 0.12:                 # part of the day on internal time
                     iscope = rnd.choice((7, 8, 8))
@@ -127,4 +138,51 @@ def add_history(con, first_monday=FIRST_MONDAY, weeks=WEEKS):
             when2 = "%s 15:00:00" % (day(approved) + datetime.timedelta(days=1)).isoformat()
             con.execute("update time_entry set status='Approved', approved_by=?, approved_at=?, last_edited_by=?, last_edited_at=? where entry_id=?", (who, when2, who, when2, eid))
         edits = []
+    con.execute("delete from paaf where user_id=23 and role_id=10 and exists (select 1 from paaf where user_id=23 and role_id=35)")   # the seed's document controller bills under each client's title now
+    # the cost controllers can try booking too: a PAAF on each client project for their own job title wherever the client has a rate for it
+    con.execute("insert into paaf (project_id, role_id, user_id, start_date) select pr.project_id, u.role_id, u.user_id, '2026-01-01' from app_user u cross join project pr join client c on c.client_id=pr.client_id "
+                "where u.permission='controller' and c.is_internal=0 and exists (select 1 from rate r where r.client_id=pr.client_id and r.role_id=u.role_id) on conflict do nothing")
+    # two PAAFs to show the dates: one that has expired (it ended before the seed's own weeks) and one that has not started yet
+    con.execute("insert into paaf (project_id, role_id, user_id, reference, start_date, end_date) values (3, 4, 4, 'PAAF-SPJ-014', '2026-01-01', '2026-09-30') on conflict do nothing")
+    con.execute("insert into paaf (project_id, role_id, user_id, reference, start_date, end_date) values (3, 3, 4, 'PAAF-SPJ-015', '2027-01-04', '2027-12-31') on conflict do nothing")
     con.commit()
+    add_late_changes(con)
+
+
+def add_late_changes(con):
+    """Corrections made after a four-week report period (28 Sep to 25 Oct) had ended, to work from inside it, so the manhour report for the next period has
+    adjustments to show: some hours taken off, some added, one bundle sent back to draft by a cost controller. Also a correction made inside the period
+    (which is not an adjustment: the report simply shows the corrected figure)."""
+    rows = con.execute(
+        "select t.entry_id, t.user_id, t.hours, t.work_date, t.scope_id from time_entry t join scope s on s.scope_id=t.scope_id "
+        "where s.client_id in (1, 2) and t.status='Approved' and t.work_date between '2026-09-28' and '2026-10-23' and t.overtime=0 "
+        "order by t.entry_id").fetchall()
+    approver = {r[0]: r[1] for r in con.execute("select user_id, approver_id from v_person_approver")}
+    by_client = {}
+    for r in rows:
+        client = con.execute("select client_id from scope where scope_id=?", (r[4],)).fetchone()[0]
+        by_client.setdefault(client, []).append(r)
+    plan = []   # (entry, change in hours, when, reason)
+    for client, entries in by_client.items():
+        picks = entries[3::37][:7]
+        for n, e in enumerate(picks):
+            if n == 6:
+                plan.append((e, None, "2026-10-28 16:00:00", "Booked to the wrong job"))              # sent back to draft
+            elif n % 2 == 0:
+                plan.append((e, -1.0, "2026-10-29 10:%02d:00" % (n * 7), "Site log shows one hour less (client query)"))
+            else:
+                plan.append((e, 0.5, "2026-10-30 11:%02d:00" % (n * 7), "Half an hour missed off the timesheet"))
+        if len(entries) > 5:
+            e = entries[1]
+            plan.append((e, -0.5, "2026-10-14 13:00:00", "Corrected before the period closed"))        # inside the period: no adjustment
+    for (eid, uid, hours, work_date, scope), change, when, reason in plan:
+        who = approver.get(uid) or COST_CONTROLLER
+        if change is None:
+            con.execute("update time_entry set status='Draft', reopen_reason=?, last_edited_by=?, last_edited_at=? where entry_id=?", (reason, COST_CONTROLLER, when, eid))
+            continue
+        con.execute("update time_entry set hours=?, status='Edited', edit_count=edit_count+1, last_change_reason=?, last_edited_by=?, last_edited_at=? where entry_id=?",
+                    (hours + change, reason, who, when, eid))
+        again = when[:-2] + "59"                                                                       # re-approved a little later
+        con.execute("update time_entry set status='Approved', approved_by=?, approved_at=?, last_edited_by=?, last_edited_at=? where entry_id=?", (who, again, who, again, eid))
+    con.commit()
+    return len(plan)

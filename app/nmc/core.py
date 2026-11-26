@@ -12,7 +12,7 @@ DB_URL = None   # the database to use; None means DATABASE_URL (see pg.database_
 
 
 # Databases built before this version lack columns and rules the app relies on. Matches the version in schema_info in db/schema.sql.
-REQUIRED_SCHEMA = 27
+REQUIRED_SCHEMA = 30
 
 
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
@@ -492,6 +492,13 @@ def opts_roles(con, active_only=True):
 def opts_clients(con, billable_only=False):
     """billable_only leaves out the Internal client, which has no rate card."""
     return [tuple(r) for r in con.execute("select client_id, name from client %s order by name" % ("where is_internal=0" if billable_only else ""))]
+
+
+def opts_assets(con, client_id=None):
+    """Assets to pick from, as (id, label): one client's, or everyone's labelled with the client."""
+    if client_id is not None:
+        return [tuple(r) for r in con.execute("select asset_id, name from asset where client_id=? order by name", (client_id,))]
+    return [tuple(r) for r in con.execute("select a.asset_id, c.name || ' - ' || a.name from asset a join client c on c.client_id=a.client_id order by c.name, a.name")]
 
 
 def opts_projects(con):

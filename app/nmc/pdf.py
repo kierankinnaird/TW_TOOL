@@ -1,4 +1,4 @@
-"""PDF reports. The man-hour report for a client as a PDF to read and sign: a clear table of approved hours by job family, role and person, and approval boxes
+"""PDF reports. The man-hour report for a client as a PDF to read and sign: a clear table of hours by CTR, person and role, the adjustments, and approval boxes
 (name, signature, date) kept together at the end so the document can go straight into DocuSign."""
 import datetime
 import io
@@ -68,36 +68,45 @@ def columns(weeks):
 
 
 def table_rows(data, keys, key_of):
-    """The report as table rows (cells) with a kind each: 'family', 'role', 'person', 'total' or 'grand'."""
+    """The work of the period as table rows (cells) with a kind each: 'ctr' (a CTR heading), 'person', 'total' or 'grand'."""
     out = []
     grand = {k: 0.0 for k in keys}
-    for family, roles in data["tree"].items():
-        fam = {k: 0.0 for k in keys}
-        out.append(("family", [family] + [""] * (len(keys) + 1)))
-        for (code, role), people in roles.items():
-            per_person = []
-            role_tot = {k: 0.0 for k in keys}
-            for person, d in people.items():
-                cells = {k: 0.0 for k in keys}
-                for w, h in d["w"].items():
-                    cells[key_of(w)] += h
-                per_person.append((person, cells))
-                for k in keys:
-                    role_tot[k] += cells[k]
-            if len(per_person) == 1:                                             # one person in the role: a single line carries both
-                person, cells = per_person[0]
-                out.append(("person", ["%s  (%s %s)" % (person, code, role)] + [num(cells[k]) for k in keys] + [num(sum(cells.values()))]))
-            else:
-                out.append(("role", ["%s %s" % (code, role)] + [num(role_tot[k]) for k in keys] + [num(sum(role_tot.values()))]))
-                for person, cells in per_person:
-                    out.append(("person", ["      " + person] + [num(cells[k]) for k in keys] + [num(sum(cells.values()))]))
+    for ctr in data["tree"].values():
+        extra = "".join("   %s: %s" % (label, v) for label, v in (("Asset", ctr["asset"]), ("PO", ctr["po"])) if v)
+        out.append(("ctr", ["%s - %s%s" % (ctr["ctr"], ctr["title"], extra)] + [""] * (len(keys) + 1)))
+        sub = {k: 0.0 for k in keys}
+        for (person, code, role), per in ctr["people"].items():
+            cells = {k: 0.0 for k in keys}
+            for w, h in per.items():
+                cells[key_of(w)] += h
+            out.append(("person", ["      %s  (%s %s)" % (person, code, role)] + [num(cells[k]) for k in keys] + [num(sum(cells.values()))]))
             for k in keys:
-                fam[k] += role_tot[k]
-        out.append(("total", ["Total " + family] + [num(fam[k]) for k in keys] + [num(sum(fam.values()))]))
+                sub[k] += cells[k]
+        if len(ctr["people"]) > 1:
+            out.append(("total", ["Total " + ctr["ctr"]] + [num(sub[k]) for k in keys] + [num(sum(sub.values()))]))
         for k in keys:
-            grand[k] += fam[k]
-    out.append(("grand", ["Total approved hours for the client"] + [num(grand[k]) for k in keys] + [num(sum(grand.values()))]))
+            grand[k] += sub[k]
+    out.append(("grand", ["Total for the period (work dated in the period)"] + [num(grand[k]) for k in keys] + [num(sum(grand.values()))]))
     return out, sum(grand.values())
+
+
+def adjustment_table(data, width):
+    """The late changes as a table, or None when there are none."""
+    adj = data["adjustments"]
+    if not adj:
+        return None
+    sg = lambda v: "%+g" % round(v, 2)
+    rows = [["CTR", "Person", "Role", "Week worked (w/c)", "Changed on", "Hours (+/-)"]]
+    rows += [["%s - %s" % (a["ctr"], a["title"]), a["person"], "%s %s" % (a["skill"], a["role"]), dmy(a["week"]), dmy(a["changed"]), sg(a["hours"])] for a in adj]
+    rows.append(["Total adjustments", "", "", "", "", sg(data["total_adjustments"])])
+    cell = ParagraphStyle("c", parent=TEXT, fontSize=8, leading=9.5)
+    body = [[Paragraph(str(c), cell) if j < 3 else c for j, c in enumerate(r)] for r in rows[1:-1]]
+    t = Table([rows[0]] + body + [rows[-1]], colWidths=[width * 0.34, width * 0.18, width * 0.2, width * 0.1, width * 0.1, width * 0.08], repeatRows=1)
+    t.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), "Helvetica"), ("FONTSIZE", (0, 0), (-1, -1), 8), ("ALIGN", (3, 0), (-1, -1), "RIGHT"),
+                           ("BACKGROUND", (0, 0), (-1, 0), BLACK), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                           ("LINEBELOW", (0, 1), (-1, -1), 0.25, LINE), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                           ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("LINEABOVE", (0, -1), (-1, -1), 0.6, BLACK)]))
+    return t
 
 
 def signature_boxes(client, prepared_by, produced):
@@ -125,16 +134,14 @@ def manhour_pdf(data, prepared_by="", compress=True):
     first, last = 80 * mm, 20 * mm
     each = min(18 * mm, (width - first - last) / max(1, len(keys)))
     col_w = [width - last - each * len(keys)] + [each] * len(keys) + [last]
-    head = ["Person / role"] + labels + ["Total"]
+    head = ["CTR / person"] + labels + ["Total"]
     styles = [("FONTNAME", (0, 0), (-1, -1), "Helvetica"), ("FONTSIZE", (0, 0), (-1, -1), 8), ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
               ("BACKGROUND", (0, 0), (-1, 0), BLACK), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
               ("LINEBELOW", (0, 1), (-1, -1), 0.25, LINE), ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
               ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]
     for i, (kind, _) in enumerate(rows, start=1):
-        if kind == "family":
+        if kind == "ctr":
             styles += [("BACKGROUND", (0, i), (-1, i), LIGHT), ("FONTNAME", (0, i), (-1, i), "Helvetica-Bold"), ("LINEABOVE", (0, i), (-1, i), 0.8, ORANGE)]
-        elif kind == "role":
-            styles += [("FONTNAME", (0, i), (-1, i), "Helvetica-Bold")]
         elif kind == "total":
             styles += [("FONTNAME", (0, i), (-1, i), "Helvetica-Bold"), ("LINEABOVE", (0, i), (-1, i), 0.6, BLACK)]
         elif kind == "grand":
@@ -144,17 +151,24 @@ def manhour_pdf(data, prepared_by="", compress=True):
 
     story = [Paragraph("Manhours report", H1), Spacer(1, 2 * mm),
              Paragraph("<b>Client:</b> %s &nbsp;&nbsp; <b>Period:</b> %s &nbsp;&nbsp; <b>Produced:</b> %s" % (client, period, produced), TEXT),
-             Paragraph("Approved hours only, by job family, role and person. %s" % (
+             Paragraph("Submitted and approved hours, counted once, by CTR, person and role. %s" % (
                  "Each column is a week (week commencing, Monday)." if len(keys) == len(data["weeks"]) else
                  "Each column is a month, by the Monday of each week worked."), SMALL),
              Spacer(1, 4 * mm)]
     if len(rows) > 1:
         story.append(table)
     else:
-        story.append(Paragraph("No approved hours for %s in this period." % client, TEXT))
+        story.append(Paragraph("No hours for %s in this period." % client, TEXT))
+    adj = adjustment_table(data, width)
+    if adj is not None:
+        story += [Spacer(1, 6 * mm), Paragraph("Adjustments", H2),
+                  Paragraph("Changes made in this period to work from earlier weeks (a late timesheet, a correction or hours sent back), shown against the week they belong to.", SMALL),
+                  Spacer(1, 2 * mm), adj]
+    grand_total = total + data["total_adjustments"]
     story += [Spacer(1, 8 * mm),
               KeepTogether([Paragraph("Approval", H2),
-                            Paragraph("The approved hours above (%s in total) are confirmed as correct for %s, for the period %s." % (num(total) or "0 hours", client, period), TEXT),
+                            Paragraph("The hours in this report (%s in total, work in the period %s and adjustments %+g) are confirmed as correct for %s, for the period %s." % (
+                                num(grand_total) or "0 hours", num(total) or "0", round(data["total_adjustments"], 2), client, period), TEXT),
                             Spacer(1, 3 * mm), signature_boxes(client, prepared_by, produced)])]
 
     buf = io.BytesIO()

@@ -300,6 +300,9 @@ def report_sheet(con, u, q, key):
         rows = [["Location", "Hours"]]
         rows += [[r["location"], r["hours"]] for r in location_data(con, u, rv, d_from, d_to)]
         return rows, "Location %s to %s" % (d_from, d_to)
+    if key in ("ltd", "paye_week", "paye_month") and permission_of(con, u) == "controller":
+        title, sub, head, found = contractor_hours(con, key, q)
+        return [head] + found + ([["Total", "", "", "", sum(r[4] for r in found)]] if found else []), title
     if key == "budget" and permission_of(con, u) == "controller":
         rows = [["Client", "CTR No", "Budget hrs", "As of", "Actual hrs", "Pending hrs", "Remaining hrs", "Used %"]]
         for r in budget_data(con):
@@ -310,7 +313,9 @@ def report_sheet(con, u, q, key):
     return None
 
 
-def view_reports(con, u, q):
+def view_all_reports(con, u, q):
+    """Every report the system can run (CTR, period, budget, internal, location, allowance, AAA, weekly hours, month end). Not on the Reports page for now: open it
+    with /reports?all=1, or switch SHOW_ALL_REPORTS on to bring the buttons back."""
     if not can_see_reports(con, u):  # reports are for cost controllers and approvers
         return no_access(con, u, "Reports")
     rv = report_view(con, u)
@@ -463,6 +468,97 @@ def view_reports(con, u, q):
     return layout(con, u, "Reports", report_menu(con, u, b, q.get("r", [""])[0]))
 
 
+# ---------- The Reports page as it is now: the manhour report and the contractor hours for AAA ----------
+# The other reports (above) still work and are only hidden: /reports?all=1 shows them all, a link with r=<report> opens that one, and SHOW_ALL_REPORTS puts the buttons back.
+SHOW_ALL_REPORTS = False
+LEGACY_REPORTS = ("ctr", "period", "budget", "aaa", "weekly", "internal", "loc", "allow", "month")
+LTD, PAYE = "Contractor - LTD", "Contractor - PAYE"
+CONTRACTOR_REPORTS = (("Contractor hours", ("ltd", "paye_week", "paye_month")),)
+
+
+def month_of(q):
+    """(first day, last day) of the month in q["month"] (yyyy-mm); last month when missing or not a month."""
+    try:
+        first = datetime.date.fromisoformat(q.get("month", [""])[0] + "-01")
+    except ValueError:
+        first = (datetime.date.today().replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
+    return first, (first.replace(day=28) + datetime.timedelta(days=4)).replace(day=1) - datetime.timedelta(days=1)
+
+
+def week_range(q):
+    """(from, to) of the weeks asked for: the dates in q, otherwise the last complete week (Monday to Sunday)."""
+    try:
+        a, b = datetime.date.fromisoformat(q.get("from", [""])[0]), datetime.date.fromisoformat(q.get("to", [""])[0])
+    except ValueError:
+        a = monday(datetime.date.today()) - datetime.timedelta(days=7)
+        b = a + datetime.timedelta(days=6)
+    return (a, b) if a <= b else (b, a)
+
+
+def contractor_hours(con, kind, q):
+    """One of the three contractor hours reports: (title, subtitle, header, rows). Rows are [NMC User ID, location, name, date, hours], one per person,
+    location and month (ltd) or week (PAYE). Hours are submitted plus approved (drafts are left out), hours only. For the PAYE monthly report a week that
+    runs over a month end is split there: each week shows only the days that fall in the month."""
+    d = lambda iso: datetime.date.fromisoformat(iso).strftime("%d %b %Y")
+    if kind == "ltd":
+        first, last = month_of(q)
+        employment, bucket, where, args = LTD, "substr(t.work_date, 1, 7)", "t.work_date between ? and ?", (first.isoformat(), last.isoformat())
+        title, sub, label = "Ltd company hours", "%s: total hours booked in the month" % first.strftime("%B %Y"), lambda b: datetime.date.fromisoformat(b + "-01").strftime("%b %Y")
+    elif kind == "paye_week":
+        first, last = week_range(q)
+        employment, bucket, where, args = PAYE, "monday_of(t.work_date)", "monday_of(t.work_date) between monday_of(?) and ?", (first.isoformat(), last.isoformat())
+        title, sub, label = "PAYE weekly hours", "Total hours for each week, weeks commencing %s to %s" % (d(monday(first).isoformat()), d(last.isoformat())), d
+    else:
+        first, last = month_of(q)
+        employment, bucket, where, args = PAYE, "monday_of(t.work_date)", "t.work_date between ? and ?", (first.isoformat(), last.isoformat())
+        title, sub, label = "PAYE monthly hours", "%s: total hours split by week (week commencing)" % first.strftime("%B %Y"), d
+    found = con.execute(
+        "select p.nmc_id, lo.name as location, p.name, %s as bucket, sum(t.hours) as hours from time_entry t join app_user p on p.user_id=t.user_id "
+        "join location lo on lo.location_id=t.location_id where t.status<>'Draft' and p.employment_type=? and %s "
+        "group by p.user_id, p.nmc_id, p.name, lo.location_id, lo.name, bucket order by p.nmc_id, lo.location_id, bucket" % (bucket, where), (employment,) + args).fetchall()
+    rows = [[r["nmc_id"], r["location"], r["name"], label(r["bucket"]), r["hours"]] for r in found]
+    return title, sub, ["Person: NMC User ID", "Timesheet Location", "Person: Full Name (Firstname Lastname)", "Date", "Time Booked (hrs)"], rows
+
+
+def contractor_panel(con, u, q, kind):
+    """One contractor report on the Reports page: its dates, the table and the Excel link."""
+    title, sub, head, rows = contractor_hours(con, kind, q)
+    if kind == "paye_week":
+        a, b = week_range(q)
+        form = "From %s to %s" % (date_input("from", a.isoformat()), date_input("to", b.isoformat()))
+        keep = [("from", a.isoformat()), ("to", b.isoformat())]
+    else:
+        first, _ = month_of(q)
+        form = 'Month <input type="month" name="month" value="%s">' % first.strftime("%Y-%m")
+        keep = [("month", first.strftime("%Y-%m"))]
+    out = ['<h4>%s</h4><p><small>%s. Submitted and approved hours, counted once, hours only (drafts are left out).</small></p>' % (esc(title), esc(sub)),
+           '<form method="get" action="/reports">%s<p>%s <input type="submit" value="Show"> '
+           '<a href="/reports/export.xlsx?%s">Download as Excel</a></p></form>' % (hidden(u=u, r=kind), form, esc(urlencode([("u", u), ("k", kind)] + keep)))]
+    if rows:
+        body = "".join('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td align="right">%s</td></tr>' % (esc(r[0]), esc(r[1]), esc(r[2]), esc(r[3]), "%.2f" % r[4]) for r in rows)
+        out.append('<table border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s%s</table>' % (
+            "".join("<th>%s</th>" % esc(h) for h in head), body, sub_row(["Total", "", "", "", "%.2f" % sum(r[4] for r in rows)], right_from=4)))
+    else:
+        out.append("<p>No hours for this period.</p>")
+    return "".join(out)
+
+
+def view_reports(con, u, q):
+    """The Reports page: the manhour report by client, and (cost controllers) the contractor hours reports for AAA. Everything else is hidden, see view_all_reports."""
+    if not can_see_reports(con, u):  # reports are for cost controllers and approvers
+        return no_access(con, u, "Reports")
+    if SHOW_ALL_REPORTS or q.get("all", [""])[0] or q.get("r", [""])[0] in LEGACY_REPORTS:
+        return view_all_reports(con, u, q)
+    parts = []
+    if permission_of(con, u) == "controller":
+        for kind, name in (("ltd", "Ltd company hours"), ("paye_week", "PAYE weekly hours"), ("paye_month", "PAYE monthly hours")):
+            parts += [sect(kind, name), contractor_panel(con, u, q, kind)]
+    opened = q.get("r", [""])[0]
+    if not parts and not manhour_clients(con, u):
+        return layout(con, u, "Reports", "<p>There are no reports for you yet.</p>")
+    return layout(con, u, "Reports", report_menu(con, u, parts, opened, CONTRACTOR_REPORTS, grid=False))
+
+
 def sect(key, title):
     """Marks where a report starts in the page, so the Reports page can offer each one as a button."""
     return (key, title)
@@ -484,10 +580,13 @@ REPORT_HELP = {
     "allow": "Offshore nights per person and what they are worth",
     "month": "Who still has to enter or submit time for a calendar month, and the month's hours by CTR",
     "grid": "Hours by person, code and day, in ready-made layouts you can tailor",
-    "manhours": "People and roles on a client's work, as an Excel file"}
+    "manhours": "People and roles on a client's work, as an Excel file",
+    "ltd": "Total hours booked in a month by each Ltd company contractor, by location",
+    "paye_week": "Each PAYE contractor's total hours for each week, by location, for AAA",
+    "paye_month": "Each PAYE contractor's hours for each week of a month, by location, for AAA"}
 
 
-def report_menu(con, u, parts, opened):
+def report_menu(con, u, parts, opened, groups=None, grid=True):
     """A row of buttons, one per report, and only the report you pick is shown. Sections arrive as (key, title) marks followed by their html."""
     panels, cur = [], None
     for x in parts:
@@ -500,15 +599,16 @@ def report_menu(con, u, parts, opened):
     opened = opened if opened in keys else ""
     by_key = {k: t for k, t, _ in panels}
     rows = []
-    for label, group in REPORT_GROUPS:
+    for label, group in (groups or REPORT_GROUPS):
         bs = "".join('<input type="button" class="rbtn" id="rb-%s" value="%s" title="%s" onclick="showReport(&quot;%s&quot;)"> ' % (k, esc(by_key[k]), esc(REPORT_HELP[k]), k)
                      for k in group if k in by_key)
         if bs:
             rows.append('<div class="rgroup"><span class="gl">%s</span>%s</div>' % (esc(label), bs))
-    pages = '<input type="button" value="Timesheet grid" title="%s" onclick="location.href=&quot;/reports/grid?u=%d&quot;"> ' % (esc(REPORT_HELP["grid"]), u)
+    pages = '<input type="button" value="Timesheet grid" title="%s" onclick="location.href=&quot;/reports/grid?u=%d&quot;"> ' % (esc(REPORT_HELP["grid"]), u) if grid else ""
     if manhour_clients(con, u):
         pages += '<input type="button" value="Manhours by client" title="%s" onclick="location.href=&quot;/reports/manhours?u=%d&quot;"> ' % (esc(REPORT_HELP["manhours"]), u)
-    rows.append('<div class="rgroup"><span class="gl">Other pages</span>%s</div>' % pages)
+    if pages:
+        rows.append('<div class="rgroup"><span class="gl">%s</span>%s</div>' % ("Other pages" if grid else "Client report", pages))
     btns = "".join(rows)
     body = "".join('<div class="rpt" id="rp-%s" style="display:%s">%s</div>' % (k, "block" if k == opened else "none", "".join(h)) for k, _, h in panels)
     js = ("<script>function showReport(k){var o=document.getElementById('rp-'+k),open=o.style.display!=='none';"
@@ -652,8 +752,35 @@ def manhour_clients(con, u):
         "where c.is_internal=0 and va.user_id=? order by c.name", (u,))]
 
 
+# The hours ledger. Every audit row moves hours in or out of the count: an hour counts once it is Submitted (and stays counted when Approved or Edited),
+# and stops counting if it is sent back to Draft. Each row gives up to two "legs": the old state taken out (negative) and the new state put in
+# (positive), each stamped with the date of the change and the week the hours belong to. The new state of a row is the old state of the next row
+# for the same entry (or the entry as it stands now, for the last row), because the audit stores only the old values of a change.
+# Adding up every leg gives exactly the hours as they stand now, so a report built from legs cannot count an hour twice.
+HOUR_LEGS = """(
+  with ev as (
+    select a.entry_id, a.user_id, a.action, a.changed_at, a.old_status, a.new_status, a.old_hours, a.new_hours,
+           a.old_scope_id, a.old_phase_id, a.old_worked_role_id, a.old_work_date,
+           lead(a.old_scope_id) over w as nx_scope, lead(a.old_phase_id) over w as nx_phase,
+           lead(a.old_worked_role_id) over w as nx_role, lead(a.old_work_date) over w as nx_date
+    from time_entry_audit a window w as (partition by a.entry_id order by a.audit_id))
+  select e.user_id, coalesce(e.nx_scope, te.scope_id) as scope_id, coalesce(e.nx_phase, te.phase_id) as phase_id,
+         coalesce(e.nx_role, te.worked_role_id) as worked_role_id, coalesce(e.nx_date, te.work_date) as work_date,
+         e.new_hours as hours, e.changed_at
+  from ev e left join time_entry te on te.entry_id = e.entry_id
+  where e.action <> 'DELETE' and e.new_status in ('Submitted','Approved','Edited')
+  union all
+  select e.user_id, e.old_scope_id, e.old_phase_id, e.old_worked_role_id, e.old_work_date, -e.old_hours, e.changed_at
+  from ev e where e.action <> 'CREATE' and e.old_status in ('Submitted','Approved','Edited')
+) t"""
+
+
 def manhour_data(con, u, q):
-    """The manhour report for one client: approved hours by job family, role and person, one column per week, with subtotals. Hours only, never money.
+    """The manhour report for one client, from the hours ledger. Hours are Submitted + Approved (+ Edited), counted once, and hours only, never money.
+    Two parts, so late changes still reach the client without anything being counted twice:
+      - the work of the period: the hours for work dated in the period, as they stood at the end of it;
+      - adjustments: changes made during the period to work dated before it (a late timesheet, a correction up or down, hours sent back),
+        each shown against the week it belongs to and the day it was changed.
     Returns None when this person has no client to report on."""
     clients = manhour_clients(con, u)
     if not clients:
@@ -668,56 +795,91 @@ def manhour_data(con, u, q):
     d_from = q.get("from", [""])[0] or "%d-01-01" % this_year
     d_to = q.get("to", [""])[0] or "%d-12-31" % this_year
     vis, vargs = visible_to(report_view(con, u), u)
+    labels = ("ph.phase_id, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as ctr, coalesce(ph.description, s.description) as title, "
+              "a.name as asset, a.po_number, ro.skill_code, ro.name as role, us.name as person")
+    joins = ("from " + HOUR_LEGS + " join scope s on s.scope_id=t.scope_id join phase ph on ph.phase_id=t.phase_id join role ro on ro.role_id=t.worked_role_id "
+             "join app_user us on us.user_id=t.user_id left join asset a on a.asset_id=s.asset_id where s.client_id=?")
+    keys = "ph.phase_id, s.scope_id, ph.ctr_code, ph.name, ph.description, s.description, a.asset_id, ro.role_id, ro.skill_code, ro.name, us.user_id, us.name"
     found = con.execute(
-        "select monday_of(t.work_date) as wk, ro.family, ro.skill_code, ro.name as role, us.name as person, "
-        "sum(case when t.status='Approved' then t.hours else 0 end) as approved, "
-        "sum(case when t.status in ('Submitted','Edited') then t.hours else 0 end) as pending "
-        "from time_entry t join scope s on s.scope_id=t.scope_id join role ro on ro.role_id=t.worked_role_id join app_user us on us.user_id=t.user_id "
-        "where s.client_id=? and t.status<>'Draft' and monday_of(t.work_date) between ? and ?" + vis +
-        " group by wk, ro.role_id, us.user_id order by ro.family, ro.skill_code, us.name, wk", (cid, d_from, d_to) + vargs).fetchall()
+        "select " + labels + ", monday_of(t.work_date) as wk, sum(t.hours) as hours " + joins +
+        " and substr(t.changed_at, 1, 10) <= ? and t.work_date between ? and ?" + vis +
+        " group by " + keys + ", wk having sum(t.hours) <> 0 order by ctr, person, wk", (cid, d_to, d_from, d_to) + vargs).fetchall()
+    adj = con.execute(
+        "select " + labels + ", monday_of(t.work_date) as wk, max(substr(t.changed_at, 1, 10)) as changed, sum(t.hours) as hours " + joins +
+        " and substr(t.changed_at, 1, 10) between ? and ? and t.work_date < ?" + vis +
+        " group by " + keys + ", wk having sum(t.hours) <> 0 order by ctr, person, wk", (cid, d_from, d_to, d_from) + vargs).fetchall()
     weeks = sorted({r["wk"] for r in found})
-    tree = {}  # family -> (skill code, role) -> person -> {"w": {week: approved}, "pending": hours}
+    tree = {}  # phase -> {"ctr", "title", "asset", "po", "people": {(person, skill code, role): {week: hours}}}
     for r in found:
-        person = tree.setdefault(r["family"], {}).setdefault((r["skill_code"], r["role"]), {}).setdefault(r["person"], {"w": {}, "pending": 0.0})
-        person["w"][r["wk"]] = person["w"].get(r["wk"], 0.0) + r["approved"]
-        person["pending"] += r["pending"]
-    return {"clients": clients, "client_id": cid, "client": dict(clients)[cid], "from": d_from, "to": d_to, "weeks": weeks, "tree": tree}
+        ctr = tree.setdefault(r["phase_id"], {"ctr": r["ctr"], "title": r["title"], "asset": r["asset"] or "", "po": r["po_number"] or "", "people": {}})
+        who = ctr["people"].setdefault((r["person"], r["skill_code"], r["role"]), {})
+        who[r["wk"]] = who.get(r["wk"], 0.0) + r["hours"]
+    adjustments = [{"ctr": r["ctr"], "title": r["title"], "asset": r["asset"] or "", "po": r["po_number"] or "", "person": r["person"], "skill": r["skill_code"],
+                    "role": r["role"], "week": r["wk"], "changed": r["changed"], "hours": r["hours"]} for r in adj]
+    return {"clients": clients, "client_id": cid, "client": dict(clients)[cid], "from": d_from, "to": d_to, "weeks": weeks, "tree": tree, "adjustments": adjustments,
+            "total_work": sum(r["hours"] for r in found), "total_adjustments": sum(r["hours"] for r in adj)}
+
+
+LEAD = 5   # columns before the weeks: CTR, person, role, asset, PO
 
 
 def manhour_lines(data):
-    """The report as rows of cells, each flagged: 'head', 'row', 'role' (subtotal), 'family' (subtotal) or 'grand'."""
+    """The work of the period as rows of cells, each flagged: 'head', 'row', 'ctr' (a CTR's subtotal) or 'grand'."""
     weeks = data["weeks"]
     dmy = lambda iso: "%s/%s/%s" % (iso[8:], iso[5:7], iso[:4])
-    lines = [("head", ["Job family", "Skill code", "Role", "Person"] + [dmy(w) for w in weeks] + ["Approved hrs", "Pending hrs"])]
+    lines = [("head", ["CTR", "Person", "Role", "Asset", "PO"] + [dmy(w) for w in weeks] + ["Total hrs"])]
     grand = {w: 0.0 for w in weeks}
-    grand_p = 0.0
 
-    def total_cells(per_week, pending):
-        return [per_week[w] or None for w in weeks] + [sum(per_week.values()), pending]   # a week with no hours is left blank
-    for family, roles in data["tree"].items():
-        fam = {w: 0.0 for w in weeks}
-        fam_p = 0.0
-        for (code, role), people in roles.items():
-            rol = {w: 0.0 for w in weeks}
-            rol_p = 0.0
-            for person, d in people.items():
-                per = {w: d["w"].get(w, 0.0) for w in weeks}
-                lines.append(("row", [family, code, role, person] + total_cells(per, d["pending"])))
-                for w in weeks:
-                    rol[w] += per[w]
-                rol_p += d["pending"]
-            if len(people) > 1:  # a role with one person needs no subtotal under that person's line
-                lines.append(("role", ["", code, "Total " + role, ""] + total_cells(rol, rol_p)))
+    def cells(per_week):
+        return [per_week[w] or None for w in weeks] + [sum(per_week.values())]   # a week with no hours is left blank
+    for ctr in data["tree"].values():
+        sub = {w: 0.0 for w in weeks}
+        for n, ((person, code, role), per) in enumerate(ctr["people"].items()):
+            row = {w: per.get(w, 0.0) for w in weeks}
+            first = ["%s - %s" % (ctr["ctr"], ctr["title"]), "", "", ctr["asset"], ctr["po"]] if n == 0 else ["", "", "", "", ""]
+            first[1], first[2] = person, "%s %s" % (code, role)
+            lines.append(("row", first + cells(row)))
             for w in weeks:
-                fam[w] += rol[w]
-            fam_p += rol_p
-        lines.append(("family", ["Total " + family, "", "", ""] + total_cells(fam, fam_p)))
+                sub[w] += row[w]
+        if len(ctr["people"]) > 1:
+            lines.append(("ctr", ["Total " + ctr["ctr"], "", "", "", ""] + cells(sub)))
         for w in weeks:
-            grand[w] += fam[w]
-        grand_p += fam_p
+            grand[w] += sub[w]
     if data["tree"]:
-        lines.append(("grand", ["Total for the client", "", "", ""] + total_cells(grand, grand_p)))
+        lines.append(("grand", ["Total for the period", "", "", "", ""] + cells(grand)))
     return lines
+
+
+def adjustment_lines(data):
+    """Late changes as rows of cells: 'head', 'row' and 'grand'. Hours are signed (+ added, - taken off)."""
+    dmy = lambda iso: "%s/%s/%s" % (iso[8:], iso[5:7], iso[:4])
+    lines = [("head", ["CTR", "Person", "Role", "Asset", "PO", "Week worked (w/c)", "Changed on", "Hours (+/-)"])]
+    for a in data["adjustments"]:
+        lines.append(("row", ["%s - %s" % (a["ctr"], a["title"]), a["person"], "%s %s" % (a["skill"], a["role"]), a["asset"], a["po"],
+                              dmy(a["week"]), dmy(a["changed"]), a["hours"]]))
+    if data["adjustments"]:
+        lines.append(("grand", ["Total adjustments", "", "", "", "", "", "", data["total_adjustments"]]))
+    return lines
+
+
+def signed(v):
+    return ("%+g" % round(v, 2)) if isinstance(v, (int, float)) else v
+
+
+def html_table(lines, left_cols):
+    """Lines (see manhour_lines) as an HTML table; cells from column left_cols onward are numbers and sit on the right."""
+    out = []
+    for kind, cells in lines:
+        tag = "th" if kind == "head" else "td"
+        bold = kind in ("ctr", "grand")
+        tds = []
+        for i, c in enumerate(cells):
+            txt = fmt(c) if isinstance(c, float) else esc(c)
+            if bold and txt:
+                txt = "<b>%s</b>" % txt
+            tds.append("<%s%s>%s</%s>" % (tag, ' align="right"' if i >= left_cols and kind != "head" else "", txt, tag))
+        out.append('<tr%s>%s</tr>' % (' style="background:#f1f1f2"' if kind == "ctr" else (' style="border-top:2px solid #0f0f12"' if kind == "grand" else ""), "".join(tds)))
+    return '<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(out)
 
 
 def view_manhours(con, u, q):
@@ -725,39 +887,41 @@ def view_manhours(con, u, q):
     data = manhour_data(con, u, q)
     if data is None:
         return layout(con, u, "Reports", "<p>The manhour report is for a client's project manager (its main approver) and for cost controllers.</p>")
-    lines = manhour_lines(data)
+    lines, adj = manhour_lines(data), adjustment_lines(data)
     auto = ' onchange="this.form.submit()"'
     qs = urlencode([("u", u), ("client", data["client_id"]), ("from", data["from"]), ("to", data["to"])])
     b = ["<p><a href=\"/reports?u=%d\">&lt;&lt; Reports</a></p>" % u,
-         "<p><small>Approved hours for one client, broken down by job family, role and the people who worked in it, one column per week (week commencing). "
-         "Hours only. Pending hrs are submitted hours still waiting for approval and are not in the approved figures.</small></p>",
+         "<p><small>Hours for one client, by CTR, person and role, one column per week (week commencing). Hours are submitted plus approved, counted once, and hours only. "
+         "Work in the period shows the hours as they stood at the end of it. A change made in this period to work from an earlier one (a late timesheet, "
+         "a correction up or down, hours sent back) appears under Adjustments, against the week it belongs to, so it reaches the report for the period it was made in.</small></p>",
          '<form method="get" action="/reports/manhours">%s<p>Client %s From %s To %s <input type="submit" value="Show"> '
          '<a href="/reports/manhours.xlsx?%s">Download as Excel</a> &nbsp; <a href="/reports/manhours.pdf?%s">Download as PDF</a> '
          '<small>(the PDF has approval boxes to sign, or to send to DocuSign)</small></p></form>' % (
              hidden(u=u), sel("client", data["clients"], data["client_id"], False, "", auto), date_input("from", data["from"]), date_input("to", data["to"]), esc(qs), esc(qs))]
-    if len(lines) > 1:
-        out = []
-        for kind, cells in lines:
-            tag = "th" if kind == "head" else "td"
-            bold = kind in ("role", "family", "grand")
-            tds = []
-            for i, c in enumerate(cells):
-                txt = fmt(c) if isinstance(c, float) else esc(c)
-                if bold and txt:
-                    txt = "<b>%s</b>" % txt
-                tds.append("<%s%s>%s</%s>" % (tag, ' align="right"' if i >= 4 and kind != "head" else "", txt, tag))
-            out.append('<tr%s>%s</tr>' % (' style="background:#f1f1f2"' if kind in ("role", "family") else ("" if kind != "grand" else ' style="border-top:2px solid #0f0f12"'), "".join(tds)))
-        b.append('<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(out))
-    else:
-        b.append("<p>No hours for %s in this date range.</p>" % esc(data["client"]))
+    b.append("<h4>Work in the period</h4>")
+    b.append(html_table(lines, LEAD) if len(lines) > 1 else "<p>No hours for %s in this date range.</p>" % esc(data["client"]))
+    b.append("<h4>Adjustments (changes made in this period to earlier weeks)</h4>")
+    b.append(html_table([(k, [signed(c) if isinstance(c, float) else c for c in cells]) for k, cells in adj], 7) if len(adj) > 1 else "<p>None.</p>")
+    b.append("<p><b>Total for the period: %s hrs</b> (work in the period %s, adjustments %s)</p>" % (
+        fmt(round(data["total_work"] + data["total_adjustments"], 2)), fmt(round(data["total_work"], 2)), signed(round(data["total_adjustments"], 2))))
     return layout(con, u, "Reports", "".join(b))
 
 
 def manhour_sheet(data):
-    lines = manhour_lines(data)
-    rows = [[None if (isinstance(c, str) and c == "" and i >= 4) else c for i, c in enumerate(cells)] for kind, cells in lines]
-    bold = tuple(i + 1 for i, (kind, _) in enumerate(lines) if kind != "row")
-    return rows, bold, "Manhours %s" % data["client"][:20]
+    """One sheet: the work of the period, then a heading and the adjustments below it."""
+    lines, adj = manhour_lines(data), adjustment_lines(data)
+    rows = [[None if (isinstance(c, str) and c == "" and i >= LEAD) else c for i, c in enumerate(cells)] for kind, cells in lines]
+    bold = [i + 1 for i, (kind, _) in enumerate(lines) if kind != "row"]
+    rows.append([])
+    rows.append(["Adjustments: changes made in this period to earlier weeks"])
+    bold.append(len(rows))
+    start = len(rows)
+    rows += [list(cells) for kind, cells in adj]
+    bold += [start + i + 1 for i, (kind, _) in enumerate(adj) if kind != "row"]
+    rows.append([])
+    rows.append(["Total for the period (work + adjustments)"] + [""] * 6 + [round(data["total_work"] + data["total_adjustments"], 2)])
+    bold.append(len(rows))
+    return rows, tuple(bold), "Manhours %s" % data["client"][:20]
 
 
 def view_grid(con, u, q):

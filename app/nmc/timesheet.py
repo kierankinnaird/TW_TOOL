@@ -1,5 +1,6 @@
 """The weekly timesheet: showing it, saving hours, booking rules and copying last week. Allowances are not claimed here (payroll sets them by location)."""
 import datetime
+import json
 from nmc import pg
 from nmc.core import ABSENCE_CODES, date_input, dmy, esc, fmt, layout, locations, me_row, monday, msgs_html, parse_adds, stamp, table
 
@@ -37,9 +38,12 @@ function flagDays(dt){
   var box=document.getElementById('dayerr'); if(box){box.style.display=over.length?'block':'none'; box.textContent=over.length?'Too many hours in one day: '+over.join(', ')+'. You cannot book more than 24 hours in a day, so those hours will not be saved.':'';}
 }
 function showOt(a){var tr=a.closest('tr'), nx=tr.nextElementSibling; if(nx){nx.style.display='';var i=nx.querySelector('input[type=text]'); if(i){i.focus();}} a.style.display='none'; return false;}
+function fillRoles(){var s=document.getElementById('addphase'),r=document.getElementById('addrole');if(!s||!r||typeof ROLES==='undefined'){return;}
+  var keep=r.value,list=ROLES[s.value]||[],i;r.innerHTML='';
+  for(i=0;i<list.length;i++){var o=document.createElement('option');o.value=list[i][0];o.text=list[i][1];if(String(list[i][0])===keep){o.selected=true;}r.appendChild(o);}}
 function filterCtr(q){q=q.toLowerCase();var s=document.getElementById('addphase'),o=s.options,i,first=null;
   for(i=0;i<o.length;i++){var m=o[i].text.toLowerCase().indexOf(q)>=0;o[i].hidden=!m;o[i].disabled=!m;if(m&&!first){first=o[i];}}
-  if(first&&(s.selectedIndex<0||o[s.selectedIndex].disabled)){first.selected=true;}}
+  if(first&&(s.selectedIndex<0||o[s.selectedIndex].disabled)){first.selected=true;}fillRoles();}
 document.addEventListener('input',function(e){if(e.target.name&&e.target.name.indexOf('h_')===0){recalc();}});
 document.addEventListener('change',function(e){if(e.target.classList&&e.target.classList.contains('rowsel')){e.target.classList.add('chg');}});
 window.addEventListener('load',recalc);
@@ -228,11 +232,18 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
              '<input type="hidden" name="u" value="%d"><input type="hidden" name="w" value="%s">%s' % (u, d0, adds_hidden))
     head = ["Booking", "Skill code", "Location"] + [d.strftime("%a %d/%m") for d in days] + ["Total", ""]
     role_rows = con.execute("select role_id, skill_code, name, active from role order by skill_code").fetchall()
+    held = paaf_roles(con, u, d0, d6)                                        # project -> role ids this person holds a PAAF for
+    row_project = {r[0]: (r[1], r[2]) for r in con.execute(
+        "select ph.phase_id, s.project_id, c.is_internal from phase ph join scope s on s.scope_id=ph.scope_id join client c on c.client_id=s.client_id "
+        "where ph.phase_id = any(?)", ([k[0] for k in rows],))}
+    own_role = con.execute("select role_id from app_user where user_id=?", (u,)).fetchone()[0]
     loc_rows = con.execute("select location_id, name, active from location order by location_id").fetchall()
 
-    def role_select(key, current):
+    def role_select(key, current, pid):
+        project, internal = row_project.get(pid, (0, 1))
+        ok = {own_role} if internal else {x[0] for x in held.get(project, [])}   # the titles this person may bill under on the project
         opts = "".join('<option value="%d"%s>%s %s</option>' % (r["role_id"], " selected" if r["role_id"] == current else "", esc(r["skill_code"]), esc(r["name"]))
-                       for r in role_rows if r["active"] or r["role_id"] == current)
+                       for r in role_rows if (r["active"] and r["role_id"] in ok) or r["role_id"] == current)
         return '<select class="rowsel" name="rs_%s" title="Skill code for this row">%s</select>' % (key, opts)
 
     def loc_select(key, current):
@@ -250,7 +261,7 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
         # the skill code and location are chosen on the row, next to the hours: changing one moves the row's draft hours (when the row has any that are not drafts, it is fixed)
         key = "%d_%d_%d_%d" % (pid, rid, lid, ot)
         if can_edit and not ot and all(e["status"] == "Draft" for e in r["cells"].values()):
-            tds.append('<td class="rs">%s</td><td class="rs">%s</td>' % (role_select(key, rid), loc_select(key, lid)))
+            tds.append('<td class="rs">%s</td><td class="rs">%s</td>' % (role_select(key, rid, pid), loc_select(key, lid)))
         else:
             tds.append('<td class="rs"><span class="sub">%s</span></td><td class="rs"><span class="sub">%s</span></td>' % (esc(r["skill"]), esc(r["location"])))
         rt = 0.0
@@ -335,14 +346,20 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
 
     # add a row
     scopes = con.execute(
-        "select ph.phase_id, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, ph.name as phase_name, s.scope_code, s.description, pr.name as project, c.name as client, c.is_internal "
+        "select ph.phase_id, s.project_id, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as phase, ph.name as phase_name, s.scope_code, s.description, pr.name as project, c.name as client, c.is_internal "
         "from phase ph join scope s on s.scope_id=ph.scope_id join project pr on pr.project_id=s.project_id "
         "join client c on c.client_id=s.client_id "
-        "where s.status='Open' and ph.status='Open' and pr.status='Open' "  # anyone can book to any open code, unless it is restricted
+        "where s.status='Open' and ph.status='Open' and pr.status='Open' "  # open codes only, and for client work only the projects this person holds a PAAF for
+        "and (c.is_internal=1 or exists (select 1 from paaf pf where pf.user_id=? and pf.project_id=s.project_id and pf.start_date<=? and (pf.end_date is null or pf.end_date>=?))) "
         "and (ph.restricted=0 or exists (select 1 from phase_person pp where pp.phase_id=ph.phase_id and pp.user_id=?)) "  # transaction controls:
         "and (ph.book_to is null or ph.book_to >= ?) and (ph.book_from is null or ph.book_from <= ?) "  # people, and booking dates
-        "order by c.is_internal, c.name, pr.name, s.scope_code, ph.name", (u, d0, d6)).fetchall()
-    roles = con.execute("select role_id, skill_code, name from role where active=1 order by skill_code").fetchall()
+        "order by c.is_internal, c.name, pr.name, s.scope_code, ph.name", (u, d6, d0, u, d0, d6)).fetchall()
+    roles = {r["role_id"]: r for r in con.execute("select role_id, skill_code, name from role where active=1")}
+    # the titles on offer for each code: a client code takes the roles this person holds a PAAF for on its project, an internal code their own job title
+    role_map = {}
+    for s_ in scopes:
+        ids = [own_role] if s_["is_internal"] else [x[0] for x in held.get(s_["project_id"], [])]
+        role_map[s_["phase_id"]] = [[i, "%s %s" % (roles[i]["skill_code"], roles[i]["name"])] for i in ids if i in roles]
     add_button = ""  # the "Add timesheet row" button above the grid, when a row can be added
     if week_inactive or locked:
         pass  # the notes above say why nothing can be added
@@ -353,25 +370,37 @@ def view_timesheet(con, u, w, msgs=None, adds=None, ok=False, typed=None):
                 return "%s%s%s" % (lead, esc(s["description"]), "" if s["phase_name"] == "General" else " &gt; %s" % esc(s["phase"]))
             return "%s &gt; %s &gt; %s %s &gt; %s" % (esc(s["client"]), esc(s["project"]), esc(s["scope_code"]), esc(s["description"]), esc(s["phase"]))
         so = "".join('<option value="%d">%s</option>' % (s["phase_id"], label(s)) for s in scopes)
-        ro = "".join('<option value="%d"%s>%s %s</option>' % (r["role_id"], " selected" if r["role_id"] == me["role_id"] else "", esc(r["skill_code"]), esc(r["name"])) for r in roles)
+        first = role_map.get(scopes[0]["phase_id"], [])
+        ro = "".join('<option value="%d"%s>%s</option>' % (i, " selected" if i == me["role_id"] else "", esc(label)) for i, label in first)
         lo = "".join('<option value="%d"%s>%s</option>' % (lid, " selected" if lid == me["default_location_id"] else "", esc(name)) for lid, name in locations(con))
         so_list = "".join('<option value="%d"%s>%s</option>' % (s["phase_id"], " selected" if i == 0 else "", label(s)) for i, s in enumerate(scopes))
         dlg = ['<dialog id="addrow" class="dlg"><div class="dlg-in"><h4>Add a timesheet row</h4>'
                '<p><small>Choose a CTR, typing in the box to search. Hours you have typed are saved first.</small></p>'
                '<p><input type="text" id="addq" placeholder="Search by client, project, scope or CTR No" autocomplete="off" oninput="filterCtr(this.value)"></p>'
-               '<p><select form="tsform" name="add_phase" id="addphase" size="8">%s</select></p>'
-               '<div class="pick2"><label>Skill code <select form="tsform" name="add_role">%s</select></label> '
+               '<p><select form="tsform" name="add_phase" id="addphase" size="8" onchange="fillRoles()">%s</select></p>'
+               '<div class="pick2"><label>Skill code <select form="tsform" name="add_role" id="addrole">%s</select></label> '
                '<label>Location <select form="tsform" name="add_loc">%s</select></label></div>'
-               "<p><small>Your own skill code and usual location are filled in. Change them if you are covering another role or working somewhere else. "
+               "<p><small>You can book to the projects you hold a PAAF for, under the job titles on your PAAFs for that project (the title decides the rate), on the days the PAAF is valid. Your usual location is filled in. "
                "Hours NMC pays for itself (not billed to a client) go to an Internal code, for example Internal - Business Services.</small></p>"
                '<p class="dlg-actions"><input form="tsform" type="submit" name="action" value="Add row"> '
                '<input type="button" value="Cancel" onclick="this.closest(\'dialog\').close()"></p>' % (so_list, ro, lo)]
-        dlg.append("</div></dialog>")
+        dlg.append("</div></dialog><script>var ROLES=%s;</script>" % json.dumps(role_map).replace("</", "<\\/"))
         b.append("".join(dlg))
-        add_button = '' if not can_edit else '<input type="button" value="+ Add timesheet row" onclick="document.getElementById(\'addrow\').showModal()">'
+        add_button = '' if not can_edit else '<input type="button" value="+ Add timesheet row" onclick="document.getElementById(\'addrow\').showModal();fillRoles()">'
     else:
         b.append("<p>There are no open booking codes you can book to.</p>")
+    if not held and not (week_inactive or locked):
+        b.append("<p><small>You do not hold a PAAF that is valid this week, so only internal codes are open to you. Speak to commercial to be added to a project or to have a PAAF renewed.</small></p>")
     return layout(con, u, "My Timesheet", "".join(b).replace("<!--ADDROW-->", add_button))
+
+
+def paaf_roles(con, u, d0, d6):
+    """The PAAFs a person holds that are valid at some point in the week d0 to d6: {project id: [(role id,)]} (the job titles they may book under on each project)."""
+    out = {}
+    for project, role in con.execute("select project_id, role_id from paaf where user_id=? and start_date<=? and (end_date is null or end_date>=?) order by project_id, role_id",
+                                     (u, d6, d0)):
+        out.setdefault(project, []).append((role,))
+    return out
 
 
 def book_entry(con, u, pid, rid, lid, ot, date, hours):
@@ -384,6 +413,9 @@ def book_entry(con, u, pid, rid, lid, ot, date, hours):
     loc = con.execute("select active from location where location_id=?", (lid,)).fetchone()
     if not loc or not loc[0] or ot not in (0, 1):
         return "that location is not available."
+    if not info["is_internal"] and not con.execute("select 1 from paaf p join scope s on s.project_id=p.project_id where s.scope_id=? and p.user_id=? and p.role_id=? "
+                                                    "and p.start_date<=? and (p.end_date is null or p.end_date>=?)", (info["scope_id"], u, rid, date, date)).fetchone():
+        return "you do not hold a PAAF for that project and role on that date (not held, not started yet or expired: speak to commercial)."
     if info["is_internal"]:  # NMC pays for these hours: no sales rate
         rate_id = None
     else:
@@ -436,6 +468,10 @@ def move_rows(con, u, form, d0, d6, msgs):
                                                     (u, pid, new_rid, new_lid, ot, d0, d6)).fetchall()}
         if taken & {e["work_date"] for e in mine}:
             msgs.append("%s: you already have a row with that skill code and location on the same days. Put the hours on that row instead." % info["phase"])
+            continue
+        if not info["is_internal"] and not con.execute("select 1 from paaf p join phase ph on ph.phase_id=? join scope s on s.scope_id=ph.scope_id and s.project_id=p.project_id "
+                                                        "where p.user_id=? and p.role_id=? and p.start_date<=? and (p.end_date is null or p.end_date>=?)", (pid, u, new_rid, d6, d0)).fetchone():
+            msgs.append("%s: you do not hold a PAAF for that project and role (speak to commercial)." % info["phase"])
             continue
         rates = {}
         problem = None

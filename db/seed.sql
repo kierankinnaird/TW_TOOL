@@ -38,6 +38,10 @@ INSERT INTO role (role_id, skill_code, name, family) VALUES
  (31,'BS-01','System Administrator','Business Services'),
  (32,'BS-02','Commercial Lead','Business Services'),
  (33,'BS-03','Managing Director','Business Services');
+-- The same job, billed under a different title by each client (a PAAF names the title a person bills under on a project).
+INSERT INTO role (role_id, skill_code, name, family) VALUES
+ (34,'PM-09','Lead Document Controller','Project Management'),
+ (35,'PM-10','Senior Document Controller','Project Management');
 
 INSERT INTO client (client_id, name) VALUES (1,'Apache'),(2,'Spirit');
 -- NMC's own client for internal hours (paid by NMC, not billed). Its codes are scopes under one project; admin can add more.
@@ -106,6 +110,8 @@ INSERT INTO rate (rate_id, client_id, role_id, sales_rate) VALUES
  (58,2,29,65.00),
  (59,1,30,114.00),
  (60,2,30,120.00);
+INSERT INTO rate (rate_id, client_id, role_id, sales_rate) SELECT (SELECT max(rate_id) FROM rate) + 1, 2, 34, 100.00;      -- Spirit bills her as a Lead Document Controller
+INSERT INTO rate (rate_id, client_id, role_id, sales_rate) SELECT (SELECT max(rate_id) FROM rate) + 1, 1, 35, 98.00;       -- Apache bills her as a Senior Document Controller
 
 -- Hour types: where hours are worked. A person's default location (On Shore unless set) is where new timesheet rows start.
 -- The choices are On Shore, Offshore and Site visit; the IT admin can add more on the Locations tab.
@@ -182,6 +188,17 @@ INSERT INTO scope (scope_id, scope_code, client_id, project_id, description, sta
  (17,'INT11',3,4,'HR',                  'Open'),
  (18,'INT12',3,4,'Other',               'Open');
 
+-- Assets (demonstration values). One PO per asset, and the PO is optional.
+INSERT INTO asset (asset_id, client_id, name, po_number) VALUES
+ (1,1,'Alpha Platform','4500123456'),
+ (2,1,'Bravo Platform',NULL),
+ (3,2,'Rivers Terminal','4500673467'),
+ (4,2,'Calder Pipeline','4500674251');
+UPDATE scope SET asset_id=1 WHERE scope_id IN (1,3);
+UPDATE scope SET asset_id=2 WHERE scope_id=2;
+UPDATE scope SET asset_id=3 WHERE scope_id IN (4,5);
+UPDATE scope SET asset_id=4 WHERE scope_id=6;
+
 -- Phases. Hours are booked to a phase. Every scope has at least one.
 INSERT INTO phase (phase_id, scope_id, name) VALUES
  (1,1,'Define'),(2,1,'Execute'),(3,2,'Define'),(4,3,'Define'),(5,4,'Define'),(6,5,'Define'),(7,6,'Define'),
@@ -192,6 +209,10 @@ INSERT INTO phase (phase_id, scope_id, name) VALUES
 INSERT INTO period (week_start) VALUES ('2026-10-26'),('2026-11-02');
 
 -- Time entries. Columns: user, scope, phase, worked role, rate, date, hours, created_by.
+-- The demo hours are booked before the PAAF register is filled, from what they show (below), so the PAAF rule waits until then.
+ALTER TABLE time_entry DISABLE TRIGGER trg_time_entry_1_paaf_insert;
+-- the demo hours are booked on the days below (the report ledger reads the booking date from the audit trail)
+ALTER TABLE time_entry ALTER COLUMN created_at SET DEFAULT '2026-10-30 17:00:00';
 INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by) VALUES
  -- Week of 26 Oct
  (5,1,1,4,4,  '2026-10-26',8,5),
@@ -231,6 +252,8 @@ INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, wo
  (9,1,2,3,3,'2026-11-03',8,9);
 
 -- More people across job families (booked to their own job title)
+-- the demo hours are booked on the days below (the report ledger reads the booking date from the audit trail)
+ALTER TABLE time_entry ALTER COLUMN created_at SET DEFAULT '2026-10-30 17:00:00';
 INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by) VALUES
  (11,2,3,7,13,'2026-10-27',8,11),
  (11,2,3,7,13,'2026-10-28',8,11),
@@ -255,6 +278,8 @@ INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, wo
  (11,6,7,7,36,'2026-11-04',4,11);
 
 -- Examples of the other hour types: an overtime day on site, and a day offshore.
+-- the demo hours are booked on the days below (the report ledger reads the booking date from the audit trail)
+ALTER TABLE time_entry ALTER COLUMN created_at SET DEFAULT '2026-11-02 08:00:00';
 INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) VALUES
  (21,1,2,11,17,'2026-11-02',8,21, 1,1),
  (24,1,1,24,30,'2026-10-28',4,24, 2,0);
@@ -325,6 +350,8 @@ WHERE phase_id = 1;
 --   Lloyd Quinn (Lead Construction Engineer): Mon on site, Tue-Fri offshore on BB0001 Define, all submitted: 3 nights (Tue-Thu).
 --   Rob Millman (HSES Advisor) has a single offshore day on 28 Oct: a day trip, no night.
 -- ---------------------------------------------------------------------------------------------------------------------
+-- the demo hours are booked on the days below (the report ledger reads the booking date from the audit trail)
+ALTER TABLE time_entry ALTER COLUMN created_at SET DEFAULT '2026-11-03 17:00:00';
 INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, work_date, hours, created_by, location_id, overtime) VALUES
  (11,2,3,7,13,'2026-11-02',8,11,2,0),
  (11,2,3,7,13,'2026-11-03',8,11,2,0),
@@ -340,6 +367,19 @@ INSERT INTO time_entry (user_id, scope_id, phase_id, worked_role_id, rate_id, wo
  (18,1,1,21,27,'2026-11-06',8,18,2,0);
 UPDATE time_entry SET status='Approved', approved_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), approved_at='2026-11-05 10:00', last_edited_by=(SELECT approver_id FROM v_person_approver pa WHERE pa.user_id = time_entry.user_id), last_edited_at='2026-11-05 10:00'
  WHERE user_id=11 AND scope_id=2 AND status='Submitted' AND work_date BETWEEN '2026-11-02' AND '2026-11-04';
+
+-- The PAAF register: everyone who has booked to a client's project holds a PAAF for the role they booked under, and one person holds the same job under a
+-- different title for each client (Arlene Chalmers: Lead Document Controller on Spirit's project, Senior Document Controller on Apache's).
+INSERT INTO paaf (project_id, role_id, user_id, start_date)
+SELECT DISTINCT sc.project_id, t.worked_role_id, t.user_id, '2026-01-01' FROM time_entry t JOIN scope sc ON sc.scope_id = t.scope_id JOIN client c ON c.client_id = sc.client_id WHERE c.is_internal = 0;
+INSERT INTO paaf (project_id, role_id, user_id, reference, start_date, end_date) VALUES
+ (3, 34, 23, 'PAAF-SPJ-001', '2026-01-01', '2027-12-31'),
+ (1, 35, 23, 'PAAF-APJ-001', '2026-01-01', '2027-06-30'),
+ (2, 35, 23, NULL, '2026-01-01', NULL);
+-- Arlene's earlier hours were booked as plain Document Controller; from now on she bills under each client's title, so that one is not carried forward.
+DELETE FROM paaf WHERE user_id = 23 AND role_id = 10;
+ALTER TABLE time_entry ENABLE TRIGGER trg_time_entry_1_paaf_insert;
+ALTER TABLE time_entry ALTER COLUMN created_at SET DEFAULT now_text();
 
 
 -- Budget hours per CTR, as loaded from P6 on 6 Nov 2026 (hours only). BB0002 Define is at 90% of its budget and A1500 is over.

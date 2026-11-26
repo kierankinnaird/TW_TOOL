@@ -29,6 +29,14 @@ class TestApp(unittest.TestCase):
         self.server = app.make_server(0)
         self.base = "http://127.0.0.1:%d" % self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        # These tests are about timesheets, approvals and reports, not about who may book where: everyone who writes time holds a PAAF for every client project
+        # and every title the client has a rate for (the PAAF rules themselves are tested in test_paaf.py).
+        con = app.db()
+        con.execute("insert into paaf (project_id, role_id, user_id, start_date) select pr.project_id, r.role_id, u.user_id, '2026-01-01' from project pr join client c on c.client_id=pr.client_id "
+                    "join (select distinct client_id, role_id from rate) r on r.client_id=c.client_id cross join app_user u where c.is_internal=0 and u.books_time=1 "
+                    "on conflict do nothing")
+        con.commit()
+        con.close()
 
     def tearDown(self):
         self.server.shutdown()
@@ -51,7 +59,7 @@ class TestApp(unittest.TestCase):
             return r.read().decode("utf-8")
 
     def test_every_page_loads(self):
-        for path in ["/", "/timesheet?u=5&w=2026-11-02", "/approvals?u=7", "/reports?u=5",
+        for path in ["/", "/timesheet?u=5&w=2026-11-02", "/approvals?u=7", "/reports?all=1&u=5",
                      "/admin?u=7&t=users", "/admin?u=7&t=periods", "/audit?u=7"]:
             self.assertIn("NMC Timewriting", self.get(path), path)
 
@@ -59,12 +67,12 @@ class TestApp(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/static/TASAOrbiterVF.woff2") as r:
             self.assertEqual(r.headers["Content-Type"], "font/woff2")
             self.assertEqual(r.read(4), b"wOF2")
-        page = self.get("/reports?u=5")
+        page = self.get("/reports?all=1&u=5")
         self.assertIn('font-family:"TASA Orbiter"', page)
         self.assertIn("/static/TASAOrbiterVF.woff2", page)
 
     def test_the_nmc_logo_is_in_the_header_and_served(self):
-        page = self.get("/reports?u=5")
+        page = self.get("/reports?all=1&u=5")
         self.assertRegex(page.split("</header>")[0], r'<img src="/static/nmc-logo\.png\?v=\d+" alt="NMC Energy">')
         self.assertIn("rel='icon'", page)
         for path in ("/static/nmc-logo.png", "/static/nmc-tab-icon.png"):
@@ -80,7 +88,7 @@ class TestApp(unittest.TestCase):
             cm.exception.close()
 
     def test_every_page_and_download_carries_the_browser_security_headers(self):
-        for path in ("/timesheet?u=5&w=2026-11-02", "/reports?u=29", "/admin?u=30", "/reports/grid.xlsx?u=29", "/nowhere"):
+        for path in ("/timesheet?u=5&w=2026-11-02", "/reports?all=1&u=29", "/admin?u=30", "/reports/grid.xlsx?u=29", "/nowhere"):
             try:
                 r = urllib.request.urlopen(self.base + path)
             except urllib.error.HTTPError as e:
@@ -93,7 +101,7 @@ class TestApp(unittest.TestCase):
             r.close()
 
     def test_styling_has_square_corners(self):
-        self.assertNotIn("border-radius", self.get("/reports?u=5"))
+        self.assertNotIn("border-radius", self.get("/reports?all=1&u=5"))
 
     def test_timesheet_shows_cover_rows_and_totals(self):
         page = self.get("/timesheet?u=5&w=2026-11-02")
@@ -219,34 +227,34 @@ class TestApp(unittest.TestCase):
 
     def test_the_project_manager_exports_a_manhour_report_for_their_client(self):
         # Alisdair Woodhead (7) is Apache's main approver, the project manager: Apache's hours by role and person, in hours, nothing from Spirit
-        link = self.get("/reports?u=7")
+        link = self.get("/reports?all=1&u=7")
         self.assertIn('/reports/manhours?u=7', link)
         page = self.get("/reports/manhours?u=7")
         self.assertIn("Client <select", page)
-        table = page[page.index("<th>Job family</th>"):]               # the report itself (the page's user menu lists everybody)
+        table = page[page.index("<th>CTR</th>"):]               # the report itself (the page's user menu lists everybody)
         for person in ("Ewan Shaw", "Louis Ducharme", "Daniel Evans"):
             self.assertIn(person, table, person)
         self.assertNotIn("Gary Bridge", table)                     # a Spirit-only person
-        self.assertIn("Total for the client", page)
+        self.assertIn("Total for the period", page)
         self.assertIn("Download as Excel", page)
         self.assertNotIn("&pound;", page)                          # hours only
         text = self.xlsx_text("/reports/manhours.xlsx?u=7")
         self.assertIn("Ewan Shaw", text)
-        self.assertIn("Approved hrs", text)
+        self.assertIn("Total hrs", text)
         self.assertNotIn("Gary Bridge", text)                      # a Spirit-only person
         # Alisdair's people have also booked to Spirit, so he can pick Spirit's report too: still only his own people's hours
         self.assertIn(">Spirit</option>", page)
         self.assertIn("Gary Bridge", self.xlsx_text("/reports/manhours.xlsx?u=7&client=2"))
         # Kenneth Nicolson (8) manages one person, Ajin Sabu: his report has only her hours
         spirit = self.get("/reports/manhours?u=8")
-        spirit = spirit[spirit.index("<th>Job family</th>"):]
+        spirit = spirit[spirit.index("<th>CTR</th>"):]
         self.assertIn("Ajin Sabu", spirit)
         self.assertNotIn("Ewan Shaw", spirit)
         # cost controllers can pick any client; people who approve nothing, and the IT admin, have no report
         self.assertIn(">Spirit</option>", self.get("/reports/manhours?u=29"))
         for who in (5, 30):
             self.assertIn("for a client's project manager", self.get("/reports/manhours?u=%d" % who) if who != 30 else "for a client's project manager")
-            self.assertNotIn("/reports/manhours?u=%d" % who, self.get("/reports?u=%d" % who) if who != 30 else "")
+            self.assertNotIn("/reports/manhours?u=%d" % who, self.get("/reports?all=1&u=%d" % who) if who != 30 else "")
         try:
             urllib.request.urlopen(self.base + "/reports/manhours.xlsx?u=5")
             self.fail("a person with no client should be refused")
@@ -332,7 +340,7 @@ class TestApp(unittest.TestCase):
         self.assertNotIn("Week 2030-01-08 opened", page)
 
     def test_reports_date_range(self):
-        page = self.get("/reports?u=7&from=2026-10-26&to=2026-10-26")
+        page = self.get("/reports?all=1&u=7&from=2026-10-26&to=2026-10-26")
         self.assertIn("2026-10-26", page)
         self.assertNotIn("2026-11-02</td>", page.split("Period reports")[1])
 
@@ -350,7 +358,7 @@ class TestApp(unittest.TestCase):
         sp = con.execute("select scope_id, scope_code, project_id from scope where scope_id=?", (ph["scope_id"],)).fetchone()
         ap_code = con.execute("select scope_code from scope where client_id=? limit 1", (apache,)).fetchone()[0]
         con.close()
-        base = "/reports?u=29&from=2026-01-01&to=2026-12-31"
+        base = "/reports?all=1&u=29&from=2026-01-01&to=2026-12-31"
         everything = self.period_part(base)
         self.assertIn(">Spirit</td>", everything)
         self.assertIn(">Apache</td>", everything)
@@ -366,7 +374,7 @@ class TestApp(unittest.TestCase):
         self.assertIn(">%s-%s</td>" % (sp["scope_code"], "PM-D-001"), one_phase)
 
     def test_period_report_has_a_reset_button_back_to_the_unfiltered_page(self):
-        page = self.get("/reports?u=7&client=2")
+        page = self.get("/reports?all=1&u=7&client=2")
         self.assertIn("value=\"Reset\" onclick=\"location.href='/reports?u=7&r=period'\"", page)
 
     def test_period_report_drops_a_filter_that_does_not_fit_the_client(self):
@@ -374,7 +382,7 @@ class TestApp(unittest.TestCase):
         spirit = con.execute("select client_id from client where name='Spirit'").fetchone()[0]
         apache_project = con.execute("select project_id from project where client_id<>? limit 1", (spirit,)).fetchone()[0]
         con.close()
-        base = "/reports?u=29&from=2026-01-01&to=2026-12-31"
+        base = "/reports?all=1&u=29&from=2026-01-01&to=2026-12-31"
         page = self.period_part(base + "&client=%d&project=%d" % (spirit, apache_project))
         self.assertIn(">Spirit</td>", page)  # the stray project is ignored, so Spirit still shows
         self.assertEqual(self.period_part(base + "&client=abc&scope=999"), self.period_part(base))
@@ -392,7 +400,7 @@ class TestApp(unittest.TestCase):
         self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Submit week", "reason": ""})
         eid = self.one("select entry_id from time_entry where user_id=4 and work_date='2026-11-04'")[0]
         self.assertIn("approved", self.post("/approvals/act", {"u": "7", "entry_id": str(eid), "action": "Approve"}))
-        page = self.get("/reports?u=7&from=2026-01-01&to=2026-12-31")
+        page = self.get("/reports?all=1&u=7&from=2026-01-01&to=2026-12-31")
         tree, rest = page.split("Period reports")
         internal = rest.split("Internal hours")[1]
         self.assertIn("INT01 Business Services", internal)
@@ -451,7 +459,7 @@ class TestApp(unittest.TestCase):
 
     # ---------- date pickers ----------
     def test_every_date_box_is_a_calendar_picker(self):
-        page = self.get("/reports?u=7&from=2026-10-26&to=2026-11-02")
+        page = self.get("/reports?all=1&u=7&from=2026-10-26&to=2026-11-02")
         self.assertIn('<input type="date" name="from" value="2026-10-26">', page)
         self.assertIn('<input type="date" name="to" value="2026-11-02">', page)
         self.assertNotIn("(yyyy-mm-dd)", page)
@@ -463,7 +471,7 @@ class TestApp(unittest.TestCase):
             self.assertNotIn('type="text" name="%s"' % names[0], page, path)
 
     def test_a_cleared_report_date_falls_back_to_the_default_range(self):
-        page = self.get("/reports?u=7&from=&to=")
+        page = self.get("/reports?all=1&u=7&from=&to=")
         year = datetime.date.today().year
         self.assertIn('<input type="date" name="from" value="%d-01-01">' % year, page)       # the current year, not a fixed range
         self.assertIn('<input type="date" name="to" value="%d-12-31">' % year, page)
@@ -472,7 +480,7 @@ class TestApp(unittest.TestCase):
 
     # ---------- reports by role: values for cost controllers only, everyone else sees hours ----------
     def report_page(self, u, extra=""):
-        page = self.get("/reports?u=%d&from=2026-01-01&to=2026-12-31%s" % (u, extra))
+        page = self.get("/reports?all=1&u=%d&from=2026-01-01&to=2026-12-31%s" % (u, extra))
         tree, rest = page.split("Period reports", 1)
         return page, tree, rest
 
@@ -492,10 +500,10 @@ class TestApp(unittest.TestCase):
 
     def test_a_standard_user_has_no_reports_but_has_a_timesheet_history(self):
         for u in (5, 6, 24):  # people who only book time
-            self.assertIn("not available to your role", self.get("/reports?u=%d" % u), u)
+            self.assertIn("not available to your role", self.get("/reports?all=1&u=%d" % u), u)
             self.assertIn("not available to your role", self.get("/reports/grid?u=%d" % u), u)
             self.assertIn("not available to your role", self.get("/ctr?u=%d&phase=1" % u), u)
-            self.assertNotIn('href="/reports?u=%d' % u, self.get("/timesheet?u=%d" % u), u)       # not in their menu
+            self.assertNotIn('href="/reports?all=1&u=%d' % u, self.get("/timesheet?u=%d" % u), u)       # not in their menu
             for path in ("/reports/export.xlsx?u=%d&k=ctr", "/reports/grid.xlsx?u=%d", "/reports/period.xlsx?u=%d", "/ctr.xlsx?u=%d&phase=1", "/reports/aaa.xlsx?u=%d"):
                 with self.assertRaises(urllib.error.HTTPError) as cm:
                     urllib.request.urlopen(self.base + path % u)
@@ -700,7 +708,7 @@ class TestApp(unittest.TestCase):
         self.assertIn("UPDATE", "".join(r[0] for r in self.q_all("select action from time_entry_audit where entry_id in (select entry_id from time_entry where user_id=5 and work_date='2026-11-10')")))   # and audited
         # a skill code the client has no rate for is refused, and the hours stay where they were
         page = self.post("/timesheet/save", dict(base, **{"rs_1_5_2_0": "31", "h_1_5_2_0_2026-11-10": "7", "h_1_5_2_0_2026-11-11": "5"}))
-        self.assertIn("no rate for that skill code on this client", page)
+        self.assertIn("you do not hold a PAAF for that project and role", page)      # a title with no rate for the client can have no PAAF
         self.assertEqual(self.one("select worked_role_id from time_entry where user_id=5 and work_date='2026-11-10'")[0], 5)
         # moving onto a row that already has hours on the same days is refused
         self.post("/timesheet/save", dict(base, **{"h_1_4_1_0_2026-11-10": "1"}))                                      # a second row: Planner, On Shore
@@ -741,7 +749,7 @@ class TestApp(unittest.TestCase):
         eid = self.one("select entry_id from time_entry where user_id=4 and work_date='2026-11-03'")[0]
         self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Submit week", "reason": ""})
         self.post("/approvals/act", {"u": "7", "entry_id": str(eid), "action": "Approve selected"})
-        section = self.get("/reports?u=29&from=2026-01-01&to=2026-12-31").split("Hours by location (approved)")[1]
+        section = self.get("/reports?all=1&u=29&from=2026-01-01&to=2026-12-31").split("Hours by location (approved)")[1]
         self.assertIn('<td>Site visit</td><td align="right">7.5</td>', section)
 
     def test_the_same_cell_is_updated_not_duplicated(self):
@@ -773,13 +781,13 @@ class TestApp(unittest.TestCase):
                 "select lo.name, sum(t.hours) from time_entry t join location lo using(location_id) where t.status='Approved' group by lo.location_id")}
         finally:
             con.close()
-        page = self.get("/reports?u=29&from=2026-01-01&to=2026-12-31")
+        page = self.get("/reports?all=1&u=29&from=2026-01-01&to=2026-12-31")
         section = page.split("Hours by location (approved)")[1]
         for name, hours in want.items():
             self.assertIn('<td>%s</td><td align="right">%s</td>' % (name, app.fmt(hours)), section)
         self.assertNotIn("Overtime", section.split("<h4>")[0])                             # overtime is no longer reported in this section
         # an approver sees their team's hours only, and no mention of values
-        own = self.get("/reports?u=7&from=2026-01-01&to=2026-12-31").split("Hours by location (approved)")[1]
+        own = self.get("/reports?all=1&u=7&from=2026-01-01&to=2026-12-31").split("Hours by location (approved)")[1]
         self.assertIn("<td>Offshore</td>", own)                       # Rob Millman's offshore hours on an Apache scope
         self.assertNotIn("&pound;", own)
 
@@ -872,7 +880,7 @@ class TestApp(unittest.TestCase):
         self.assertIn("sent back by Kenneth Nicolson on 06/11/2026 10:00", page)
         self.assertIn('title="Sent back: Project Controls Manager cover', page)  # a hover note on the box itself
         self.assertIn("My Timesheet (1 sent back)", page)                          # and in the menu, on any page
-        self.assertIn("My Timesheet (1 sent back)", self.get("/reports?u=10"))
+        self.assertIn("My Timesheet (1 sent back)", self.get("/reports?all=1&u=10"))
         # people with nothing sent back see none of it
         page = self.get("/timesheet?u=5&w=2026-11-02")
         self.assertNotIn("Sent back", page)
@@ -1015,7 +1023,7 @@ class TestApp(unittest.TestCase):
         self.assertGreater(before, 0)
         self.reopen(5)
         self.assertLess(approved(5), before)  # this week's approved hours are drafts again
-        page = self.get("/reports?u=7&from=2026-01-01&to=2026-12-31")
+        page = self.get("/reports?all=1&u=7&from=2026-01-01&to=2026-12-31")
         self.assertIn("Actual booked hrs", page)  # and the Apache approver's report no longer counts them
         self.assertEqual(self.week_states(5, "2026-10-26", "2026-11-01"), ["Approved", "Approved"])  # the earlier week is still approved
 
@@ -1114,9 +1122,9 @@ class TestApp(unittest.TestCase):
         self.assertIn("BB0001-PM-D-001", page)
         self.assertNotIn('href="/monthend?u=29"', page)                     # no separate menu item: it is a report on the Reports page
         self.assertIn("Ewan Shaw", self.get("/monthend?u=29&m=2026-10"))      # 26-31 Oct is the end of the week of 26 Oct: counted in October only
-        self.assertNotIn("Month end", self.get("/reports?u=5"))                 # not on a standard user's Reports page
-        self.assertIn('id="rb-month"', self.get("/reports?u=29"))              # a button on the cost controller's Reports page
-        self.assertIn('id="rp-month" style="display:block"', self.get("/reports?u=29&r=month&m=2026-11"))
+        self.assertNotIn("Month end", self.get("/reports?all=1&u=5"))                 # not on a standard user's Reports page
+        self.assertIn('id="rb-month"', self.get("/reports?all=1&u=29"))              # a button on the cost controller's Reports page
+        self.assertIn('id="rp-month" style="display:block"', self.get("/reports?all=1&u=29&r=month&m=2026-11"))
         self.assertIn("not available", self.get("/monthend?u=5&m=2026-11").lower())
         # a week over the month end counts on each side by date: 30 Nov in November, 1 Dec in December
         con = app.db()
@@ -1142,7 +1150,7 @@ class TestApp(unittest.TestCase):
         self.assertNotIn("Submit up to", self.get("/timesheet?u=5&w=2026-11-09&add_phase=1&add_role=4&add_loc=1"))
 
     def test_nobody_needs_to_be_on_a_list_to_book(self):
-        # David Hart is on no client list (there is none): he is offered, and can book to, Apache's code
+        # David Hart holds a PAAF for Apache's project: he is offered, and can book to, Apache's code
         self.assertIn("Apache &gt; Wellbay Decommissioning", self.get("/timesheet?u=4&w=2026-11-02"))
         self.assertIn("1 entry saved", self.post("/timesheet/save", {"u": "4", "w": "2026-11-02", "action": "Save draft",
                                                                     "h_1_4_1_0_2026-11-03": "4", "reason": ""}))
@@ -1189,7 +1197,7 @@ class TestApp(unittest.TestCase):
 
     # ---------- cost permission is not tied to a job title ----------
     def test_cost_permission_can_be_given_to_anyone_not_only_cost_engineers(self):
-        url = "/reports?u=%d&from=2026-01-01&to=2026-12-31"
+        url = "/reports?all=1&u=%d&from=2026-01-01&to=2026-12-31"
         for u in (1, 2):  # the two cost engineers are controllers from the start
             self.assertIn("Sales rate", self.get(url % u), u)
         # Daniel Evans (9) is a Project Engineer: a standard user, who sees only his own hours and no values
@@ -1337,7 +1345,7 @@ class TestApp(unittest.TestCase):
         self.assertEqual(menu(8), {"approvals": True, "reports": True, "admin": False, "audit": False})     # approver (Spirit)
         self.assertEqual(menu(29), {"approvals": True, "reports": True, "admin": True, "audit": True})      # cost controller (approvers' own hours)
         self.assertEqual(menu(30), {"approvals": False, "reports": False, "admin": True, "audit": True})    # IT admin
-        self.assertIn("not available to your role", self.get("/reports?u=30"))
+        self.assertIn("not available to your role", self.get("/reports?all=1&u=30"))
         self.assertIn("not available to your role", self.get("/ctr?u=30&phase=1"))
 
     def test_only_a_named_approver_sees_approvals_and_controllers_and_admins_cannot_approve(self):
@@ -1385,13 +1393,12 @@ class TestApp(unittest.TestCase):
                                        "permission": "user", "start_date": "2026-11-01", "end_date": ""})
         uid = self.one("select user_id from app_user where nmc_id='A901'")[0]
         book = {"u": str(uid), "w": "2026-11-02", "action": "Save draft", "h_1_6_1_0_2026-11-06": "4", "reason": ""}
-        # there is no client list to be added to: the hours are priced at the client's rate for their skill code (Cost Engineer on Apache)
+        # a new person holds no PAAF yet: nothing can be booked to a client until commercial adds one
+        self.assertNotIn("1 entry saved", self.post("/timesheet/save", book))
+        self.admin_post("/admin/add", {"t": "paaf", "project_id": "1", "role_id": "6", "start_date": "2026-01-01", "person": [str(uid)]})
+        # then the hours are priced at the client's rate for the title on the PAAF (Cost Engineer on Apache)
         self.assertIn("1 entry saved", self.post("/timesheet/save", book))
         self.assertEqual(self.one("select rt.sales_rate from time_entry t join rate rt on rt.rate_id=t.rate_id where t.user_id=?", uid)[0], 85.5)
-
-    def test_there_is_no_paaf_tab(self):
-        self.assertNotIn("PAAF", self.get("/admin?u=29"))
-        self.assertEqual(self.one("select count(*) from information_schema.tables where table_schema='public' and table_name like '%paaf%'")[0], 0)
 
     def test_new_rate_applies_from_its_date_and_old_hours_keep_old_price(self):
         self.open_next_week()
@@ -1418,7 +1425,7 @@ class TestApp(unittest.TestCase):
 
 
     def test_user_switcher_shows_each_persons_job_title(self):
-        page = self.get("/reports?u=7")
+        page = self.get("/reports?all=1&u=7")
         for label in ["Alisdair Woodhead - Engineering Manager</option>", "Kenneth Nicolson - Head of Projects</option>",
                       "Emma Noble - Cost Engineer (controller)", "Stephanie Apedaile - Commercial Lead (controller)",
                       "NMC Admin - System Administrator (admin)", "Louis Ducharme - Operations Superintendent",
@@ -1431,7 +1438,7 @@ class TestApp(unittest.TestCase):
             self.assertIn(text, page)
 
     def test_reports_show_the_new_job_titles(self):
-        page = self.get("/reports?u=29")
+        page = self.get("/reports?all=1&u=29")
         for text in ["PM-04 Planner", "EM-01 Operations Superintendent", "PI-01 Lead Piping Engineer", "TS-01 Lead Technical Safety Engineer"]:
             self.assertIn(text, page)
 
@@ -1478,7 +1485,7 @@ class TestApp(unittest.TestCase):
         self.assertRegex(page, r"Approved [\d.]+, Edited [\d.]+, Submitted [\d.]+, Draft [\d.]+")
 
     def test_report_subtotals_sit_in_the_columns(self):
-        page = self.get("/reports?u=29")
+        page = self.get("/reports?all=1&u=29")
         self.assertIn("Grand total", page)
         self.assertIn("Actual booked hrs", page)
         self.assertIn("Subtotal week commencing 02/11/2026", page)
@@ -1494,7 +1501,7 @@ class TestApp(unittest.TestCase):
         self.assertIn("<b>%.2f</b>" % ctr, page.split("Grand total")[1])
 
     def test_reports_tree_goes_client_project_scope_phase_skill_person_entry(self):
-        page = self.get("/reports?u=29")
+        page = self.get("/reports?all=1&u=29")
         for kind in ["Client", "Project", "Scope", "CTR", "Skill code", "Person", "Entry"]:
             self.assertIn("<td>%s</td>" % kind, page)
         for name in ["Wellbay Decommissioning", "BB0001 Wellbay Clearance", "BB0001-PM-E-001", "Ewan Shaw", "03/11/2026", "Morecambe Hub"]:
@@ -1617,7 +1624,7 @@ class TestApp(unittest.TestCase):
         self.assertIn('<td align="right"><b>%s</b></td>' % app.fmt(mine), page)
 
     def test_every_report_on_the_reports_page_downloads_as_excel(self):
-        page = self.get("/reports?u=29")
+        page = self.get("/reports?all=1&u=29")
         for key in ("ctr", "internal", "allow", "loc", "budget"):
             self.assertIn("/reports/export.xlsx?u=29&amp;k=%s" % key, page)
             data, headers = self.raw("/reports/export.xlsx?u=29&k=%s&from=2026-01-01&to=2026-12-31" % key)
@@ -1658,7 +1665,7 @@ class TestApp(unittest.TestCase):
             urllib.request.urlopen(self.base + "/ctr.xlsx?u=29&phase=99999")
 
     def test_every_table_of_figures_can_be_downloaded_from_the_page(self):
-        for path in ("/reports?u=29", "/monthend?u=29&m=2026-11", "/missing?u=29", "/approvals?u=7", "/admin?u=29"):
+        for path in ("/reports?all=1&u=29", "/monthend?u=29&m=2026-11", "/missing?u=29", "/approvals?u=7", "/admin?u=29"):
             self.assertIn("/export/table.xlsx", self.get(path), path)         # the link is added to every page by the shared layout
         import json
         req = urllib.request.Request(self.base + "/export/table.xlsx", method="POST", headers={"Content-Type": "application/json"},
@@ -1724,7 +1731,7 @@ class TestApp(unittest.TestCase):
         self.assertEqual(rows[-1][0], "Total for range")
         client_only = " and scope_id in (select s.scope_id from scope s join client c on c.client_id=s.client_id where c.is_internal=0)"
         self.assertAlmostEqual(rows[-1][7], self.approved_hours("2026-10-01", "2026-12-31", client_only))
-        self.assertIn("/reports/period.xlsx?u=29", self.get("/reports?u=29"))
+        self.assertIn("/reports/period.xlsx?u=29", self.get("/reports?all=1&u=29"))
 
     def test_every_excel_file_carries_the_logo_title_and_date(self):
         data, _ = self.raw("/reports/export.xlsx?u=29&k=ctr")
@@ -1752,7 +1759,7 @@ class TestApp(unittest.TestCase):
             con.close()
 
     def test_the_aaa_consulting_export_filters_by_dates_and_staff_or_contractors(self):
-        page = self.get("/reports?u=29")
+        page = self.get("/reports?all=1&u=29")
         self.assertIn("AAA Consulting", page)
         self.assertIn("/reports/aaa.xlsx", page)
         span = "from=2026-01-01&to=2026-12-31&layout=lines"
@@ -2099,7 +2106,7 @@ class TestApp(unittest.TestCase):
         for u in (5, 7, 30):
             with self.assertRaises(urllib.error.HTTPError):
                 urllib.request.urlopen(self.base + "/reports/aaa.xlsx?u=%d" % u)
-        self.assertNotIn("AAA Consulting", self.get("/reports?u=5"))
+        self.assertNotIn("AAA Consulting", self.get("/reports?all=1&u=5"))
 
     def test_excel_text_is_stored_as_text_and_special_characters_are_safe(self):
         data = app.xlsx_bytes("Test <sheet>:1", [["Name", "Hours"], ["=1+1 & <b>x</b>\x01", 7.5]])
@@ -2145,12 +2152,12 @@ class TestApp(unittest.TestCase):
         self.post("/timesheet/save", {"u": "5", "w": "2026-11-09", "action": "Submit week", "reason": ""})
         self.approve_all(5)
         self.assertEqual({r[1] for r in self.q_all("select work_date, status from v_offshore_night where user_id=5")}, {"Approved"})
-        section = self.get("/reports?u=29&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]
+        section = self.get("/reports?all=1&u=29&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]
         self.assertIn("<td>Ewan Shaw</td><td>Offshore allowance</td><td align=\"right\">2</td><td align=\"right\">0</td>", section)
         self.assertIn("200.00", section)                                                     # money for cost controllers
-        own = self.get("/reports?u=7&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]       # the Apache approver sees the people on his scopes
+        own = self.get("/reports?all=1&u=7&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]       # the Apache approver sees the people on his scopes
         self.assertIn("Ewan Shaw", own)
-        other = self.get("/reports?u=8&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]       # the Spirit approver sees none of Ewan's
+        other = self.get("/reports?all=1&u=8&from=2026-10-01&to=2026-12-31").split("Allowances (offshore allowance")[1]       # the Spirit approver sees none of Ewan's
         self.assertNotIn("Ewan Shaw", other.split("<h4>")[0])
         month = self.get("/monthend?u=29&m=2026-11")
         self.assertIn("Offshore nights", month)
@@ -2195,7 +2202,7 @@ class TestApp(unittest.TestCase):
         self.assertEqual(self.one("select hours from time_entry where user_id=5 and work_date='2026-11-11'")[0], 3)
         # the controls sit under the grid's own form, so they travel with it
         self.assertIn('<form id="tsform" method="post" action="/timesheet/save">', page)
-        self.assertIn('<select form="tsform" name="add_phase" id="addphase" size="8">', page)
+        self.assertIn('<select form="tsform" name="add_phase" id="addphase" size="8" onchange="fillRoles()">', page)
         self.assertIn('<input form="tsform" type="submit" name="action" value="Add row">', page)
 
     def test_the_timesheet_shows_the_week_status_a_this_week_link_and_a_date_picker(self):
@@ -2383,7 +2390,7 @@ class TestApp(unittest.TestCase):
             self.assertAlmostEqual(r[8], max(r[4] - 40, 0))
         want = self.one("select sum(hours) from time_entry where user_id=5 and work_date between '2026-11-02' and '2026-11-08'")[0]
         self.assertAlmostEqual(ewan[1][4], want)
-        self.assertIn("Weekly hours by person", self.get("/reports?u=29"))
+        self.assertIn("Weekly hours by person", self.get("/reports?all=1&u=29"))
         for who in (5, 7, 30):                                                            # everyone's hours: cost controllers only
             with self.assertRaises(urllib.error.HTTPError) as cm:
                 urllib.request.urlopen(self.base + "/reports/weekly.xlsx?u=%d" % who)
@@ -2709,9 +2716,9 @@ class TestApp(unittest.TestCase):
         self.assertIn("Budget 160 hrs", ctr)
         self.assertIn("remaining 88.5 hrs", ctr)
         self.assertIn("used 45%", ctr)
-        report = self.get("/reports?u=29&from=2026-01-01&to=2026-12-31").split("Budget against actual hours")[1].split("<h4>")[0]
+        report = self.get("/reports?all=1&u=29&from=2026-01-01&to=2026-12-31").split("Budget against actual hours")[1].split("<h4>")[0]
         self.assertIn("<td>BB0001-PM-D-001</td><td align=\"right\">160</td>", report)
-        self.assertNotIn("Budget against actual hours", self.get("/reports?u=5&from=2026-01-01&to=2026-12-31"))   # cost controllers only
+        self.assertNotIn("Budget against actual hours", self.get("/reports?all=1&u=5&from=2026-01-01&to=2026-12-31"))   # cost controllers only
         # load a new snapshot: a changed budget, an unchanged one, a heading line, an unknown CTR and a bad figure
         data = "CTR No,Budget hrs\nBB0001-PM-D-001,200\nBB0001-PM-E-001,40\nZZ-NOPE,10\nA1500-PM-D-001,lots\n"
         out = self.admin_post("/admin/budgets", {"u": "30", "as_of": "2026-11-13", "data": data}, u="30")
@@ -2728,7 +2735,7 @@ class TestApp(unittest.TestCase):
         self.admin_post("/admin/budgets", {"u": "5", "as_of": "2026-11-14", "data": "BB0001-PM-D-001,999"}, u="5")
         self.assertEqual(self.one("select count(*) from ctr_budget where hours=999")[0], 0)
         # a CTR with hours but no budget says so
-        self.assertIn("not budgeted", self.get("/reports?u=29&from=2026-01-01&to=2026-12-31"))
+        self.assertIn("not budgeted", self.get("/reports?all=1&u=29&from=2026-01-01&to=2026-12-31"))
 
     def test_the_cost_dashboard_charts_budget_against_actual_hours(self):
         page = self.get("/dashboard?u=29")
@@ -2848,7 +2855,7 @@ class TestApp(unittest.TestCase):
             tab = self.get("/ctr?u=29&phase=%d&family=%s" % (ph, f.replace(" ", "%20")))
             self.assertIn("Resources", tab)
             self.assertIn("Timesheet entries", tab)
-        self.assertIn("Open CTR", self.get("/reports?u=29"))
+        self.assertIn("Open CTR", self.get("/reports?all=1&u=29"))
         self.assertIn("CTR not found", self.get("/ctr?u=29&phase=9999"))
         self.assertIn("CTR BB0001-PM-D-001", self.get("/ctr?u=29&phase=%d&family=Nonsense" % ph))
 

@@ -8,21 +8,21 @@ from nmc.core import (
     date_input, dmy, edit_link, esc, fmt,
     fmt_time, hidden, layout, msgs_html,
     audit_user_added, audit_user_changes, need_choice, need_date, need_email, need_hours, need_text, no_access,
-    locations, opts_clients, opts_projects, opts_roles, opts_scopes, people_picker,
+    locations, opts_assets, opts_clients, opts_projects, opts_roles, opts_scopes, people_picker,
     opts_users, permission_of, sel,
     stamp, table, txt)
 
 
 # ---------- Admin ----------
 ADMIN_TABS = [("periods", "Weekly periods"), ("users", "Users"), ("roles", "Job families / titles"),
-              ("clients", "Clients"), ("rates", "Client rate cards"), ("scopes", "Projects / scopes / CTRs"),
+              ("clients", "Clients"), ("assets", "Assets / POs"), ("paaf", "PAAFs"), ("rates", "Client rate cards"), ("scopes", "Projects / scopes / CTRs"),
               ("internal", "Internal codes"), ("locations", "Locations (hour types)"), ("allowance_rates", "Allowance rates"),
               ("budgets", "Budgets (from P6)")]
 
 
 # Who may use each Admin tab. Cost controllers have every tab: they maintain the system day to day (people, job roles, locations, clients, rate cards,
 # scopes, internal codes, allowance rates, periods and budgets). The IT admin keeps the tabs it always had (periods, users, job roles, locations, budgets).
-TAB_ACCESS = {"periods": ("controller", "admin"), "users": ("controller", "admin"), "roles": ("controller", "admin"), "clients": ("controller",),
+TAB_ACCESS = {"periods": ("controller", "admin"), "users": ("controller", "admin"), "roles": ("controller", "admin"), "clients": ("controller",), "assets": ("controller",), "paaf": ("controller",),
               "rates": ("controller",), "scopes": ("controller",), "internal": ("controller",),
               "locations": ("controller", "admin"), "allowance_rates": ("controller",), "budgets": ("controller", "admin")}  # budgets (P6) are parked for v1
 
@@ -177,6 +177,56 @@ def admin_body(con, u, t, q=None):
                 for r in con.execute("select at.name, ar.amount, ar.effective_from from allowance_rate ar join allowance_type at on at.allowance_id=ar.allowance_id "
                                      "order by at.allowance_id, ar.effective_from desc")]
         b.append("<h4>Every rate, newest first</h4>" + table(["Allowance", "Per night", "From"], hist))
+    elif t == "assets":
+        b.append("<p><small>A client's assets (a platform or a field). Each asset can hold one purchase order (PO) number, which is optional because operators invoice in "
+                 "different ways. Pick an asset on a scope (Projects / scopes / CTRs tab); the manhour report then shows the asset and its PO.</small></p>")
+        rows = [[r["client"], r["name"], r["po_number"] or "", str(r["n_scopes"]), edit_link(u, "assets", r["asset_id"])]
+                for r in con.execute("select a.*, c.name as client, (select count(*) from scope s where s.asset_id=a.asset_id) as n_scopes "
+                                     "from asset a join client c on c.client_id=a.client_id order by c.name, a.name")]
+        b.append(table(["Client", "Asset", "PO number", "Scopes", ""], rows, raw_cols=(4,)) if rows else "<p>No assets yet.</p>")
+        b.append('<h4>Add an asset</h4><form method="post" action="/admin/add">%s Client %s Asset %s PO number (optional) %s <input type="submit" value="Add asset"></form>'
+                 % (hidden(u=u, t="assets"), sel("client_id", opts_clients(con, billable_only=True)), txt("name", "", 30), txt("po_number", "", 20)))
+    elif t == "paaf":
+        b.append("<p><small>The PAAF register: who may write time on which client project, and under which job title. A person sees only the CTRs of projects they hold a PAAF for, "
+                 "and on each only the job titles on their PAAFs for that project. The title decides the rate: the hours are priced at the client's rate for that title (set on the "
+                 "client rate card, so add the rate first). A person can hold several PAAFs on a project, one for each job title. Internal codes need no PAAF. "
+                 "Hours can only be booked on days from the PAAF's start date to its end date (no end date means it has none set), so an expired PAAF cannot be booked on; to renew one, change its dates. "
+                 "This is a register only: the signed PAAF documents are held elsewhere and commercial keeps this list up to date. The reference is where to find the document, not the document. "
+                 "Removing a PAAF stops new bookings only; hours already booked stay.</small></p>")
+        fp = ((q or {}).get("f_project", [""])[0]).strip()
+        fq = ((q or {}).get("f_person", [""])[0]).strip()
+        projects = [tuple(r) for r in con.execute("select p.project_id, c.name || ' - ' || p.name from project p join client c on c.client_id=p.client_id "
+                                                  "where c.is_internal=0 order by c.name, p.name")]
+        b.append('<form method="get" action="/admin">%s<p>Project %s Person %s <input type="submit" value="Show"></p></form>' % (
+            hidden(u=u, t="paaf"), sel("f_project", projects, fp, True, "All projects"), txt("f_person", fq, 20)))
+        where, args = "", []
+        if fp.isdigit():
+            where += " and pf.project_id=?"
+            args.append(int(fp))
+        if fq:
+            where += " and us.name ilike ?"
+            args.append("%" + fq + "%")
+        found = con.execute("select pf.paaf_id, c.name as client, pr.name as project, ro.skill_code, ro.name as role, us.name as person, pf.reference, pf.start_date, pf.end_date "
+                            "from paaf pf join project pr on pr.project_id=pf.project_id join client c on c.client_id=pr.client_id join role ro on ro.role_id=pf.role_id "
+                            "join app_user us on us.user_id=pf.user_id where true" + where + " order by c.name, pr.name, us.name, ro.skill_code limit 501", args).fetchall()
+        today = datetime.date.today().isoformat()
+
+        def paaf_status(r):
+            if r["start_date"] > today:
+                return "Not started"
+            return "Expired" if r["end_date"] and r["end_date"] < today else "Valid"
+        rows = [[r["client"], r["project"], "%s %s" % (r["skill_code"], r["role"]), r["person"], dmy(r["start_date"]), dmy(r["end_date"]), paaf_status(r), r["reference"] or "",
+                 edit_link(u, "paaf", r["paaf_id"])] for r in found[:500]]
+        b.append(table(["Client", "Project", "Role", "Person", "From", "To", "Status", "Reference", ""], rows, raw_cols=(8,)) if rows else "<p>No PAAFs match.</p>")
+        if len(found) > 500:
+            b.append("<p><small>Showing the first 500. Pick a project or a person to narrow it down.</small></p>")
+        b.append('<h4>Add PAAFs</h4><p><small>Choose a project and a job title, then add everyone who should hold that PAAF. The end date can be left empty. The reference is optional: where the signed PAAF is kept.</small></p>'
+                 '<form method="post" action="/admin/add">%s<table border="0" cellpadding="2"><tr><td>Project</td><td>%s</td></tr>'
+                 '<tr><td>Job title</td><td>%s</td></tr><tr><td>Start date</td><td>%s</td></tr><tr><td>End date</td><td>%s</td></tr>'
+                 '<tr><td>Reference</td><td>%s</td></tr><tr><td>People</td><td>%s</td></tr></table>'
+                 '<input type="submit" value="Add PAAFs"></form>' % (
+                     hidden(u=u, t="paaf"), sel("project_id", projects), sel("role_id", opts_roles(con)), date_input("start_date", today), date_input("end_date", ""), txt("reference", "", 20),
+                     people_picker("person", [tuple(r) for r in con.execute("select user_id, name from app_user where books_time=1 order by name")], set(), "Nobody chosen")))
     elif t == "budgets":
         b.append("<p><small>Budget hours per CTR come from P6, which holds hours only. Paste either (1) a P6 export copied from SSMS or saved as CSV, with the columns "
                  "<b>project, WBS name, activity code, budget hours, actual hours, remaining hours, % complete</b> (the CTR No is read from the end of the WBS name, "
@@ -219,17 +269,18 @@ def admin_body(con, u, t, q=None):
         b.append('<form method="post" action="/admin/add">%s Client %s Code %s Name %s <input type="submit" value="Add project"></form>'
                  % (hidden(u=u, t="projects"), sel("client_id", opts_clients(con)), txt("project_code", "", 10), txt("name", "", 30)))
         b.append("<h4>Scopes</h4>")
-        rows = [[r["client"], r["project"], r["scope_code"], r["description"], r["status"], edit_link(u, "scopes", r["scope_id"])]
-                for r in con.execute("select s.scope_id, c.name as client, pr.name as project, s.scope_code, s.description, s.status "
+        rows = [[r["client"], r["project"], r["scope_code"], r["description"], r["asset"] or "", r["po_number"] or "", r["status"], edit_link(u, "scopes", r["scope_id"])]
+                for r in con.execute("select s.scope_id, c.name as client, pr.name as project, s.scope_code, s.description, s.status, a.name as asset, a.po_number "
                                      "from scope s join client c on c.client_id=s.client_id join project pr on pr.project_id=s.project_id "
-                                     "order by c.name, pr.name, s.scope_code")]
-        b.append(table(["Client", "Project", "Scope", "Description", "Status", ""], rows, raw_cols=(5,)))
+                                     "left join asset a on a.asset_id=s.asset_id order by c.name, pr.name, s.scope_code")]
+        b.append(table(["Client", "Project", "Scope", "Description", "Asset", "PO", "Status", ""], rows, raw_cols=(7,)))
         b.append('<p><b>Add a scope</b> <small>A CTR called General is created automatically; add or rename CTRs below.</small></p>'
                  '<form method="post" action="/admin/add">%s<table border="0" cellpadding="2">'
                  "<tr><td>Project</td><td>%s</td></tr><tr><td>Scope code</td><td>%s</td></tr>"
-                 "<tr><td>Description</td><td>%s</td></tr><tr><td>Status</td><td>%s</td></tr></table>"
+                 "<tr><td>Description</td><td>%s</td></tr><tr><td>Asset (optional)</td><td>%s</td></tr><tr><td>Status</td><td>%s</td></tr></table>"
                  '<input type="submit" value="Add scope"></form>'
                  % (hidden(u=u, t="scopes"), sel("project_id", opts_projects(con)), txt("scope_code", "", 10), txt("description", "", 40),
+                    sel("asset_id", opts_assets(con), None, True, "None"),
                     sel("status", [("Open", "Open"), ("Pipeline", "Pipeline"), ("Closed", "Closed")])))
         b.append("<h4>CTRs</h4>")
         rows = []
@@ -311,11 +362,31 @@ def view_admin_edit(con, u, t, i, msgs=None):
         r = con.execute("select s.*, c.name as client from scope s join client c on c.client_id=s.client_id where scope_id=?", (i,)).fetchone()
         if not r:
             return layout(con, u, "Admin", "<p>Not found.</p>")
-        form = ("<tr><td>Client</td><td>%s</td></tr><tr><td>Scope code</td><td>%s</td></tr><tr><td>Description</td><td>%s</td></tr>"
+        asset_row = "" if t == "internal" else ("<tr><td>Asset</td><td>%s</td></tr>" % sel("asset_id", opts_assets(con, r["client_id"]), r["asset_id"], True, "None"))
+        form = ("<tr><td>Client</td><td>%s</td></tr><tr><td>Scope code</td><td>%s</td></tr><tr><td>Description</td><td>%s</td></tr>%s"
                 "<tr><td>Status</td><td>%s</td></tr>" % (
-                    esc(r["client"]), esc(r["scope_code"]), txt("description", r["description"], 40),
+                    esc(r["client"]), esc(r["scope_code"]), txt("description", r["description"], 40), asset_row,
                     sel("status", [("Open", "Open"), ("Pipeline", "Pipeline"), ("Closed", "Closed")], r["status"])))
-        note = "<p><small>Closing a scope stops new bookings.</small></p>"
+        note = "<p><small>Closing a scope stops new bookings. The asset (and its PO) comes from the client's assets, kept on the Assets / POs tab.</small></p>"
+    elif t == "assets":
+        r = con.execute("select a.*, c.name as client from asset a join client c on c.client_id=a.client_id where asset_id=?", (i,)).fetchone()
+        if not r:
+            return layout(con, u, "Admin", "<p>Not found.</p>")
+        form = ("<tr><td>Client</td><td>%s</td></tr><tr><td>Asset</td><td>%s</td></tr><tr><td>PO number (optional)</td><td>%s</td></tr>"
+                % (esc(r["client"]), txt("name", r["name"], 30), txt("po_number", r["po_number"] or "", 20)))
+        note = "<p><small>One PO per asset. Leave it empty when the operator does not invoice against a PO.</small></p>"
+    elif t == "paaf":
+        r = con.execute("select pf.*, c.name as client, pr.name as project, ro.skill_code, ro.name as role, us.name as person from paaf pf join project pr on pr.project_id=pf.project_id "
+                        "join client c on c.client_id=pr.client_id join role ro on ro.role_id=pf.role_id join app_user us on us.user_id=pf.user_id where pf.paaf_id=?", (i,)).fetchone()
+        if not r:
+            return layout(con, u, "Admin", "<p>Not found.</p>")
+        form = ("<tr><td>Client</td><td>%s</td></tr><tr><td>Project</td><td>%s</td></tr><tr><td>Person</td><td>%s</td></tr><tr><td>Job title</td><td>%s %s</td></tr>"
+                "<tr><td>Start date</td><td>%s</td></tr><tr><td>End date</td><td>%s <small>empty = no end date</small></td></tr>"
+                "<tr><td>Reference</td><td>%s <small>where the signed PAAF is kept</small></td></tr>" % (
+                    esc(r["client"]), esc(r["project"]), esc(r["person"]), esc(r["skill_code"]), esc(r["role"]),
+                    date_input("start_date", r["start_date"]), date_input("end_date", r["end_date"] or ""), txt("reference", r["reference"] or "", 24)))
+        note = ('<p><small>To renew a PAAF, change its dates. To change the person, project or job title, remove this PAAF and add a new one. Removing stops new bookings only; hours already booked stay.</small></p>'
+                '<p><input type="submit" name="remove" value="Remove this PAAF" onclick="return confirm(\'Remove this PAAF? Hours already booked stay, but no new hours can be booked under it.\');"></p>')
     elif t == "projects":
         r = con.execute("select p.*, c.name as client from project p join client c on c.client_id=p.client_id where project_id=?", (i,)).fetchone()
         if not r:
@@ -388,6 +459,25 @@ def admin_add(con, form):
         elif t == "clients":
             con.execute("insert into client (name) values (?)", (need_text(g("name"), "Client name"),))
             msg = "Client added."
+        elif t == "assets":
+            con.execute("insert into asset (client_id, name, po_number) values (?,?,?)",
+                        (int(g("client_id")), need_text(g("name"), "Asset name"), g("po_number") or None))
+            msg = "Asset added."
+        elif t == "paaf":
+            people = [int(x) for x in form.get("person", [])]
+            if not people:
+                raise ValueError("Choose at least one person.")
+            start, end = need_date(g("start_date"), "Start date"), need_date(g("end_date"), "End date", False)
+            if end and end < start:
+                raise ValueError("The end date cannot be before the start date.")
+            made = 0
+            for who in people:
+                if con.execute("select 1 from paaf where project_id=? and role_id=? and user_id=?", (int(g("project_id")), int(g("role_id")), who)).fetchone():
+                    continue                                                                            # already held
+                con.execute("insert into paaf (project_id, role_id, user_id, reference, start_date, end_date) values (?,?,?,?,?,?)",
+                            (int(g("project_id")), int(g("role_id")), who, g("reference") or None, start, end))
+                made += 1
+            msg = "%d PAAF%s added%s." % (made, "" if made == 1 else "s", "" if made == len(people) else " (%d already held)" % (len(people) - made))
         elif t == "rates":
             try:
                 rate = float(g("sales_rate"))
@@ -404,8 +494,9 @@ def admin_add(con, form):
             pr = con.execute("select client_id from project where project_id=?", (int(g("project_id") or 0),)).fetchone()
             if not pr:
                 raise ValueError("Choose a project (add one first if there are none).")
-            cur = con.execute("insert into scope (scope_code, client_id, project_id, description, status) values (?,?,?,?,?) returning scope_id",
-                              (need_text(g("scope_code"), "Scope code"), pr[0], int(g("project_id")), need_text(g("description"), "Description"), g("status")))
+            cur = con.execute("insert into scope (scope_code, client_id, project_id, description, status, asset_id) values (?,?,?,?,?,?) returning scope_id",
+                              (need_text(g("scope_code"), "Scope code"), pr[0], int(g("project_id")), need_text(g("description"), "Description"), g("status"),
+                               int(g("asset_id")) if g("asset_id") else None))
             con.execute("insert into phase (scope_id, name) values (?, 'General')", (cur.fetchone()[0],))
             msg = "Scope added with a General CTR."
         elif t == "phases":
@@ -486,8 +577,21 @@ def admin_save(con, form):
                         (need_text(g("name"), "Location name"), int(g("active")), 1 if g("earns_allowance") == "1" else 0, i))
         elif t == "clients":
             con.execute("update client set framework_ref=? where client_id=?", (g("framework_ref") or None, i))
+        elif t == "paaf":
+            if form.get("remove"):
+                con.execute("delete from paaf where paaf_id=?", (i,))
+                con.commit()
+                return view_admin(con, u, t, ["PAAF removed."], ok=True)
+            start, end = need_date(g("start_date"), "Start date"), need_date(g("end_date"), "End date", False)
+            if end and end < start:
+                raise ValueError("The end date cannot be before the start date.")
+            con.execute("update paaf set reference=?, start_date=?, end_date=? where paaf_id=?", (g("reference") or None, start, end, i))
+        elif t == "assets":
+            con.execute("update asset set name=?, po_number=? where asset_id=?", (need_text(g("name"), "Asset name"), g("po_number") or None, i))
         elif t in ("scopes", "internal"):
             con.execute("update scope set description=?, status=? where scope_id=?", (need_text(g("description"), "Description"), g("status"), i))
+            if t == "scopes":
+                con.execute("update scope set asset_id=? where scope_id=?", (int(g("asset_id")) if g("asset_id") else None, i))
         elif t == "projects":
             con.execute("update project set name=?, status=? where project_id=?", (need_text(g("name"), "Project name"), g("status"), i))
         elif t == "phases":

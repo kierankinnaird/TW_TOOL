@@ -33,7 +33,7 @@ class TestSeed(Base):
     def test_counts(self):
         self.assertEqual(self.scalar("select count(*) from app_user"), 31)
         self.assertEqual(self.scalar("select count(*) from time_entry"), 64)
-        self.assertEqual(self.scalar("select count(*) from rate"), 60)
+        self.assertEqual(self.scalar("select count(*) from rate"), 62)       # 60, and a rate each for the two document controller titles
 
     def test_rates_rise_with_seniority_for_each_client(self):
         order = ["Cost Engineer", "Planner", "Project Engineer", "Project Controls Manager",
@@ -45,7 +45,7 @@ class TestSeed(Base):
             self.assertEqual([rows[n] for n in order], sorted(rows[n] for n in order), client)
 
     def test_job_families_and_titles_from_the_estimate(self):
-        self.assertEqual(self.scalar("select count(*) from role"), 33)
+        self.assertEqual(self.scalar("select count(*) from role"), 35)
         families = {r[0] for r in self.con.execute("select family from role")}
         for f in ["Project Management", "Engineering Management", "Project Engineering", "Piping Engineering", "Technical Safety", "HSES", "QA/QC"]:
             self.assertIn(f, families)
@@ -53,7 +53,7 @@ class TestSeed(Base):
 
     def test_every_user_has_a_job_title_and_every_title_is_priced_for_both_clients(self):
         self.assertEqual(self.scalar("select count(*) from app_user where role_id not in (select role_id from role)"), 0)
-        self.assertEqual(self.scalar("select count(*) from role r where (select count(*) from rate where role_id=r.role_id) not in (0, 2)"), 0)
+        self.assertEqual(self.scalar("select count(*) from role r where (select count(*) from rate where role_id=r.role_id) not in (0, 2) and r.role_id not in (34, 35)"), 0)       # the two document controller titles are priced by one client each
         # the only titles without a rate card never bill a client
         self.assertEqual({r[0] for r in self.con.execute("select name from role r where not exists (select 1 from rate where role_id=r.role_id)")},
                          {"System Administrator", "Commercial Lead", "Managing Director"})
@@ -74,9 +74,12 @@ class TestBookingRules(Base):
         self.con.execute(NEW_ENTRY, (5, 1, 1, 4, 4, "2026-11-06", 8, 5))
         self.assertEqual(self.scalar("select count(*) from time_entry_audit where action='CREATE'"), 65)
 
-    def test_anyone_can_book_to_any_open_client_code(self):
-        # nobody needs to be on a client's list: anyone can book to any open client code at the client's rate
+    def test_client_hours_are_booked_under_a_paaf_at_the_clients_rate(self):
+        # David Hart has no PAAF for Apache's project and the Planner title: refused until he is given one
+        self.blocked(NEW_ENTRY, (4, 1, 1, 4, 4, "2026-11-06", 8, 4), "No PAAF")
+        self.con.execute("insert into paaf (project_id, role_id, user_id, start_date) values (1, 4, 4, '2026-01-01')")
         self.con.execute(NEW_ENTRY, (4, 1, 1, 4, 4, "2026-11-06", 8, 4))
+        self.con.execute("insert into paaf (project_id, role_id, user_id, start_date) values (3, 4, 5, '2026-01-01')")
         spirit_planner = self.scalar("select rate_id from rate where client_id=2 and role_id=4 order by effective_from desc limit 1")
         self.con.execute(NEW_ENTRY, (5, 5, 6, 4, spirit_planner, "2026-11-06", 4, 5))
         self.blocked(NEW_ENTRY, (5, 5, 6, 4, 4, "2026-11-06", 4, 5), "Rate does not match")  # but the rate must be the client's own
