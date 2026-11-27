@@ -5,6 +5,7 @@ import os
 from urllib.parse import quote, urlencode
 from nmc.core import ROOT, can_see_reports, date_input, dmy, esc, fmt, hidden, layout, monday, no_access, permission_of, sel, sub_row
 from nmc.monthend import monthend_body
+from nmc import costreports
 
 
 REPORT_JS = """<script>
@@ -302,7 +303,7 @@ def report_sheet(con, u, q, key):
         return rows, "Location %s to %s" % (d_from, d_to)
     if key in ("ltd", "paye_week", "paye_month") and permission_of(con, u) == "controller":
         title, sub, head, found = contractor_hours(con, key, q)
-        return [head] + found + ([["Total", "", "", "", sum(r[4] for r in found)]] if found else []), title
+        return [head] + once(found) + ([["Total", "", "", "", sum(r[4] for r in found)]] if found else []), title
     if key == "budget" and permission_of(con, u) == "controller":
         rows = [["Client", "CTR No", "Budget hrs", "As of", "Actual hrs", "Pending hrs", "Remaining hrs", "Used %"]]
         for r in budget_data(con):
@@ -441,8 +442,8 @@ def view_all_reports(con, u, q):
         brows = budget_data(con)
         b.append(sect("budget", "Budget against actual"))
         b.append(xl(u, "budget"))
-        b.append("<h4>Budget against actual hours (from P6)</h4>")
-        b.append("<p><small>Budget hours are the latest load from P6 (Admin, Budgets). Actual is approved hours to date, all weeks; pending is submitted hours waiting for approval. "
+        b.append("<h4>Budget against actual hours</h4>")
+        b.append("<p><small>Budget hours are the latest budget set on the CTR page. Actual is approved hours to date, all weeks; pending is submitted hours waiting for approval. "
                  "Remaining is budget less actual; used is actual as a percentage of budget. A CTR with hours but no budget is shown as not budgeted.</small></p>")
         if brows:
             t4 = ["<tr><th>Client</th><th>CTR No</th><th>Budget hrs</th><th>As of</th><th>Actual hrs</th><th>Pending hrs</th><th>Remaining hrs</th><th>Used</th></tr>"]
@@ -456,7 +457,7 @@ def view_all_reports(con, u, q):
             t4.append(sub_row(["", "Total (budgeted CTRs)", fmt(tb), "", fmt(ta), "", fmt(tb - ta), ("%.0f%%" % (100 * ta / tb)) if tb else ""], right_from=2))
             b.append('<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(t4))
         else:
-            b.append("<p>No budgets loaded and no client hours yet.</p>")
+            b.append("<p>No budgets set and no client hours yet.</p>")
 
     if permission_of(con, u) == "controller":
         b.append(sect("aaa", "AAA Consulting"))
@@ -473,7 +474,7 @@ def view_all_reports(con, u, q):
 SHOW_ALL_REPORTS = False
 LEGACY_REPORTS = ("ctr", "period", "budget", "aaa", "weekly", "internal", "loc", "allow", "month")
 LTD, PAYE = "Contractor - LTD", "Contractor - PAYE"
-CONTRACTOR_REPORTS = (("Contractor hours", ("ltd", "paye_week", "paye_month")),)
+CONTRACTOR_REPORTS = (("Cost reports (by client)", tuple(k for k, _ in costreports.COST_REPORTS)), ("Contractor hours", ("ltd", "paye_week", "paye_month")))
 
 
 def month_of(q):
@@ -520,24 +521,33 @@ def contractor_hours(con, kind, q):
     return title, sub, ["Person: NMC User ID", "Timesheet Location", "Person: Full Name (Firstname Lastname)", "Date", "Time Booked (hrs)"], rows
 
 
+def once(rows):
+    """Contractor rows with each person's NMC ID and name stated once, on their first row, and left blank on the rows below (as the CMAP report does)."""
+    out, last = [], None
+    for r in rows:
+        key = (r[0], r[2])
+        out.append(list(r) if key != last else ["", r[1], "", r[3], r[4]])
+        last = key
+    return out
+
+
 def contractor_panel(con, u, q, kind):
     """One contractor report on the Reports page: its dates, the table and the Excel link."""
     title, sub, head, rows = contractor_hours(con, kind, q)
     if kind == "paye_week":
         a, b = week_range(q)
-        form = "From %s to %s" % (date_input("from", a.isoformat()), date_input("to", b.isoformat()))
+        fields = [("From", date_input("from", a.isoformat())), ("To", date_input("to", b.isoformat()))]
         keep = [("from", a.isoformat()), ("to", b.isoformat())]
     else:
         first, _ = month_of(q)
-        form = 'Month <input type="month" name="month" value="%s">' % first.strftime("%Y-%m")
+        fields = [("Month", '<input type="month" name="month" value="%s">' % first.strftime("%Y-%m"))]
         keep = [("month", first.strftime("%Y-%m"))]
-    out = ['<h4>%s</h4><p><small>%s. Submitted and approved hours, counted once, hours only (drafts are left out).</small></p>' % (esc(title), esc(sub)),
-           '<form method="get" action="/reports">%s<p>%s <input type="submit" value="Show"> '
-           '<a href="/reports/export.xlsx?%s">Download as Excel</a></p></form>' % (hidden(u=u, r=kind), form, esc(urlencode([("u", u), ("k", kind)] + keep)))]
+    out = ["<h4>%s</h4>" % esc(title), '<p class="crmeta">%s &nbsp;|&nbsp; Exported %s</p>' % (esc(sub), datetime.datetime.now().strftime("%d/%m/%Y %H:%M")),
+           costreports.filter_bar(u, kind, fields, "/reports/export.xlsx?" + urlencode([("u", u), ("k", kind)] + keep))]
     if rows:
-        body = "".join('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td align="right">%s</td></tr>' % (esc(r[0]), esc(r[1]), esc(r[2]), esc(r[3]), "%.2f" % r[4]) for r in rows)
-        out.append('<table border="1" cellpadding="3" cellspacing="0"><tr>%s</tr>%s%s</table>' % (
-            "".join("<th>%s</th>" % esc(h) for h in head), body, sub_row(["Total", "", "", "", "%.2f" % sum(r[4] for r in rows)], right_from=4)))
+        body = [("row", r) for r in once(rows)] + [("grand", ["Total", "", "", "", sum(r[4] for r in rows)])]
+        out.append(costreports.render_table(head, body, 4))
+        out.append('<p class="crmeta">Submitted and approved hours, counted once, hours only (drafts are left out).</p>')
     else:
         out.append("<p>No hours for this period.</p>")
     return "".join(out)
@@ -551,6 +561,8 @@ def view_reports(con, u, q):
         return view_all_reports(con, u, q)
     parts = []
     if permission_of(con, u) == "controller":
+        for kind, name in costreports.COST_REPORTS:
+            parts += [sect(kind, name), costreports.panel(con, u, q, kind)]
         for kind, name in (("ltd", "Ltd company hours"), ("paye_week", "PAYE weekly hours"), ("paye_month", "PAYE monthly hours")):
             parts += [sect(kind, name), contractor_panel(con, u, q, kind)]
     opened = q.get("r", [""])[0]
@@ -572,7 +584,7 @@ REPORT_GROUPS = [("Billing", ("ctr", "period", "budget", "aaa")), ("Hours", ("in
 REPORT_HELP = {
     "ctr": "Approved and pending hours and value for every client, project, scope and CTR, down to each person's entries",
     "period": "Approved hours and value week by week, filtered by client, project, scope or CTR",
-    "budget": "Hours against the P6 budget for each CTR",
+    "budget": "Hours against the budget for each CTR",
     "weekly": "Each person's total hours per week against their contracted hours, as an Excel file",
     "aaa": "Hours between two dates for AAA Consulting: contractors, staff or both, as an Excel file",
     "internal": "Hours booked to internal codes (paid by NMC, not billed to a client)",
@@ -581,6 +593,8 @@ REPORT_HELP = {
     "month": "Who still has to enter or submit time for a calendar month, and the month's hours by CTR",
     "grid": "Hours by person, code and day, in ready-made layouts you can tailor",
     "manhours": "People and roles on a client's work, as an Excel file",
+    "ctr_week": costreports.COST_HELP["ctr_week"], "budget_hours": costreports.COST_HELP["budget_hours"],
+    "cost_week": costreports.COST_HELP["cost_week"], "invoice": costreports.COST_HELP["invoice"],
     "ltd": "Total hours booked in a month by each Ltd company contractor, by location",
     "paye_week": "Each PAYE contractor's total hours for each week, by location, for AAA",
     "paye_month": "Each PAYE contractor's hours for each week of a month, by location, for AAA"}
@@ -796,26 +810,31 @@ def manhour_data(con, u, q):
     d_to = q.get("to", [""])[0] or "%d-12-31" % this_year
     vis, vargs = visible_to(report_view(con, u), u)
     labels = ("ph.phase_id, (s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name))) as ctr, coalesce(ph.description, s.description) as title, "
-              "a.name as asset, a.po_number, ro.skill_code, ro.name as role, us.name as person")
+              "a.name as asset, a.po_number, ro.skill_code, ro.name as role, us.name as person, coalesce(dp.name, ph.name) as stage")
     joins = ("from " + HOUR_LEGS + " join scope s on s.scope_id=t.scope_id join phase ph on ph.phase_id=t.phase_id join role ro on ro.role_id=t.worked_role_id "
-             "join app_user us on us.user_id=t.user_id left join asset a on a.asset_id=s.asset_id where s.client_id=?")
-    keys = "ph.phase_id, s.scope_id, ph.ctr_code, ph.name, ph.description, s.description, a.asset_id, ro.role_id, ro.skill_code, ro.name, us.user_id, us.name"
+             "join app_user us on us.user_id=t.user_id left join asset a on a.asset_id=s.asset_id left join discipline dp on dp.discipline_id=ph.discipline_id where s.client_id=?")
+    keys = "ph.phase_id, s.scope_id, ph.ctr_code, ph.name, ph.description, s.description, a.asset_id, ro.role_id, ro.skill_code, ro.name, us.user_id, us.name, dp.discipline_id, dp.name"
     found = con.execute(
-        "select " + labels + ", monday_of(t.work_date) as wk, sum(t.hours) as hours " + joins +
+        "select " + labels + ", t.work_date as day, sum(t.hours) as hours " + joins +
         " and substr(t.changed_at, 1, 10) <= ? and t.work_date between ? and ?" + vis +
-        " group by " + keys + ", wk having sum(t.hours) <> 0 order by ctr, person, wk", (cid, d_to, d_from, d_to) + vargs).fetchall()
+        " group by " + keys + ", t.work_date having sum(t.hours) <> 0 order by ctr, person, t.work_date", (cid, d_to, d_from, d_to) + vargs).fetchall()
     adj = con.execute(
         "select " + labels + ", monday_of(t.work_date) as wk, max(substr(t.changed_at, 1, 10)) as changed, sum(t.hours) as hours " + joins +
         " and substr(t.changed_at, 1, 10) between ? and ? and t.work_date < ?" + vis +
         " group by " + keys + ", wk having sum(t.hours) <> 0 order by ctr, person, wk", (cid, d_from, d_to, d_from) + vargs).fetchall()
-    weeks = sorted({r["wk"] for r in found})
-    tree = {}  # phase -> {"ctr", "title", "asset", "po", "people": {(person, skill code, role): {week: hours}}}
+    week_of = lambda d: (datetime.date.fromisoformat(d) - datetime.timedelta(days=datetime.date.fromisoformat(d).weekday())).isoformat()
+    weeks = sorted({week_of(r["day"]) for r in found})
+    tree = {}  # phase -> {"ctr", "title", "asset", "po", "stage", "people": {(person, skill code, role): {week: hours}}, "by_day": the same by day}
     for r in found:
-        ctr = tree.setdefault(r["phase_id"], {"ctr": r["ctr"], "title": r["title"], "asset": r["asset"] or "", "po": r["po_number"] or "", "people": {}})
+        ctr = tree.setdefault(r["phase_id"], {"ctr": r["ctr"], "title": r["title"], "asset": r["asset"] or "", "po": r["po_number"] or "", "stage": r["stage"] or "",
+                                              "people": {}, "by_day": {}})
         who = ctr["people"].setdefault((r["person"], r["skill_code"], r["role"]), {})
-        who[r["wk"]] = who.get(r["wk"], 0.0) + r["hours"]
+        wk = week_of(r["day"])
+        who[wk] = who.get(wk, 0.0) + r["hours"]
+        day = ctr["by_day"].setdefault((r["person"], r["skill_code"], r["role"]), {})
+        day[r["day"]] = day.get(r["day"], 0.0) + r["hours"]
     adjustments = [{"ctr": r["ctr"], "title": r["title"], "asset": r["asset"] or "", "po": r["po_number"] or "", "person": r["person"], "skill": r["skill_code"],
-                    "role": r["role"], "week": r["wk"], "changed": r["changed"], "hours": r["hours"]} for r in adj]
+                    "role": r["role"], "stage": r["stage"] or "", "week": r["wk"], "changed": r["changed"], "hours": r["hours"]} for r in adj]
     return {"clients": clients, "client_id": cid, "client": dict(clients)[cid], "from": d_from, "to": d_to, "weeks": weeks, "tree": tree, "adjustments": adjustments,
             "total_work": sum(r["hours"] for r in found), "total_adjustments": sum(r["hours"] for r in adj)}
 
@@ -823,8 +842,22 @@ def manhour_data(con, u, q):
 LEAD = 5   # columns before the weeks: CTR, person, role, asset, PO
 
 
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def days_text(by_day, week):
+    """The days of one week a person booked hours on, with the hours: 'Mon 8, Tue 8, Fri 4'."""
+    start = datetime.date.fromisoformat(week)
+    out = []
+    for i in range(7):
+        h = by_day.get((start + datetime.timedelta(days=i)).isoformat())
+        if h:
+            out.append("%s %s" % (WEEKDAYS[i], ("%g" % round(h, 2))))
+    return ", ".join(out)
+
+
 def manhour_lines(data):
-    """The work of the period as rows of cells, each flagged: 'head', 'row', 'ctr' (a CTR's subtotal) or 'grand'."""
+    """The work of the period as rows of cells, each flagged: 'head', 'row' (a person, with a 'days' row beneath showing the days booked), 'ctr' (a CTR's subtotal) or 'grand'."""
     weeks = data["weeks"]
     dmy = lambda iso: "%s/%s/%s" % (iso[8:], iso[5:7], iso[:4])
     lines = [("head", ["CTR", "Person", "Role", "Asset", "PO"] + [dmy(w) for w in weeks] + ["Total hrs"])]
@@ -839,6 +872,7 @@ def manhour_lines(data):
             first = ["%s - %s" % (ctr["ctr"], ctr["title"]), "", "", ctr["asset"], ctr["po"]] if n == 0 else ["", "", "", "", ""]
             first[1], first[2] = person, "%s %s" % (code, role)
             lines.append(("row", first + cells(row)))
+            lines.append(("days", ["", "booked on", "", "", ""] + [days_text(ctr["by_day"][(person, code, role)], w) for w in weeks] + [""]))
             for w in weeks:
                 sub[w] += row[w]
         if len(ctr["people"]) > 1:
@@ -873,6 +907,9 @@ def html_table(lines, left_cols):
         tag = "th" if kind == "head" else "td"
         bold = kind in ("ctr", "grand")
         tds = []
+        if kind == "days":
+            out.append('<tr style="color:#4b4b50;font-size:90%%">%s</tr>' % "".join('<td align="right">%s</td>' % esc(c) if i >= left_cols else "<td>%s</td>" % esc(c) for i, c in enumerate(cells)))
+            continue
         for i, c in enumerate(cells):
             txt = fmt(c) if isinstance(c, float) else esc(c)
             if bold and txt:
@@ -911,7 +948,7 @@ def manhour_sheet(data):
     """One sheet: the work of the period, then a heading and the adjustments below it."""
     lines, adj = manhour_lines(data), adjustment_lines(data)
     rows = [[None if (isinstance(c, str) and c == "" and i >= LEAD) else c for i, c in enumerate(cells)] for kind, cells in lines]
-    bold = [i + 1 for i, (kind, _) in enumerate(lines) if kind != "row"]
+    bold = [i + 1 for i, (kind, _) in enumerate(lines) if kind not in ("row", "days")]
     rows.append([])
     rows.append(["Adjustments: changes made in this period to earlier weeks"])
     bold.append(len(rows))
@@ -993,10 +1030,12 @@ LOGO_FILE = os.path.join(ROOT, "app", "static", "nmc-logo-black.png")  # the bla
 BANNER_ROWS = 4  # logo, title, subtitle, a blank row: the table starts on the row after these
 
 
-def xlsx_bytes(sheet_name, rows, bold_rows=(1,), title=None, subtitle=""):
+def xlsx_bytes(sheet_name, rows, bold_rows=(1,), title=None, subtitle="", decimals=False, freeze_cols=0):
     """A one-sheet Excel file (.xlsx) from rows of text and numbers, built with the standard library only. Rows in bold_rows (counting from 1)
     are bold, and the first row is the table's header, in the NMC orange. Every file opens with the NMC logo, the report's title and when it was
-    produced; the table follows from row 5. Text is stored as text, so nothing typed into the system can be read as a formula."""
+    produced; the table follows from row 5. Text is stored as text, so nothing typed into the system can be read as a formula.
+    With decimals, numbers show with thousands separators and two decimals and the bold rows (totals) are shaded light grey; freeze_cols keeps that many
+    leading columns in view when the sheet is scrolled across."""
     import io
     import zipfile
     from xml.sax.saxutils import escape
@@ -1015,28 +1054,40 @@ def xlsx_bytes(sheet_name, rows, bold_rows=(1,), title=None, subtitle=""):
     lines.append('<row r="2" ht="22" customHeight="1"><c r="A2" s="3" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c></row>' % clean(title or sheet_name))
     lines.append('<row r="3"><c r="A3" s="4" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c></row>' % clean(" | ".join(x for x in (subtitle, made) if x)))
     for ri, row in enumerate(rows, 1):
-        cells = []
+        cells = []                                                  # (column, xml)
         ri_out = ri + BANNER_ROWS
+        total_row = decimals and ri in bold_rows
         for ci, v in enumerate(row):
+            ref = "%s%d" % (col_letter(ci), ri_out)
             if v is None or v == "":
+                if total_row:                                       # let the grey of a total run across the empty cells
+                    cells.append((ci, '<c r="%s" s="7"/>' % ref))
                 continue
-            ref, style = "%s%d" % (col_letter(ci), ri_out), (' s="2"' if ri == 1 else ' s="1"' if ri in bold_rows else "")
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                cells.append('<c r="%s"%s><v>%s</v></c>' % (ref, style, repr(round(float(v), 6))))
-                text = fmt(v)
+            number = isinstance(v, (int, float)) and not isinstance(v, bool)
+            if ri == 1:
+                style = ' s="2"'
+            elif total_row:
+                style = ' s="6"' if number else ' s="7"'             # a total: bold on light grey
+            elif ri in bold_rows:
+                style = ' s="1"'
             else:
-                cells.append('<c r="%s"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (ref, style, clean(v)))
+                style = ' s="5"' if (decimals and number) else ""
+            if number:
+                cells.append((ci, '<c r="%s"%s><v>%s</v></c>' % (ref, style, repr(round(float(v), 6)))))
+                text = "{:,.2f}".format(v) if decimals else fmt(v)
+            else:
+                cells.append((ci, '<c r="%s"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (ref, style, clean(v))))
                 text = str(v)
             while len(widths) <= ci:
                 widths.append(8)
             widths[ci] = max(widths[ci], min(len(text) + 2, 50))
-        lines.append('<row r="%d">%s</row>' % (ri_out, "".join(cells)))
+        lines.append('<row r="%d">%s</row>' % (ri_out, "".join(x for _, x in sorted(cells))))
     name = "".join(ch for ch in sheet_name if ch not in "[]:*?/\\")[:31] or "Report"
     sheet = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
              '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-             '<sheetViews><sheetView workbookViewId="0" showGridLines="0"><pane ySplit="%d" topLeftCell="A%d" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+             '<sheetViews><sheetView workbookViewId="0" showGridLines="0"><pane %sySplit="%d" topLeftCell="%s%d" activePane="%s" state="frozen"/></sheetView></sheetViews>'
              '<cols>%s</cols><sheetData>%s</sheetData>%s</worksheet>' % (
-                 BANNER_ROWS + 1, BANNER_ROWS + 2,
+                 ('xSplit="%d" ' % freeze_cols) if freeze_cols else "", BANNER_ROWS + 1, col_letter(freeze_cols), BANNER_ROWS + 2, "bottomRight" if freeze_cols else "bottomLeft",
                  "".join('<col min="%d" max="%d" width="%d" customWidth="1"/>' % (i + 1, i + 1, w) for i, w in enumerate(widths)), "".join(lines),
                  '<drawing r:id="rId1"/>' if logo else ""))
     parts = {
@@ -1058,13 +1109,17 @@ def xlsx_bytes(sheet_name, rows, bold_rows=(1,), title=None, subtitle=""):
         '<fonts count="5"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font>'
         '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font><font><b/><sz val="16"/><name val="Calibri"/></font>'
         '<font><sz val="10"/><color rgb="FF4B4B50"/><name val="Calibri"/></font></fonts>'
-        '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>'
-        '<fill><patternFill patternType="solid"><fgColor rgb="FFFE6700"/><bgColor indexed="64"/></patternFill></fill></fills>'
+        '<fills count="4"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFFE6700"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFF1F1F2"/><bgColor indexed="64"/></patternFill></fill></fills>'
         '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
         '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="5"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<cellXfs count="8"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
         '<xf numFmtId="0" fontId="2" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
-        '<xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="4" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
+        '<xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="4" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="4" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+        '<xf numFmtId="4" fontId="1" fillId="3" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1"/>'
+        '<xf numFmtId="0" fontId="1" fillId="3" borderId="0" xfId="0" applyFont="1" applyFill="1"/></cellXfs>'
         '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>',
         "xl/worksheets/sheet1.xml": sheet}
     if logo:
@@ -1406,11 +1461,11 @@ def view_ctr(con, u, q):
         b.append('<table border="1" cellpadding="3" cellspacing="0" style="width:100%%;margin-top:.4rem"><tr><th align="left">Basis of Proposal</th></tr><tr><td>%s</td></tr></table>' % para(ph["basis"]))
         bud = con.execute("select * from v_ctr_budget where phase_id=?", (pid,)).fetchone() if money else None
         if bud and bud["budget_hours"] is not None:
-            b.append("<p><b>Budget %s hrs</b> (P6, as of %s) &nbsp; actual %s hrs &nbsp; remaining %s hrs &nbsp; used %.0f%%</p>" % (
+            b.append("<p><b>Budget %s hrs</b> (as of %s) &nbsp; actual %s hrs &nbsp; remaining %s hrs &nbsp; used %.0f%%</p>" % (
                 fmt(bud["budget_hours"]), esc(dmy(bud["as_of"])), fmt(bud["actual_hours"]), fmt(bud["budget_hours"] - bud["actual_hours"]),
                 100 * bud["actual_hours"] / bud["budget_hours"] if bud["budget_hours"] else 0))
         elif bud:
-            b.append("<p><small>No budget has been loaded for this CTR (Admin, Budgets).</small></p>")
+            b.append("<p><small>No budget has been set for this CTR (Admin, Projects / scopes / CTRs).</small></p>")
         b.append("<p><small>Hours are those booked and approved against this CTR, priced at the client's rate card for each skill code; additions are approved allowances "
                  "at the allowance rate table. Pending hrs are submitted and waiting for approval. The job family tabs above list the people and each timesheet entry.</small></p>")
     else:

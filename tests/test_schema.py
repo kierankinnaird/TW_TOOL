@@ -773,7 +773,7 @@ class TestInternalHours(Base):
 
 
 class DemoHistory(unittest.TestCase):
-    """python scripts/build.py --history: twelve weeks of approved timesheets before the seed's own weeks."""
+    """python scripts/build.py --history: months of timesheets for everyone, a bigger catalogue, client-specific titles, PAAFs and budgets."""
 
     @classmethod
     def setUpClass(cls):
@@ -796,7 +796,7 @@ class DemoHistory(unittest.TestCase):
         seed_part = "select user_id, scope_id, work_date, hours, status from time_entry where work_date >= '2026-10-26' order by 1,2,3,4,5"
         # the seed's own entries are all still there, unchanged; the first of its weeks also gets hours for people the seed has none for
         self.assertLessEqual(set(self.plain.execute(seed_part).fetchall()), set(self.con.execute(seed_part).fetchall()))
-        self.assertEqual(self.scalar("select count(*) from time_entry where work_date >= '2026-11-02'"), self.plain.execute("select count(*) from time_entry where work_date >= '2026-11-02'").fetchone()[0])
+        self.assertGreater(self.scalar("select count(*) from time_entry where work_date >= '2026-11-02'"), self.plain.execute("select count(*) from time_entry where work_date >= '2026-11-02'").fetchone()[0])   # the weeks since are filled in too
         self.assertEqual(self.scalar("select status from period where week_start='2026-10-26'"), "Closed")
 
     def test_every_historical_hour_is_approved_by_the_scopes_approver(self):
@@ -817,6 +817,28 @@ class DemoHistory(unittest.TestCase):
     def test_offshore_nights_come_from_the_rotation_and_only_staff_earn_them(self):
         self.assertGreater(self.scalar("select count(*) from v_offshore_night where work_date < '2026-10-26'"), 50)
         self.assertEqual(self.scalar("select count(*) from v_offshore_night n join app_user p using(user_id) where p.employment_type<>'Staff'"), 0)
+
+    def test_the_recent_weeks_are_in_every_state_and_everyone_who_writes_time_has_hours(self):
+        states = {r[0] for r in self.con.execute("select distinct status from time_entry where work_date >= '2026-11-09'")}
+        self.assertEqual(states, {"Draft", "Submitted", "Approved"})
+        missing = self.scalar("select count(*) from app_user u where books_time=1 and start_date <= '2026-10-01' and not exists (select 1 from time_entry t where t.user_id=u.user_id)")
+        self.assertEqual(missing, 0)
+
+    def test_the_catalogue_is_bigger_and_has_clients_with_their_own_titles_and_paafs(self):
+        self.assertGreater(self.scalar("select count(*) from phase p join scope s using(scope_id) join client c using(client_id) where c.is_internal=0"), 40)
+        self.assertGreater(self.scalar("select count(*) from paaf"), 2 * self.plain.execute("select count(*) from paaf").fetchone()[0])
+        # a title priced for one client only, with a different rate from the other client's equivalent
+        spirit_only = self.scalar("select count(*) from role r where exists (select 1 from rate x where x.role_id=r.role_id and x.client_id=2) and not exists (select 1 from rate x where x.role_id=r.role_id and x.client_id=1)")
+        apache_only = self.scalar("select count(*) from role r where exists (select 1 from rate x where x.role_id=r.role_id and x.client_id=1) and not exists (select 1 from rate x where x.role_id=r.role_id and x.client_id=2)")
+        self.assertGreater(spirit_only, 5)
+        self.assertGreater(apache_only, 1)
+        # booked hours always sit under a PAAF for that person, project and title (except the seed's own first weeks, booked before the register)
+        orphans = self.scalar("select count(*) from time_entry t join scope s using(scope_id) join client c using(client_id) where c.is_internal=0 and t.work_date >= '2026-08-03' and t.work_date < '2026-10-26' "
+                              "and not exists (select 1 from paaf p where p.user_id=t.user_id and p.project_id=s.project_id and p.role_id=t.worked_role_id and t.work_date >= p.start_date and (p.end_date is null or t.work_date <= p.end_date))")
+        self.assertEqual(orphans, 0)
+
+    def test_every_client_ctr_has_a_budget(self):
+        self.assertEqual(self.scalar("select count(*) from phase p join scope s using(scope_id) join client c using(client_id) where c.is_internal=0 and not exists (select 1 from ctr_budget b where b.phase_id=p.phase_id)"), 0)
 
     def test_it_is_the_same_every_time(self):
         other = build(history=True)

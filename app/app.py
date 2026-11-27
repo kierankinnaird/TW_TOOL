@@ -25,7 +25,8 @@ from nmc.reports import (
 from nmc.dashboard import view_dashboard
 from nmc.team import view_person_timesheet, view_team
 from nmc.pdf import manhour_pdf
-from nmc.admin import act_allowance_rates, act_budgets, act_period, admin_add, admin_save, view_admin, view_admin_edit, view_audit
+from nmc import costreports
+from nmc.admin import act_allowance_rates, act_period, admin_add, admin_save, view_admin, view_admin_edit, view_audit
 from nmc import core, pg
 from nmc.core import REQUIRED_SCHEMA, db, fmt, monday  # noqa: F401  (kept importable from here: the tests and scripts use app.db, app.fmt and so on)
 from nmc.reports import ctr_tree_rows, xlsx_bytes  # noqa: F401
@@ -226,6 +227,22 @@ def weekly_download(con):
                     headers={"Content-Disposition": 'attachment; filename="weekly-hours-%s-to-%s.xlsx"' % (first.isoformat(), last.isoformat())})
 
 
+@flask_app.route("/reports/cost.xlsx")
+@with_db
+def cost_download(con):
+    """Excel download of one of the cost team's reports (k = ctr_week, budget_hours, cost_week, invoice), for the client chosen. Cost controllers only."""
+    q = query()
+    u = user_id(con, q)
+    kind = q.get("k", [""])[0]
+    if permission_of(con, u) != "controller" or kind not in dict(costreports.COST_REPORTS):
+        return html_response(no_access(con, u, "Reports"), 403)
+    rep = costreports.report(con, kind, q)
+    name = "%s - %s_%s" % (rep["title"], rep["params"]["client_name"], datetime.date.today().strftime("%d %b %Y"))
+    name = re.sub(r"[^A-Za-z0-9 _&-]+", "", name).strip()
+    return Response(costreports.workbook(rep, kind), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="%s.xlsx"' % name})
+
+
 @flask_app.route("/reports/export.xlsx")
 @with_db
 def report_export(con):
@@ -350,7 +367,6 @@ page("/admin/save", methods=("POST",))(lambda con, form: admin_save(con, form))
 page("/admin/allowance_rates", methods=("POST",))(lambda con, form: act_allowance_rates(con, form))
 
 
-page("/admin/budgets", methods=("POST",))(lambda con, form: act_budgets(con, form))
 
 
 def make_server(port=8000):

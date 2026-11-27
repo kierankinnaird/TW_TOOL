@@ -157,6 +157,20 @@ class TestContractorReports(unittest.TestCase):
         text = self.xlsx_text("/reports/export.xlsx?u=%d&k=paye_month&month=2026-11" % CONTROLLER)
         self.assertIn("Ewan Shaw", text)
 
+    def test_a_person_is_named_once_however_many_rows_they_have(self):
+        self.run_sql("update time_entry set location_id=(select min(location_id) from location where location_id<>time_entry.location_id), status='Edited', last_change_reason='Wrong location', last_edited_by=?, last_edited_at='2026-11-20 10:00:00' "
+                     "where entry_id=(select min(entry_id) from time_entry where user_id=? and work_date between '2026-11-01' and '2026-11-30')", CONTROLLER, EWAN)
+        _, _, _, rows = reports.contractor_hours(self.con(), "ltd", {"month": ["2026-11"]})
+        mine = [r for r in rows if r[2] == "Ewan Shaw"]
+        self.assertGreater(len(mine), 1)                                                            # one person, several locations
+        shown = reports.once(rows)
+        self.assertEqual(sum(1 for r in shown if r[2] == "Ewan Shaw"), 1)                           # the name is stated once
+        self.assertEqual(sum(1 for r in shown if r[0] == mine[0][0]), 1)                            # and so is the ID
+        self.assertEqual(sum(r[4] for r in shown), sum(r[4] for r in rows))                         # no hours lost
+        self.assertEqual([r[1] for r in shown], [r[1] for r in rows])                               # every location still shown
+        page = self.main("/reports?u=%d&r=ltd&month=2026-11" % CONTROLLER)
+        self.assertEqual(page.split('id="rp-ltd"')[1].split('id="rp-paye_week"')[0].count("Ewan Shaw"), 1)
+
     def con(self):
         return app.db()
 

@@ -332,6 +332,7 @@ INSERT INTO allowance_rate (allowance_id, amount, effective_from) VALUES (1, 100
 -- CTR sheet details. Every CTR has a code (discipline - phase letter - sequence); the number shown is the scope code in front of it,
 -- for example A1500-PM-D-001. One CTR has the sheet fields filled in as an example.
 UPDATE phase SET ctr_code = 'PM-' || upper(substr(name, 1, 1)) || '-001';
+UPDATE phase SET discipline_id = (SELECT discipline_id FROM discipline WHERE code = split_part(phase.ctr_code, '-', 1));
 UPDATE client SET framework_ref = 'SPT-01163 Contract' WHERE client_id = 2;
 UPDATE phase SET description = 'Wellbay Clearance - Define', prepared_by = 'AB', checked_by = 'GH / KNic',
   objectives = 'Define the scope, sequence and cost of clearing the Wellbay so that an execute phase can be sanctioned.',

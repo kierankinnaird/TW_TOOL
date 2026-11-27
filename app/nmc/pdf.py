@@ -67,6 +67,17 @@ def columns(weeks):
     return months, ["%s %s" % (names[int(m[5:7]) - 1], m[2:4]) for m in months], lambda w: w[:7]
 
 
+def days_text(by_day, week):
+    """The days of one week a person booked hours on, with the hours: 'Mon 8, Tue 8, Fri 4'."""
+    start = datetime.date.fromisoformat(week)
+    out = []
+    for i in range(7):
+        h = by_day.get((start + datetime.timedelta(days=i)).isoformat())
+        if h:
+            out.append("%s %s" % (("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[i], "%g" % round(h, 2)))
+    return ", ".join(out)
+
+
 def table_rows(data, keys, key_of):
     """The work of the period as table rows (cells) with a kind each: 'ctr' (a CTR heading), 'person', 'total' or 'grand'."""
     out = []
@@ -80,6 +91,8 @@ def table_rows(data, keys, key_of):
             for w, h in per.items():
                 cells[key_of(w)] += h
             out.append(("person", ["      %s  (%s %s)" % (person, code, role)] + [num(cells[k]) for k in keys] + [num(sum(cells.values()))]))
+            if len(keys) == len(data["weeks"]):                # a column a week: show beneath the person the days those hours were booked on
+                out.append(("days", ["booked on"] + [days_text(ctr["by_day"][(person, code, role)], k) for k in keys] + [""]))
             for k in keys:
                 sub[k] += cells[k]
         if len(ctr["people"]) > 1:
@@ -146,6 +159,11 @@ def manhour_pdf(data, prepared_by="", compress=True):
             styles += [("FONTNAME", (0, i), (-1, i), "Helvetica-Bold"), ("LINEABOVE", (0, i), (-1, i), 0.6, BLACK)]
         elif kind == "grand":
             styles += [("FONTNAME", (0, i), (-1, i), "Helvetica-Bold"), ("BACKGROUND", (0, i), (-1, i), BLACK), ("TEXTCOLOR", (0, i), (-1, i), colors.white)]
+    small = ParagraphStyle("d", parent=TEXT, fontSize=6, leading=7, textColor=GREY, alignment=2)
+    for i, (kind, cells) in enumerate(rows, start=1):
+        if kind == "days":
+            rows[i - 1] = (kind, [Paragraph("&nbsp;" * 16 + "booked on", ParagraphStyle("d0", parent=small, alignment=0))] + [Paragraph(c, small) if c else "" for c in cells[1:]])
+            styles += [("TEXTCOLOR", (0, i), (-1, i), GREY), ("TOPPADDING", (0, i), (-1, i), 0), ("BOTTOMPADDING", (0, i), (-1, i), 2), ("LINEBELOW", (0, i), (-1, i), 0, colors.white)]
     table = Table([head] + [cells for _, cells in rows], colWidths=col_w, repeatRows=1)
     table.setStyle(TableStyle(styles))
 

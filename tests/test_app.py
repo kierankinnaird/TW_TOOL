@@ -241,6 +241,7 @@ class TestApp(unittest.TestCase):
         text = self.xlsx_text("/reports/manhours.xlsx?u=7")
         self.assertIn("Ewan Shaw", text)
         self.assertIn("Total hrs", text)
+        self.assertIn("booked on", text)
         self.assertNotIn("Gary Bridge", text)                      # a Spirit-only person
         # Alisdair's people have also booked to Spirit, so he can pick Spirit's report too: still only his own people's hours
         self.assertIn(">Spirit</option>", page)
@@ -1318,7 +1319,7 @@ class TestApp(unittest.TestCase):
                                                                    "permission": "user", "start_date": "2026-11-01", "end_date": ""}, u="29"))   # but a cost controller can
 
     def test_cost_controllers_have_every_admin_tab_and_can_maintain_people_roles_and_locations(self):
-        for tab in ("periods", "users", "roles", "clients", "rates", "scopes", "internal", "locations", "allowance_rates", "budgets"):
+        for tab in ("periods", "users", "roles", "clients", "rates", "scopes", "internal", "locations", "allowance_rates"):
             self.assertNotIn("not available to your role", self.get("/admin?u=29&t=%s" % tab), tab)
         self.assertNotIn("not available to your role", self.get("/admin/edit?u=29&t=users&id=5"))
         base = {"t": "users", "id": "5", "name": "Ewan Shaw", "employment_type": "Staff", "role_id": "4", "permission": "user", "end_date": "", "line_manager_id": "7", "email": "", "books_time": "1"}
@@ -2423,12 +2424,98 @@ class TestApp(unittest.TestCase):
         data.update(kw)
         return self.admin_post("/admin/save", data, u="1")
 
+    # ---------- the CTR page and its budget by role ----------
+    def rate_roles(self, client):
+        return [r[0] for r in self.all("select distinct r.role_id from rate rt join role r on r.role_id=rt.role_id where rt.client_id=? and r.active=1 order by r.role_id", client)]
+
+    def test_a_ctr_is_created_on_one_page_laid_out_in_boxes_with_a_budget_picker(self):
+        scopes = self.get("/admin?u=1&t=scopes")
+        self.assertIn('href="/admin/edit?u=1&amp;t=phases&amp;id=0"', scopes)                       # the one-line form is now a button to the full page
+        self.assertNotIn("Add CTR\"", scopes)
+        page = self.get("/admin/edit?u=1&t=phases&id=0")
+        for heading in ("<h5>CTR</h5>", "<h5>Commercial</h5>", "<h5>Budget by role</h5>", "<h5>References</h5>", "<h5>Who and when can book</h5>", "<h5>Proposal</h5>"):
+            self.assertIn(heading, page, heading)
+        self.assertIn('<select name="scope_id">', page)
+        self.assertIn('value="Create CTR"', page)
+        self.assertIn('name="b_role"', page)                                                         # a role picker row ready for use
+        self.assertIn("Pick a role", page)
+
+    def test_the_budget_roles_offered_are_the_roles_on_the_clients_rate_card(self):
+        apache = self.rate_roles(1)
+        self.assertTrue(apache)
+        page = self.get("/admin/edit?u=1&t=phases&id=1")                                            # CTR 1 is on an Apache scope
+        row = page.split('class="brow"')[1].split("</select>")[0]
+        self.assertEqual(row.count("<option value=") - 1, len(apache))                              # every rate card role and nothing else
+        other = [r for r in self.all("select role_id from role where active=1") if r[0] not in apache]
+        if other:
+            self.assertNotIn('<option value="%d"' % other[0][0], row)
+
+    def test_a_ctr_can_be_created_with_its_budget_split_by_role(self):
+        roles = self.rate_roles(1)[:2]
+        out = self.admin_post("/admin/add", {"t": "phases", "scope_id": "1", "name": "Budgeted", "b_role": [str(roles[0]), str(roles[1]), ""], "b_hours": ["38.7", "90.3", ""],
+                                             "budget_as_of": "2026-11-27"}, u="1")
+        self.assertIn("CTR added", out)
+        pid = self.one("select phase_id from phase where name='Budgeted'")[0]
+        b = self.one("select budget_id, hours, as_of from ctr_budget where phase_id=?", pid)
+        self.assertEqual((float(b[1]), b[2]), (129.0, "2026-11-27"))                                  # the budget is the total of the roles
+        self.assertEqual({r[0]: float(r[1]) for r in self.all("select role_id, hours from ctr_budget_role where budget_id=?", b[0])}, {roles[0]: 38.7, roles[1]: 90.3})
+        page = self.get("/admin/edit?u=1&t=phases&id=%d" % pid)                                      # shown again on the CTR page, with a spare row
+        self.assertIn('value="38.7"', page)
+        self.assertIn('value="90.3"', page)
+        self.assertIn("Current budget: <b>129 hrs</b>", page)
+        # the reports use the total
+        self.assertEqual(self.one("select budget_hours from v_ctr_budget where phase_id=?", pid)[0], 129)
+
+    def test_changing_the_budget_saves_a_new_version_and_keeps_the_old_one(self):
+        roles = self.rate_roles(1)[:2]
+        self.admin_post("/admin/add", {"t": "phases", "scope_id": "1", "name": "Versioned", "b_role": [str(roles[0])], "b_hours": ["40"], "budget_as_of": "2026-11-20"}, u="1")
+        pid = self.one("select phase_id from phase where name='Versioned'")[0]
+        base = {"t": "phases", "id": str(pid), "name": "Versioned", "status": "Open", "restricted": "0"}
+        # the same lines again: no new version
+        self.admin_post("/admin/save", dict(base, b_role=[str(roles[0])], b_hours=["40"], budget_as_of="2026-11-25"), u="1")
+        self.assertEqual(self.one("select count(*) from ctr_budget where phase_id=?", pid)[0], 1)
+        # a change on or before the date already held is refused, and says why
+        out = self.admin_post("/admin/save", dict(base, b_role=[str(roles[0])], b_hours=["55"], budget_as_of="2026-11-20"), u="1")
+        self.assertIn("already held", out)
+        self.assertIn('value="55"', out)                                                              # what was typed is still there
+        self.assertEqual(self.one("select count(*) from ctr_budget where phase_id=?", pid)[0], 1)
+        # a later date saves a new version
+        self.assertIn("Saved", self.admin_post("/admin/save", dict(base, b_role=[str(roles[0]), str(roles[1])], b_hours=["55", "10"], budget_as_of="2026-11-25"), u="1"))
+        self.assertEqual([float(r[0]) for r in self.all("select hours from ctr_budget where phase_id=? order by as_of", pid)], [40.0, 65.0])
+        self.assertEqual(self.one("select budget_hours from v_ctr_budget where phase_id=?", pid)[0], 65)
+
+    def test_a_bad_budget_line_is_refused_with_a_reason_and_nothing_is_created(self):
+        roles = self.rate_roles(1)
+        stranger = [r[0] for r in self.all("select role_id from role where active=1") if r[0] not in roles]
+        def add(**kw):
+            return self.admin_post("/admin/add", dict({"t": "phases", "scope_id": "1", "name": "Refused"}, **kw), u="1")
+        self.assertIn("Enter the budget hours", add(b_role=[str(roles[0])], b_hours=[""]))
+        self.assertIn("Pick a role", add(b_role=[""], b_hours=["8"]))
+        self.assertIn("must be a number", add(b_role=[str(roles[0])], b_hours=["lots"]))
+        self.assertIn("more than 0", add(b_role=[str(roles[0])], b_hours=["0"]))
+        self.assertIn("listed twice", add(b_role=[str(roles[0]), str(roles[0])], b_hours=["8", "9"]))
+        if stranger:
+            self.assertIn("not on this client", add(b_role=[str(stranger[0])], b_hours=["8"]))
+        self.assertEqual(self.one("select count(*) from phase where name='Refused'")[0], 0)
+        self.assertIn("Create CTR", add(b_role=[str(roles[0])], b_hours=["lots"]))                    # the page comes back to be corrected
+
+    def test_budget_lines_are_never_edited_or_deleted(self):
+        roles = self.rate_roles(1)[:1]
+        self.admin_post("/admin/add", {"t": "phases", "scope_id": "1", "name": "Locked", "b_role": [str(roles[0])], "b_hours": ["12"]}, u="1")
+        con = app.db()
+        for sql in ("update ctr_budget_role set hours=1", "delete from ctr_budget_role"):
+            with self.assertRaises(Exception) as cm:
+                con.execute(sql)
+            self.assertIn("never", str(cm.exception))
+            con = app.db()
+        con.close()
+
     def test_the_phase_page_has_description_references_approver_and_controls(self):
         page = self.get("/admin/edit?u=1&t=phases&id=1")
         for label in ("CTR code", "CTR title", "Prepared by", "Checked by", "Objectives", "Input requirements", "Scope of work", "This CTR assumes", "This CTR excludes",
                       "Expenses", "Payment terms", "Basis of proposal", "WBS", "CBS", "ABS", "Who can book", "People allowed", "Bookable from", "Bookable until"):
-            self.assertIn("<td>%s</td>" % label, page, label)
-        self.assertNotIn("<td>Approver</td>", page)                      # approvers are on the client and the scope now
+            self.assertIn("<label>%s</label>" % label, page, label)
+        self.assertNotIn("<label>Approver</label>", page)                      # approvers are on the client and the scope now
         self.assertIn("Saved", self.save_phase(1, description="Clear the wellbay", wbs="1.2.3", cbs="C-40", abs_code="A-7"))
         self.assertEqual(tuple(self.one("select description, wbs, cbs, abs_code from phase where phase_id=1")), ("Clear the wellbay", "1.2.3", "C-40", "A-7"))
         # shown on the CTR
@@ -2705,12 +2792,7 @@ class TestApp(unittest.TestCase):
         self.assertIn('value="%d"' % eid, self.get("/approvals?u=31&w=2026-11-09"))                    # in her line manager Graeme Hogg's queue
         self.assertIn("1 entry approved", self.post("/approvals/act", {"u": "31", "w": "2026-11-09", "entry_id": str(eid), "action": "Approve selected"}))
 
-    def test_budget_hours_from_p6_are_loaded_and_compared_with_the_approved_hours(self):
-        self.assertIn("not available to your role", self.get("/admin?u=5&t=budgets"))
-        self.assertIn("P6, which holds hours only", self.get("/admin?u=29&t=budgets"))   # cost controllers load the budgets (and so can the IT admin)
-        page = self.get("/admin?u=30&t=budgets")
-        self.assertIn("P6, which holds hours only", page)
-        self.assertIn("BB0001-PM-D-001", page)                                     # the seeded budgets are listed
+    def test_budget_hours_are_compared_with_the_approved_hours(self):
         # the CTR page and the report compare budget with approved hours (BB0001-PM-D-001: 160 budget, 71.5 approved)
         ctr = self.get("/ctr?u=29&phase=1")
         self.assertIn("Budget 160 hrs", ctr)
@@ -2719,21 +2801,6 @@ class TestApp(unittest.TestCase):
         report = self.get("/reports?all=1&u=29&from=2026-01-01&to=2026-12-31").split("Budget against actual hours")[1].split("<h4>")[0]
         self.assertIn("<td>BB0001-PM-D-001</td><td align=\"right\">160</td>", report)
         self.assertNotIn("Budget against actual hours", self.get("/reports?all=1&u=5&from=2026-01-01&to=2026-12-31"))   # cost controllers only
-        # load a new snapshot: a changed budget, an unchanged one, a heading line, an unknown CTR and a bad figure
-        data = "CTR No,Budget hrs\nBB0001-PM-D-001,200\nBB0001-PM-E-001,40\nZZ-NOPE,10\nA1500-PM-D-001,lots\n"
-        out = self.admin_post("/admin/budgets", {"u": "30", "as_of": "2026-11-13", "data": data}, u="30")
-        self.assertIn("1 budget loaded, as of 2026-11-13. 1 unchanged.", out)
-        self.assertIn("ZZ-NOPE", out)
-        self.assertIn("line 5", out)
-        self.assertIn("Budget 200 hrs", self.get("/ctr?u=29&phase=1"))
-        self.assertEqual(self.one("select count(*) from ctr_budget where phase_id=1")[0], 2)           # the old snapshot is kept
-        # the same or an earlier as-of date cannot be loaded with a different figure
-        out = self.admin_post("/admin/budgets", {"u": "30", "as_of": "2026-11-13", "data": "BB0001-PM-D-001,300"}, u="30")
-        self.assertIn("use a later date", out)
-        self.assertEqual(self.one("select hours from ctr_budget where phase_id=1 order by as_of desc limit 1")[0], 200)
-        # nobody else can load budgets
-        self.admin_post("/admin/budgets", {"u": "5", "as_of": "2026-11-14", "data": "BB0001-PM-D-001,999"}, u="5")
-        self.assertEqual(self.one("select count(*) from ctr_budget where hours=999")[0], 0)
         # a CTR with hours but no budget says so
         self.assertIn("not budgeted", self.get("/reports?all=1&u=29&from=2026-01-01&to=2026-12-31"))
 
@@ -2756,8 +2823,36 @@ class TestApp(unittest.TestCase):
         self.assertNotIn("&pound;", page)                                                            # hours only
         self.assertIn("Week commencing 26/10/2026", page)
         # budgets that are later loaded show up on it
-        self.admin_post("/admin/budgets", {"u": "30", "as_of": "2026-11-13", "data": "A1500-PM-D-001,200"}, u="30")
+        con = app.db()
+        con.execute("insert into ctr_budget (phase_id, hours, as_of) values (6, 200, '2026-11-13')")
+        con.commit()
+        con.close()
         self.assertIn("A1500-PM-D-001: budget 200 hrs, approved 100 hrs, pending 0 hrs, 100 hrs remaining", self.get("/dashboard?u=29"))
+
+    def test_the_dashboard_charts_the_budget_by_role_for_ctrs_that_have_one(self):
+        page = self.get("/dashboard?u=29")
+        self.assertIn("Budget against approved hours, by role", page)
+        self.assertIn("None of these CTRs has its budget split by role yet", page)                  # none of the seed budgets is split
+        # split CTR 6's budget (A1500-PM-D-001, 95 hrs) in two: the role that booked the hours, and one nobody has booked to
+        booked = self.one("select worked_role_id from time_entry where phase_id=6 and status='Approved' group by worked_role_id order by sum(hours) desc limit 1")[0]
+        idle = [r[0] for r in self.all("select role_id from role where active=1 and role_id<>? order by role_id", booked)][0]
+        bid = self.one("select budget_id from ctr_budget where phase_id=6 order by as_of desc limit 1")[0]
+        con = app.db()
+        con.execute("insert into ctr_budget_role (budget_id, role_id, hours) values (?,?,60)", (bid, booked))
+        con.execute("insert into ctr_budget_role (budget_id, role_id, hours) values (?,?,35)", (bid, idle))
+        con.commit()
+        con.close()
+        names = {r[0]: r[1] for r in self.all("select role_id, name from role")}
+        got = float(self.one("select sum(hours) from time_entry where phase_id=6 and status='Approved' and worked_role_id=?", booked)[0])
+        page = self.get("/dashboard?u=29&phase=6")
+        self.assertIn("<h4>Budget against approved hours, by role</h4>", page)
+        self.assertIn("%s: budget 60 hrs, approved %g hrs" % (names[booked], got), page)             # the role's hours against the role's share
+        self.assertIn("%s: budget 35 hrs, approved 0 hrs" % names[idle], page)
+        self.assertIn("The roles of the 1 CTR above", page)
+        # hours booked in a role the budget does not have are shown too, as not budgeted
+        others = float(self.one("select coalesce(sum(hours), 0) from time_entry where phase_id=6 and status='Approved' and worked_role_id<>?", booked)[0])
+        if others:
+            self.assertIn("not budgeted", page)
 
     def test_the_dashboard_can_be_filtered(self):
         base = "/dashboard?u=29"
@@ -2791,51 +2886,6 @@ class TestApp(unittest.TestCase):
         self.assertIn("No approved client hours for these filters", self.get(base + "&from=2030-01-01"))
         # a nonsense value is ignored, not an error
         self.assertIn("A1500-PM-D-001: budget", self.get(base + "&client=abc&show=zzz&from=nope"))
-
-    P6_SAMPLE = "\n".join([
-        "project\twbs_name\ttask_code\tbudget_hours\tactual_hours\tremaining_hours\tphys_complete_pct",
-        "PROJ-A\tProject Management (Direct) - A1500-PM-D-001\tX-1\t300.000000\t120.500000\t179.500000\t40.17",
-        "PROJ-A\tFuture Scope Estimate\tZ-1\t9999\t0\t9999\t0",
-        "PROJ-A\tNMC-A0101 - Spirit - Technical Safety Engineering\tZ-2\t264\t68\t196\t0",
-        "PROJ-A\tSomething - Z9999-PR-D-001\tZ-3\t50\t0\t50\t0",
-        "PROJ-A\tPlanning (Direct) - BB0002-PM-D-001\tD-1\t100\t10\t90\t10",
-        "PROJ-A\tPlanning (Core) - BB0002-PM-D-001\tD-2\t20\t0\t20\t0",
-        "PROJ-B\tProject Management (Direct) - A1500-PM-D-001\tX-1\t800\t1\t799\t1",
-    ])
-
-    def test_a_p6_export_is_previewed_and_then_loaded_for_the_chosen_project(self):
-        before = self.one("select count(*) from ctr_budget")[0]
-        data = {"u": "30", "as_of": "2026-11-13", "data": self.P6_SAMPLE}
-        page = self.admin_post("/admin/budgets", data, u="30")
-        self.assertIn("Preview: nothing has been loaded yet", page)
-        self.assertEqual(self.one("select count(*) from ctr_budget")[0], before)                    # a preview writes nothing
-        self.assertIn("A1500-PM-D-001", page)
-        self.assertIn("Not a CTR in this system", page)                                             # Z9999
-        self.assertIn("No CTR No at the end of the WBS name", page)                                # 'Future Scope Estimate' and the NMC-A0101 line
-        self.assertIn("appears 2 times in this project: not loaded", page)                         # a duplicated CTR No is flagged, never added up
-        self.assertIn("Load 1 budget from PROJ-A", page)
-        self.assertIn(">PROJ-B</option>", page)
-        # the other P6 project can be previewed
-        other = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-B"), u="30")
-        self.assertIn("Load 1 budget from PROJ-B", other)
-        # confirm the first project
-        out = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-A", confirm="1"), u="30")
-        self.assertIn("1 budget loaded from P6 project PROJ-A, as of 2026-11-13. 0 unchanged, 5 not loaded.", out)
-        row = self.one("select hours, p6_actual_hours, percent_complete, p6_project, as_of from ctr_budget where phase_id=6 order by as_of desc limit 1")
-        self.assertEqual(tuple(row), (300, 120.5, 40.17, "PROJ-A", "2026-11-13"))
-        self.assertEqual(self.one("select count(*) from ctr_budget where phase_id=3 and as_of='2026-11-13'")[0], 0)   # BB0002 (duplicated) was not loaded
-        self.assertIn("Budget 300 hrs", self.get("/ctr?u=29&phase=6"))
-        # loading the same figures again changes nothing; a different figure needs a later date
-        again = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-A"), u="30")
-        self.assertIn("Unchanged", again)
-        self.assertIn("Nothing to load for this project", again)
-        clash = self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-B"), u="30")
-        self.assertIn("already held: use a later date", clash)
-        # only cost controllers can use it
-        self.admin_post("/admin/budgets", dict(data, p6_project="PROJ-B", confirm="1", u="5"), u="5")
-        self.assertEqual(self.one("select hours from ctr_budget where phase_id=6 order by as_of desc limit 1")[0], 300)
-        # an export with no rows is explained
-        self.assertIn("No rows were found", self.admin_post("/admin/budgets", {"u": "30", "as_of": "2026-11-13", "data": "a\tb\tc\td\te\tf\tg\n"}, u="30"))
 
     def test_ctr_page(self):
         con = app.db()

@@ -12,7 +12,7 @@ DB_URL = None   # the database to use; None means DATABASE_URL (see pg.database_
 
 
 # Databases built before this version lack columns and rules the app relies on. Matches the version in schema_info in db/schema.sql.
-REQUIRED_SCHEMA = 30
+REQUIRED_SCHEMA = 32
 
 
 # Static files the app may serve. Only these exact URLs, never a path built from the request.
@@ -268,9 +268,43 @@ table.ap tr.drow table{margin:0}
 .scrollbox{max-height:27rem;overflow:auto;border:1px solid var(--line);margin:.3rem 0}
 .scrollbox table{margin:0;width:100%}
 .scrollbox th{position:sticky;top:0;z-index:1}
+.crform{display:flex;flex-wrap:wrap;align-items:flex-end;gap:.6rem 1rem;margin:.7rem 0 .4rem}
+.crform label{display:flex;flex-direction:column;gap:.2rem;font-size:.75rem;color:var(--grey-dark)}
+.crform a.dl{display:inline-flex;align-items:center;height:2.2rem;padding:0 .9rem;font-size:.85rem;color:var(--ink);border:1px solid var(--line);background:var(--white)}
+.crform a.dl:hover{color:var(--orange);border-color:var(--orange)}
+.crmeta{margin:.1rem 0 .2rem;font-size:.8rem;color:var(--grey-dark)}
+.crwrap{overflow:auto;max-height:36rem;border:1px solid var(--line);background:var(--white);margin:.5rem 0 1rem}
+table.cr{border-collapse:separate;border-spacing:0;width:100%;font-size:.84rem;font-variant-numeric:tabular-nums}
+table.cr th{position:sticky;top:0;z-index:3;background:var(--black);color:var(--white);font-weight:500;text-align:left;padding:.5rem .7rem;white-space:nowrap;border:0;border-bottom:2px solid var(--orange)}
+table.cr th.n,table.cr td.n{text-align:right}
+table.cr td{padding:.32rem .7rem;border:0;border-bottom:1px solid var(--line);white-space:nowrap;background:var(--white)}
+table.cr td.t{white-space:normal;min-width:15rem;max-width:30rem}
+table.cr td.z{color:var(--grey-light)}
+table.cr tbody tr:hover td{background:#fff6ef}
+table.cr tr.sub td{background:#f1f1f2;font-weight:600}
+table.cr tr.group td{background:#e2e2e4;font-weight:700}
+table.cr tr.group td.k{background:#e2e2e4}
+table.cr tr.grand td{background:var(--ink);color:var(--white);font-weight:600;border-bottom:0}
+table.cr th.k,table.cr td.k{position:sticky;left:0;z-index:2;border-right:1px solid var(--line)}
+table.cr th.k{z-index:4}
+table.cr tr.sub td.k{background:#f1f1f2}
+table.cr tr.grand td.k{background:var(--ink)}
 p.pager{margin:.3rem 0 1rem}
 p.pager a,p.pager b{display:inline-block;min-width:1.6rem;text-align:center;padding:.1rem .3rem}
 p.pager b{background:var(--black);color:var(--white);font-weight:450}
+.btn{display:inline-flex;align-items:center;height:2.2rem;padding:0 1.1rem;font-size:.85rem;color:var(--white);background:var(--black);border:1px solid var(--black);text-decoration:none}
+.btn:hover{background:var(--orange);border-color:var(--orange);color:var(--white)}
+.ctrhead{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin:0 0 .6rem}.ctrhead h4{margin:0}
+.ctrgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(24rem,1fr));gap:1rem;align-items:start}
+.ctrgrid .col{display:grid;gap:1rem;align-content:start}
+.ctrgrid .box{border:1px solid var(--line);background:var(--white);padding:.8rem 1rem}.ctrgrid .box.wide{grid-column:1/-1}
+.ctrgrid h5{margin:0 0 .6rem;font-size:.75rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--grey-dark)}
+.fld{display:grid;grid-template-columns:8.5rem 1fr;gap:.45rem .8rem;align-items:start}.fld>label{font-size:.8rem;color:var(--grey-dark);padding-top:.4rem}
+.fld textarea,.ctext textarea{width:100%;font:inherit;font-size:.9rem;border:1px solid var(--grey-light);padding:.4rem .6rem;resize:vertical}
+.fld small{display:block;color:var(--grey-mid)}
+.ctext{display:grid;grid-template-columns:repeat(auto-fit,minmax(20rem,1fr));gap:.8rem 1rem}.ctext label{display:block;font-size:.8rem;color:var(--grey-dark);margin:0 0 .2rem}
+.bpick .brow{display:grid;grid-template-columns:1fr 6rem 2rem;gap:.4rem;margin:.3rem 0}.bpick .brow input{text-align:right}.bpick .brow .chip{padding:0}
+.btotal{margin:.6rem 0 .3rem}.btotal b{font-size:1.1rem}.asof{font-size:.8rem;color:var(--grey-dark)}.bnote{margin:0 0 .5rem}
 .picker{max-width:46rem}
 .pk-q{width:100%;max-width:22rem;margin:0 0 .5rem}
 .pk-chosen{display:flex;flex-wrap:wrap;gap:.3rem;margin:0 0 .5rem}
@@ -356,7 +390,7 @@ function title(t){var e=t;while(e&&e!==main){var p=e.previousElementSibling;whil
 var h=main.querySelector('h1');return h?h.textContent.trim():'Table';}
 main.querySelectorAll('table').forEach(function(t){
 if(t.getAttribute('border')==='0'||t.classList.contains('ts')||t.classList.contains('cal')||t.classList.contains('ap')||t.querySelector('table')||t.rows.length<2||!t.querySelector('th')||t.rows[0].cells.length<2||editable(t))return;
-var panel=t.closest('.rpt');if(panel&&panel.querySelector('a[href*="/reports/export.xlsx"],a[href*="period.xlsx"]')&&panel.querySelectorAll('table').length===1)return;
+var panel=t.closest('.rpt');if(panel&&panel.querySelector('a[href*="/reports/export.xlsx"],a[href*="period.xlsx"],a[href*="/reports/cost.xlsx"]')&&panel.querySelectorAll('table').length===1)return;
 var name=title(t),p=document.createElement('p'),a=document.createElement('a');
 a.href='#';a.textContent='Download table as Excel';p.className='xl';p.appendChild(a);
 a.onclick=function(ev){ev.preventDefault();var rows=[];

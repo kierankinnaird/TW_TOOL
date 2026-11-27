@@ -1,7 +1,7 @@
-"""Admin tabs (periods, users, roles, clients, rates, scopes, internal codes, locations, allowance rates, budgets) and the audit trail."""
+"""Admin tabs (periods, users, roles, clients, rates, scopes, internal codes, locations, allowance rates) and the audit trail."""
 import csv
 import datetime
-import re
+import json
 from urllib.parse import quote
 from nmc import pg
 from nmc.core import (
@@ -16,15 +16,14 @@ from nmc.core import (
 # ---------- Admin ----------
 ADMIN_TABS = [("periods", "Weekly periods"), ("users", "Users"), ("roles", "Job families / titles"),
               ("clients", "Clients"), ("assets", "Assets / POs"), ("paaf", "PAAFs"), ("rates", "Client rate cards"), ("scopes", "Projects / scopes / CTRs"),
-              ("internal", "Internal codes"), ("locations", "Locations (hour types)"), ("allowance_rates", "Allowance rates"),
-              ("budgets", "Budgets (from P6)")]
+              ("internal", "Internal codes"), ("locations", "Locations (hour types)"), ("allowance_rates", "Allowance rates")]
 
 
 # Who may use each Admin tab. Cost controllers have every tab: they maintain the system day to day (people, job roles, locations, clients, rate cards,
-# scopes, internal codes, allowance rates, periods and budgets). The IT admin keeps the tabs it always had (periods, users, job roles, locations, budgets).
+# scopes, internal codes, allowance rates and periods). The IT admin keeps the tabs it always had (periods, users, job roles, locations).
 TAB_ACCESS = {"periods": ("controller", "admin"), "users": ("controller", "admin"), "roles": ("controller", "admin"), "clients": ("controller",), "assets": ("controller",), "paaf": ("controller",),
               "rates": ("controller",), "scopes": ("controller",), "internal": ("controller",),
-              "locations": ("controller", "admin"), "allowance_rates": ("controller",), "budgets": ("controller", "admin")}  # budgets (P6) are parked for v1
+              "locations": ("controller", "admin"), "allowance_rates": ("controller",)}
 
 
 PAYMENT_TERMS = [("Reimbursable", "Reimbursable"), ("Budget", "Budget"), ("Lump Sum", "Lump Sum"), ("Non-reimbursable", "Non-reimbursable")]
@@ -227,18 +226,6 @@ def admin_body(con, u, t, q=None):
                  '<input type="submit" value="Add PAAFs"></form>' % (
                      hidden(u=u, t="paaf"), sel("project_id", projects), sel("role_id", opts_roles(con)), date_input("start_date", today), date_input("end_date", ""), txt("reference", "", 20),
                      people_picker("person", [tuple(r) for r in con.execute("select user_id, name from app_user where books_time=1 order by name")], set(), "Nobody chosen")))
-    elif t == "budgets":
-        b.append("<p><small>Budget hours per CTR come from P6, which holds hours only. Paste either (1) a P6 export copied from SSMS or saved as CSV, with the columns "
-                 "<b>project, WBS name, activity code, budget hours, actual hours, remaining hours, % complete</b> (the CTR No is read from the end of the WBS name, "
-                 "for example <i>Process Engineering - A0101-PR-D-001</i>; you see a preview and choose the P6 project before anything is loaded), or (2) one CTR per line: "
-                 "the CTR No then the budget hours. Comma or tab separated; a heading line is ignored. Each load is saved as a snapshot with its as-of date and never edited, "
-                 "so earlier budgets are kept; the latest is compared with the approved hours booked here on the Reports page, the dashboard and each CTR's page. "
-                 "A CTR whose figures have not changed is left alone.</small></p>")
-        b.append('<form method="post" action="/admin/budgets">%s<p>As of %s</p><p><textarea name="data" rows="8" cols="80" placeholder="BB0001-PM-D-001,160"></textarea></p>'
-                 '<input type="submit" value="Load budgets"></form>' % (hidden(u=u), date_input("as_of", datetime.date.today().isoformat())))
-        rows = [[r["phase"], r["client"], fmt(r["budget_hours"]), dmy(r["as_of"]), fmt(r["actual_hours"])]
-                for r in con.execute("select * from v_ctr_budget where budget_hours is not null order by phase")]
-        b.append("<h4>Budgets now held</h4>" + (table(["CTR No", "Client", "Budget hrs", "As of", "Actual hrs (approved)"], rows) if rows else "<p>None loaded yet.</p>"))
     elif t == "locations":
         b.append("<p><small>Where hours are worked. People pick one on each timesheet row (it starts at their default location, set on their user record). "
                  "Rename a location or switch it off to stop new bookings to it; hours already booked keep it. At least one must stay active. "
@@ -296,10 +283,7 @@ def admin_body(con, u, t, q=None):
             rows.append([r["client"], r["scope_code"], r["scope_desc"], r["name"], r["description"] or "", r["status"],
                          "; ".join(controls) or "open to all", edit_link(u, "phases", r["phase_id"])])
         b.append(table(["Client", "Scope", "Scope description", "CTR (booking code)", "CTR description", "Status", "Who and when can book", ""], rows, raw_cols=(7,)))
-        b.append('<form method="post" action="/admin/add">%s Scope %s CTR name %s Payment terms %s Lump sum value &pound; %s <input type="submit" value="Add CTR"> '
-                 "<small>Non-reimbursable CTRs are left out of billing. A lump sum CTR is tracked against its agreed value (leave it empty until agreed).</small></form>"
-                 % (hidden(u=u, t="phases"), sel("scope_id", opts_scopes(con)), txt("name", "", 20), sel("payment_terms", PAYMENT_TERMS, "Reimbursable"),
-                    txt("lump_sum_value", "", 10)))
+        b.append('<p><a class="btn" href="/admin/edit?u=%d&amp;t=phases&amp;id=0">Add a CTR</a> <small>Opens the full CTR page: details, budget by role, who and when can book.</small></p>' % u)
     return "".join(b)
 
 
@@ -313,7 +297,7 @@ def view_admin(con, u, t, msgs=None, ok=False, q=None):
     return layout(con, u, "Admin", body)
 
 
-def view_admin_edit(con, u, t, i, msgs=None):
+def view_admin_edit(con, u, t, i, msgs=None, form=None):
     if not can_use_tab(con, u, t):
         return no_access(con, u, "Admin")
     back = '<p><a href="/admin?u=%d&amp;t=%s">&lt;&lt; Back</a></p>' % (u, "scopes" if t in ("projects", "phases") else t)
@@ -395,44 +379,240 @@ def view_admin_edit(con, u, t, i, msgs=None):
                 % (esc(r["client"]), esc(r["project_code"]), txt("name", r["name"], 30), sel("status", [("Open", "Open"), ("Closed", "Closed")], r["status"])))
         note = "<p><small>Closing a project stops new bookings to all of its scopes.</small></p>"
     elif t == "phases":
-        r = con.execute("select ph.*, s.scope_code from phase ph join scope s on s.scope_id=ph.scope_id where phase_id=?", (i,)).fetchone()
-        if not r:
-            return layout(con, u, "Admin", "<p>Not found.</p>")
-        allowed = {x[0] for x in con.execute("select user_id from phase_person where phase_id=?", (i,))}
-        people = people_picker("person", [tuple(r) for r in con.execute("select user_id, name from app_user order by name")], allowed, "Nobody listed")
-        def area(name, value, rows=3):
-            return '<textarea name="%s" rows="%d" cols="70">%s</textarea>' % (name, rows, esc(value or ""))
-        form = ("<tr><td>Scope</td><td>%s</td></tr><tr><td>CTR name</td><td>%s</td></tr><tr><td>Status</td><td>%s</td></tr>"
-                "<tr><td>CTR code</td><td>%s <small>discipline - phase letter - number, e.g. PM-D-001. The scope code goes in front: %s-&hellip;</small></td></tr>"
-                "<tr><td>CTR title</td><td>%s</td></tr><tr><td>Prepared by</td><td>%s</td></tr><tr><td>Checked by</td><td>%s</td></tr>"
-                "<tr><td>Objectives</td><td>%s</td></tr><tr><td>Input requirements</td><td>%s</td></tr><tr><td>Scope of work</td><td>%s</td></tr>"
-                "<tr><td>This CTR assumes</td><td>%s</td></tr><tr><td>This CTR excludes</td><td>%s</td></tr>"
-                "<tr><td>Expenses</td><td>%s</td></tr><tr><td>Payment terms</td><td>%s</td></tr><tr><td>Lump sum value (&pound;)</td><td>%s <small>Lump Sum CTRs only: the price agreed with the client</small></td></tr><tr><td>Basis of proposal</td><td>%s</td></tr>"
-                "<tr><td>WBS</td><td>%s</td></tr><tr><td>CBS</td><td>%s</td></tr><tr><td>ABS</td><td>%s</td></tr>"
-                "<tr><td>Who can book</td><td>%s</td></tr><tr><td>People allowed</td><td>%s</td></tr>"
-                "<tr><td>Bookable from</td><td>%s</td></tr><tr><td>Bookable until</td><td>%s</td></tr>"
-                % (esc(r["scope_code"]), txt("name", r["name"], 20), sel("status", [("Open", "Open"), ("Closed", "Closed")], r["status"]),
-                   txt("ctr_code", r["ctr_code"] or "", 14), esc(r["scope_code"]),
-                   txt("description", r["description"] or "", 50), txt("prepared_by", r["prepared_by"] or "", 20), txt("checked_by", r["checked_by"] or "", 20),
-                   area("objectives", r["objectives"]), area("inputs", r["inputs"]), area("scope_of_work", r["scope_of_work"]),
-                   area("assumptions", r["assumptions"]), area("exclusions", r["exclusions"]),
-                   txt("expenses", r["expenses"] or "Reimbursable", 20),
-                   sel("payment_terms", PAYMENT_TERMS, r["payment_terms"]),
-                   txt("lump_sum_value", "%g" % r["lump_sum_value"] if r["lump_sum_value"] is not None else "", 12),
-                   area("basis", r["basis"]),
-                   txt("wbs", r["wbs"] or "", 20), txt("cbs", r["cbs"] or "", 20), txt("abs_code", r["abs_code"] or "", 20),
-                   sel("restricted", [("0", "Anyone"), ("1", "Only the people ticked below")], str(r["restricted"])),
-                   people, date_input("book_from", r["book_from"] or ""), date_input("book_to", r["book_to"] or "")))
-        note = ("<p><small>Closing a CTR stops new bookings to it. Existing hours are not affected. Hours are approved by the client's main approver or the scope's "
-                "secondary approvers (set on the scope). Transaction controls: by default anyone who may book to the client "
-                "can book to this code. Choose \"Only the people ticked\" to limit it to a list (nobody can book if the list is empty), and set dates to limit "
-                "which work dates can be booked. These controls stop new bookings only; hours already booked are not affected. WBS, CBS and ABS are "
-                "optional reference fields.</small></p>")
+        return ctr_page(con, u, i, msgs, form)
     else:
         return layout(con, u, "Admin", "<p>Not found.</p>")
     body = '%s%s<form method="post" action="/admin/save">%s<table border="0" cellpadding="2">%s</table>%s<input type="submit" value="Save changes"></form>' % (
         msgs_html(msgs), back, hidden(u=u, t=t, id=i), form, note)
     return layout(con, u, "Edit", body)
+
+
+# ---------- The CTR page: create or edit a CTR, with its budget by role ----------
+BUDGET_JS = r"""<script>
+(function(){var box=document.querySelector('.bpick');if(!box)return;
+var map=JSON.parse(box.getAttribute('data-roles')),client=box.getAttribute('data-client'),rows=box.querySelector('.brows'),tot=document.getElementById('btot');
+function opts(s){var cur=s.value;s.textContent='';var o=document.createElement('option');o.value='';o.textContent='Pick a role';s.appendChild(o);
+(map[client]||[]).forEach(function(p){var e=document.createElement('option');e.value=p[0];e.textContent=p[1];s.appendChild(e);});s.value=cur;}
+function mk(){var d=document.createElement('div');d.className='brow';var s=document.createElement('select');s.name='b_role';
+var h=document.createElement('input');h.type='text';h.name='b_hours';h.placeholder='hours';h.setAttribute('inputmode','decimal');
+var x=document.createElement('button');x.type='button';x.className='chip';x.textContent='×';x.title='Remove this role';
+d.appendChild(s);d.appendChild(h);d.appendChild(x);opts(s);rows.appendChild(d);}
+function sum(){var t=0;rows.querySelectorAll('input[name=b_hours]').forEach(function(i){var v=parseFloat(i.value.replace(/,/g,''));if(v>0)t+=v;});tot.textContent=Math.round(t*100)/100;}
+function spare(){var l=rows.lastElementChild;if(!l||l.querySelector('select').value)mk();}
+rows.addEventListener('change',function(){spare();sum();});rows.addEventListener('input',sum);
+rows.addEventListener('click',function(e){if(e.target.className==='chip'){var r=e.target.parentNode;r.parentNode.removeChild(r);spare();sum();}});
+var sc=document.querySelector('select[name=scope_id]');
+if(sc){sc.addEventListener('change',function(){client=sc.options[sc.selectedIndex].getAttribute('data-client');
+rows.querySelectorAll('select').forEach(function(s){s.value='';opts(s);});sum();});}
+spare();sum();})();
+</script>"""
+
+CTR_TEXT_FIELDS = (("objectives", "Objectives"), ("inputs", "Input requirements"), ("scope_of_work", "Scope of work"),
+                   ("assumptions", "This CTR assumes"), ("exclusions", "This CTR excludes"))
+
+
+def role_choices(con, client_id, keep=()):
+    """The roles a client's CTR can be budgeted in: the roles on that client's rate card, so each client's own role names are used.
+    A role already in the budget stays offered even if it has since been retired. Returns [(role_id, 'Name (code)')]."""
+    rows = [(r["role_id"], "%s (%s)" % (r["name"], r["skill_code"])) for r in con.execute(
+        "select distinct r.role_id, r.name, r.skill_code from rate rt join role r on r.role_id=rt.role_id where rt.client_id=? and r.active=1 order by r.name", (client_id,))]
+    have = {x[0] for x in rows}
+    for rid in keep:
+        if rid not in have:
+            r = con.execute("select name, skill_code from role where role_id=?", (rid,)).fetchone()
+            if r:
+                rows.append((rid, "%s (%s)" % (r["name"], r["skill_code"])))
+    return rows
+
+
+def latest_budget(con, phase_id):
+    return con.execute("select budget_id, hours, as_of from ctr_budget where phase_id=? order by as_of desc limit 1", (phase_id,)).fetchone()
+
+
+def budget_lines(con, budget_id):
+    return {r["role_id"]: float(r["hours"]) for r in con.execute(
+        "select br.role_id, br.hours from ctr_budget_role br join role r on r.role_id=br.role_id where br.budget_id=? order by r.name", (budget_id,))}
+
+
+def parse_budget(form, allowed):
+    """The budget by role from the posted rows (b_role, b_hours): {role_id: hours}. Empty rows are skipped."""
+    roles, hours, lines = form.get("b_role", []), form.get("b_hours", []), {}
+    for n, rid in enumerate(roles):
+        raw = (hours[n] if n < len(hours) else "").strip().replace(",", "")
+        if not rid and not raw:
+            continue
+        if not rid:
+            raise ValueError("Pick a role for the budget hours you entered.")
+        rid = int(rid)
+        if rid not in allowed:
+            raise ValueError("That role is not on this client's rate card.")
+        if not raw:
+            raise ValueError("Enter the budget hours for %s." % allowed[rid])
+        try:
+            h = round(float(raw), 2)
+        except ValueError:
+            raise ValueError("The budget hours for %s must be a number." % allowed[rid])
+        if h <= 0:
+            raise ValueError("The budget hours for %s must be more than 0 (remove the line to drop the role)." % allowed[rid])
+        if rid in lines:
+            raise ValueError("%s is listed twice: put its hours on one line." % allowed[rid])
+        lines[rid] = h
+    return lines
+
+
+def ctr_client(con, scope_id):
+    r = con.execute("select client_id from scope where scope_id=?", (scope_id,)).fetchone()
+    return r["client_id"] if r else None
+
+
+def ctr_page(con, u, i, msgs=None, form=None):
+    """One page to create (i = 0) or edit a CTR, laid out in boxes: the CTR, commercial terms, budget by role, references, who and when can book, and the
+    proposal text. Posted values are shown again when something is wrong."""
+    creating = i == 0
+    r = None
+    if not creating:
+        r = con.execute("select ph.*, s.scope_code, s.client_id from phase ph join scope s on s.scope_id=ph.scope_id where phase_id=?", (i,)).fetchone()
+        if not r:
+            return layout(con, u, "Admin", "<p>Not found.</p>")
+    scopes = [tuple(x) for x in con.execute("select s.scope_id, c.name || ' - ' || s.scope_code || ' ' || s.description, s.client_id from scope s "
+                                            "join client c on c.client_id=s.client_id order by c.name, s.scope_code")]
+
+    def val(k, default=""):
+        if form is not None:
+            return form[k][0] if k in form else default
+        if r is not None and k in r.keys() and r[k] is not None:
+            return r[k]
+        return default
+    area = lambda k, rows=3: '<textarea name="%s" rows="%d">%s</textarea>' % (k, rows, esc(val(k)))
+    fld = lambda label, box, note="": '<label>%s</label><div>%s%s</div>' % (esc(label), box, (' <small>%s</small>' % note) if note else "")
+    scope_id = int(val("scope_id") or (r["scope_id"] if r else (scopes[0][0] if scopes else 0)) or 0)
+    client_id = ctr_client(con, scope_id)
+    if creating:
+        scope_box = '<select name="scope_id">%s</select>' % "".join('<option value="%d" data-client="%d"%s>%s</option>' % (
+            sid, cid, " selected" if sid == scope_id else "", esc(label)) for sid, label, cid in scopes)
+        code_note = "discipline - phase letter - number, e.g. PM-D-001. The scope code goes in front."
+    else:
+        scope_box = esc(r["scope_code"])
+        code_note = "discipline - phase letter - number, e.g. PM-D-001. The scope code goes in front: %s-&hellip;" % esc(r["scope_code"])
+    disciplines = [(str(d[0]), d[1]) for d in con.execute("select discipline_id, name from discipline order by name")]
+    lump_v = val("lump_sum_value")
+    if form is None and lump_v != "":
+        lump_v = "%g" % lump_v
+    box_ctr = ("<h5>CTR</h5><div class=\"fld\">%s%s%s%s%s%s</div>" % (
+        fld("Scope", scope_box), fld("CTR name", txt("name", val("name"), 24), "the booking code people pick on their timesheet"),
+        fld("CTR title", txt("description", val("description"), 40)),
+        fld("CTR code", txt("ctr_code", val("ctr_code"), 14), code_note),
+        fld("Discipline", sel("discipline_id", disciplines, str(val("discipline_id")), True, "(from the CTR code)"), "shown as the stage on the cost reports"),
+        fld("Status", sel("status", [("Open", "Open"), ("Closed", "Closed")], val("status", "Open")), "closing stops new bookings; hours already booked are not affected")))
+    box_com = ("<h5>Commercial</h5><div class=\"fld\">%s%s%s%s%s%s</div>" % (
+        fld("Payment terms", sel("payment_terms", PAYMENT_TERMS, val("payment_terms", "Reimbursable"))),
+        fld("Lump sum value (\u00a3)", txt("lump_sum_value", lump_v, 12), "Lump Sum CTRs only: the price agreed with the client"),
+        fld("Expenses", txt("expenses", val("expenses", "Reimbursable"), 20)), fld("Prepared by", txt("prepared_by", val("prepared_by"), 20)),
+        fld("Checked by", txt("checked_by", val("checked_by"), 20)), fld("Basis of proposal", area("basis", 2))))
+    # the budget by role
+    cur = latest_budget(con, i) if not creating else None
+    have = budget_lines(con, cur["budget_id"]) if cur else {}
+    if form is not None:
+        posted = [(rid, h) for rid, h in zip(form.get("b_role", []), form.get("b_hours", [])) if rid or h]
+    else:
+        posted = [(str(k), "%g" % v) for k, v in have.items()]
+    keep = [int(rid) for rid, _ in posted if rid.isdigit()]
+    roles_by_client = {str(cid): role_choices(con, cid, keep if cid == client_id else ()) for cid in {x[2] for x in scopes}}
+    roles_by_client = {k: [[str(a), b] for a, b in v] for k, v in roles_by_client.items()}
+    mine = roles_by_client.get(str(client_id), [])
+    rows_html = "".join('<div class="brow"><select name="b_role"><option value="">Pick a role</option>%s</select><input type="text" name="b_hours" value="%s" placeholder="hours" inputmode="decimal">'
+                        '<button type="button" class="chip" title="Remove this role">&times;</button></div>' % (
+                            "".join('<option value="%s"%s>%s</option>' % (esc(a), " selected" if a == rid else "", esc(b)) for a, b in mine), esc(h)) for rid, h in posted + [("", "")])             # always a spare row at the end
+    total = sum(float(h.replace(",", "") or 0) for _, h in posted if h.replace(",", "").replace(".", "", 1).isdigit())
+    now = ("Current budget: <b>%g hrs</b> as of %s%s." % (cur["hours"], dmy(cur["as_of"]), "" if have else ", with no role breakdown (loaded as a total)")) if cur else "No budget yet."
+    box_bud = ('<h5>Budget by role</h5><p class="bnote"><small>%s Roles come from this client\'s rate card. Pick a role and enter its hours; a new line appears each time. '
+               'Changing the budget saves a new version with the date below; earlier versions are kept.</small></p>'
+               '<div class="bpick" data-client="%s" data-roles="%s"><div class="brows">%s</div></div>'
+               '<p class="btotal">Budget total <b id="btot">%g</b> hrs &nbsp; <span class="asof">as of %s</span></p>%s' % (
+                   now, client_id or "", esc(json.dumps(roles_by_client)), rows_html, total,
+                   date_input("budget_as_of", val("budget_as_of", datetime.date.today().isoformat())),
+                   "" if mine else '<p class="bad"><small>This client has no rate card yet, so there are no roles to pick (Admin, Client rate cards).</small></p>'))
+    box_ref = "<h5>References</h5><div class=\"fld\">%s%s%s</div>" % (
+        fld("WBS", txt("wbs", val("wbs"), 20)), fld("CBS", txt("cbs", val("cbs"), 20)), fld("ABS", txt("abs_code", val("abs_code"), 20)))
+    allowed = {x[0] for x in con.execute("select user_id from phase_person where phase_id=?", (i,))} if not creating else set()
+    if form is not None:
+        allowed = {int(x) for x in form.get("person", [])}
+    people = people_picker("person", [tuple(x) for x in con.execute("select user_id, name from app_user order by name")], allowed, "Nobody listed")
+    box_book = ("<h5>Who and when can book</h5><div class=\"fld\">%s%s%s%s</div>"
+                "<p><small>By default anyone who may book to the client can book to this code. Choose \"Only the people ticked\" to limit it to a list "
+                "(nobody can book if the list is empty), and set dates to limit which work dates can be booked. These controls stop new bookings only.</small></p>" % (
+                    fld("Who can book", sel("restricted", [("0", "Anyone"), ("1", "Only the people listed below")], str(val("restricted", "0")))),
+                    fld("People allowed", people), fld("Bookable from", date_input("book_from", val("book_from"))), fld("Bookable until", date_input("book_to", val("book_to")))))
+    box_text = "<h5>Proposal</h5><div class=\"ctext\">%s</div>" % "".join("<div><label>%s</label>%s</div>" % (esc(label), area(k, 4)) for k, label in CTR_TEXT_FIELDS)
+    back = '<p><a href="/admin?u=%d&amp;t=scopes">&lt;&lt; Back</a></p>' % u
+    action, title = ("/admin/add", "New CTR") if creating else ("/admin/save", "CTR %s-%s" % (r["scope_code"], r["ctr_code"] or r["name"].upper()))
+    save = '<input type="submit" value="%s">' % ("Create CTR" if creating else "Save changes")
+    body = ('%s%s<form method="post" action="%s">%s<div class="ctrhead"><h4>%s</h4>%s</div><div class="ctrgrid">'
+            '<div class="col"><div class="box">%s</div><div class="box">%s</div></div><div class="col"><div class="box">%s</div><div class="box">%s</div><div class="box">%s</div></div>'
+            '<div class="box wide">%s</div></div><p>%s</p></form>%s' % (
+                msgs_html(msgs), back, action, hidden(u=u, t="phases", id=i), esc(title), save, box_ctr, box_bud, box_com, box_ref, box_book, box_text, save, BUDGET_JS))
+    return layout(con, u, "New CTR" if creating else "Edit", body)
+
+
+def prepare_ctr(con, g, form, phase_id, scope_id):
+    """Check a CTR form and return what is to be written, before anything is. Raises ValueError with a message the person can act on."""
+    b_from, b_to = need_date(g("book_from"), "Bookable from", False), need_date(g("book_to"), "Bookable until", False)
+    if b_from and b_to and b_to < b_from:
+        raise ValueError("Bookable until cannot be before bookable from.")
+    terms, lump = payment_terms(g)
+    name = need_text(g("name"), "CTR name")
+    client_id = ctr_client(con, scope_id)
+    cur = latest_budget(con, phase_id) if phase_id else None
+    have = budget_lines(con, cur["budget_id"]) if cur else {}
+    lines = parse_budget(form, {rid: label for rid, label in role_choices(con, client_id, have.keys())})
+    change = None
+    if lines != have and (lines or have):
+        as_of = need_date(g("budget_as_of") or datetime.date.today().isoformat(), "Budget as of")
+        if cur and as_of <= cur["as_of"]:
+            raise ValueError("A budget as of %s is already held for this CTR: set the budget date later than that to save the change (earlier versions are kept)." % dmy(cur["as_of"]))
+        change = (as_of, lines)
+    return {"name": name, "terms": terms, "lump": lump, "from": b_from, "to": b_to, "budget": change}
+
+
+def write_ctr(con, u, g, form, i, v):
+    con.execute("update phase set name=?, status=?, description=?, wbs=?, cbs=?, abs_code=?, restricted=?, book_from=?, book_to=?, "
+                "ctr_code=?, discipline_id=coalesce(?, (select discipline_id from discipline where code=split_part(?, '-', 1))), objectives=?, inputs=?, scope_of_work=?, "
+                "assumptions=?, exclusions=?, prepared_by=?, checked_by=?, expenses=?, payment_terms=?, lump_sum_value=?, basis=? where phase_id=?",
+                (v["name"], g("status") or "Open", g("description") or None, g("wbs") or None, g("cbs") or None, g("abs_code") or None,
+                 1 if g("restricted") == "1" else 0, v["from"], v["to"], g("ctr_code") or None, int(g("discipline_id")) if g("discipline_id") else None, g("ctr_code") or "",
+                 g("objectives") or None, g("inputs") or None, g("scope_of_work") or None, g("assumptions") or None, g("exclusions") or None,
+                 g("prepared_by") or None, g("checked_by") or None, g("expenses") or "Reimbursable", v["terms"], v["lump"], g("basis") or None, i))
+    con.execute("delete from phase_person where phase_id=?", (i,))
+    for person in form.get("person", []):
+        con.execute("insert into phase_person (phase_id, user_id) values (?,?) on conflict do nothing", (i, int(person)))
+    if v["budget"]:
+        as_of, lines = v["budget"]
+        bid = con.execute("insert into ctr_budget (phase_id, hours, as_of, loaded_by) values (?,?,?,?) returning budget_id",
+                          (i, round(sum(lines.values()), 2), as_of, u)).fetchone()[0]
+        for rid, h in lines.items():
+            con.execute("insert into ctr_budget_role (budget_id, role_id, hours) values (?,?,?)", (bid, rid, h))
+
+
+def apply_ctr(con, u, g, form, i):
+    scope_id = con.execute("select scope_id from phase where phase_id=?", (i,)).fetchone()["scope_id"]
+    write_ctr(con, u, g, form, i, prepare_ctr(con, g, form, i, scope_id))
+
+
+def create_ctr(con, u, form, g):
+    """Add a CTR from the full CTR page."""
+    try:
+        scope_id = int(g("scope_id") or 0)
+        if not ctr_client(con, scope_id):
+            raise ValueError("Choose a scope for the CTR.")
+        v = prepare_ctr(con, g, form, None, scope_id)
+        pid = con.execute("insert into phase (scope_id, name) values (?,?) returning phase_id", (scope_id, v["name"])).fetchone()[0]
+        write_ctr(con, u, g, form, pid, v)
+        con.commit()
+    except ValueError as e:
+        return ctr_page(con, u, 0, [str(e)], form)
+    except pg.DatabaseError as e:
+        return ctr_page(con, u, 0, ["That CTR already exists on this scope (the name must be unique)." if isinstance(e, pg.UniqueViolation) else pg.error_text(e)], form)
+    return view_admin(con, u, "phases", ["CTR added."], ok=True)
 
 
 def admin_add(con, form):
@@ -500,10 +680,7 @@ def admin_add(con, form):
             con.execute("insert into phase (scope_id, name) values (?, 'General')", (cur.fetchone()[0],))
             msg = "Scope added with a General CTR."
         elif t == "phases":
-            terms, value = payment_terms(g)
-            con.execute("insert into phase (scope_id, name, payment_terms, lump_sum_value) values (?,?,?,?)",
-                        (int(g("scope_id")), need_text(g("name"), "CTR name"), terms, value))
-            msg = "CTR added."
+            return create_ctr(con, u, form, g)
         elif t == "locations":
             con.execute("insert into location (name) values (?)", (need_text(g("name"), "Location name"),))
             msg = "Location added."
@@ -595,29 +772,16 @@ def admin_save(con, form):
         elif t == "projects":
             con.execute("update project set name=?, status=? where project_id=?", (need_text(g("name"), "Project name"), g("status"), i))
         elif t == "phases":
-            b_from, b_to = need_date(g("book_from"), "Bookable from", False), need_date(g("book_to"), "Bookable until", False)
-            if b_from and b_to and b_to < b_from:
-                raise ValueError("Bookable until cannot be before bookable from.")
-            terms, lump = payment_terms(g)
-            con.execute("update phase set name=?, status=?, description=?, wbs=?, cbs=?, abs_code=?, restricted=?, book_from=?, book_to=?, "
-                        "ctr_code=?, objectives=?, inputs=?, scope_of_work=?, assumptions=?, exclusions=?, prepared_by=?, checked_by=?, expenses=?, payment_terms=?, lump_sum_value=?, basis=? "
-                        "where phase_id=?",
-                        (need_text(g("name"), "CTR name"), g("status"), g("description") or None, g("wbs") or None, g("cbs") or None,
-                         g("abs_code") or None, 1 if g("restricted") == "1" else 0, b_from, b_to,
-                         g("ctr_code") or None, g("objectives") or None, g("inputs") or None, g("scope_of_work") or None, g("assumptions") or None,
-                         g("exclusions") or None, g("prepared_by") or None, g("checked_by") or None, g("expenses") or "Reimbursable", terms, lump, g("basis") or None, i))
-            con.execute("delete from phase_person where phase_id=?", (i,))
-            for person in form.get("person", []):
-                con.execute("insert into phase_person (phase_id, user_id) values (?,?) on conflict do nothing", (i, int(person)))
+            apply_ctr(con, u, g, form, i)
         else:
             raise ValueError("Unknown form.")
         con.commit()
         return view_admin(con, u, "scopes" if t in ("projects", "phases") else t, ["Saved."], ok=True)
     except ValueError as e:
-        return view_admin_edit(con, u, t, i, [str(e)])
+        return view_admin_edit(con, u, t, i, [str(e)], form)
     except pg.DatabaseError as e:
         text = "That already exists (it must be unique)." if isinstance(e, pg.UniqueViolation) else pg.error_text(e)
-        return view_admin_edit(con, u, t, i, [text])
+        return view_admin_edit(con, u, t, i, [text], form)
 
 
 def act_allowance_rates(con, form):
@@ -651,159 +815,6 @@ def act_allowance_rates(con, form):
     except pg.IntegrityError:
         con.rollback()
         return view_admin(con, u, "allowance_rates", ["A rate already exists from that date. Rates are never edited: choose a later date."])
-
-
-P6_CTR_RE = re.compile(r"([A-Z]{1,3}\d{3,5}-[A-Z]{2,3}-[A-Z]{1,3}-\d{3})\s*$", re.I)
-
-
-def _cells(line):
-    return [c.strip() for c in next(csv.reader([line], delimiter="\t" if "\t" in line else ","))]
-
-
-def _num(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
-
-def p6_format(data):
-    """True when the pasted text is a P6 export (seven or more columns) and not the simple 'CTR No, hours' lines."""
-    for line in data.replace("\r", "").split("\n"):
-        if line.strip():
-            return len(_cells(line)) >= 7
-    return False
-
-
-def p6_parse(data):
-    """Rows of a P6 export: project, WBS name, activity code, budget, actual, remaining, % complete, and the CTR No read from the end of the WBS name."""
-    rows, bad = [], []
-    lines = [x for x in data.replace("\r", "").split("\n") if x.strip()]
-    for n, line in enumerate(lines, 1):
-        c = _cells(line)
-        budget = _num(c[3]) if len(c) >= 7 else None
-        if budget is None or budget < 0:
-            if n > 1:
-                bad.append("line %d" % n)
-            continue  # (the first line is a heading)
-        m = P6_CTR_RE.search(c[1])
-        rows.append({"project": c[0], "wbs": c[1], "code": c[2], "budget": budget, "actual": _num(c[4]), "remaining": _num(c[5]), "pct": _num(c[6]),
-                     "ctr": m.group(1).upper() if m else None})
-    return rows, bad
-
-
-def p6_budgets(con, u, form, data, as_of):
-    """A P6 export: a preview of what would be loaded for one P6 project (and nothing written), then the load itself once confirmed."""
-    rows, bad = p6_parse(data)
-    if not rows:
-        raise ValueError("No rows were found in that export. The columns are: project, WBS name, activity code, budget hours, actual hours, remaining hours, % complete.")
-    projects = list(dict.fromkeys(r["project"] for r in rows))
-    chosen = form.get("p6_project", [""])[0]
-    chosen = chosen if chosen in projects else projects[0]
-    mine = [r for r in rows if r["project"] == chosen]
-    ctrs = {r["no"].upper(): r["phase_id"] for r in con.execute(
-        "select ph.phase_id, s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name)) as no from phase ph join scope s on s.scope_id=ph.scope_id "
-        "join client c on c.client_id=s.client_id where c.is_internal=0")}
-    times = {}
-    for r in mine:
-        if r["ctr"]:
-            times[r["ctr"]] = times.get(r["ctr"], 0) + 1
-    for r in mine:
-        r["phase_id"] = None
-        if not r["ctr"]:
-            r["result"], r["act"] = "No CTR No at the end of the WBS name", "skip"
-        elif times[r["ctr"]] > 1:
-            r["result"], r["act"] = "CTR No appears %d times in this project: not loaded" % times[r["ctr"]], "skip"
-        elif r["ctr"] not in ctrs:
-            r["result"], r["act"] = "Not a CTR in this system", "skip"
-        else:
-            r["phase_id"] = ctrs[r["ctr"]]
-            cur = con.execute("select hours, as_of, p6_actual_hours, percent_complete from ctr_budget where phase_id=? order by as_of desc limit 1", (r["phase_id"],)).fetchone()
-            same = lambda a, b: (a is None and b is None) or (a is not None and b is not None and abs(a - b) < 1e-6)
-            if cur and same(cur["hours"], r["budget"]) and same(cur["p6_actual_hours"], r["actual"]) and same(cur["percent_complete"], r["pct"]):
-                r["result"], r["act"] = "Unchanged", "same"
-            elif cur and cur["as_of"] >= as_of:
-                r["result"], r["act"] = "A budget as of %s is already held: use a later date" % cur["as_of"], "skip"
-            else:
-                r["result"], r["act"] = ("New" if not cur else "Changed (budget was %s hrs)" % fmt(cur["hours"])), "load"
-    to_load = [r for r in mine if r["act"] == "load"]
-    if "confirm" in form:
-        for r in to_load:
-            con.execute("insert into ctr_budget (phase_id, hours, as_of, p6_actual_hours, percent_complete, p6_project, loaded_by) values (?,?,?,?,?,?,?)",
-                        (r["phase_id"], r["budget"], as_of, r["actual"], r["pct"], chosen, u))
-        con.commit()
-        skipped = sum(1 for r in mine if r["act"] == "skip")
-        return view_admin(con, u, "budgets", ["%d budget%s loaded from P6 project %s, as of %s. %d unchanged, %d not loaded." % (
-            len(to_load), "" if len(to_load) == 1 else "s", chosen, as_of, sum(1 for r in mine if r["act"] == "same"), skipped)], ok=True)
-    body = ['<p><a href="/admin?u=%d&amp;t=budgets">&lt;&lt; Back to Budgets</a></p>' % u,
-            "<p><b>Preview: nothing has been loaded yet.</b> P6 project <b>%s</b>, as of %s. %d of its %d rows would be loaded, %d are unchanged and %d would not be loaded.</p>" % (
-                esc(chosen), esc(as_of), len(to_load), len(mine), sum(1 for r in mine if r["act"] == "same"), sum(1 for r in mine if r["act"] == "skip"))]
-    if bad:
-        body.append("<p><small>Lines that could not be read and are ignored: %s.</small></p>" % esc(", ".join(bad)))
-    trs = ["<tr><th>WBS name</th><th>CTR No</th><th>Budget hrs</th><th>P6 actual hrs</th><th>% complete</th><th>Result</th></tr>"]
-    for r in mine:
-        trs.append('<tr><td>%s</td><td>%s</td><td align="right">%s</td><td align="right">%s</td><td align="right">%s</td><td>%s</td></tr>' % (
-            esc(r["wbs"]), esc(r["ctr"] or ""), fmt(r["budget"]), fmt(r["actual"]), fmt(r["pct"]), esc(r["result"])))
-    body.append('<table border="1" cellpadding="3" cellspacing="0">%s</table>' % "".join(trs))
-    body.append('<form method="post" action="/admin/budgets">%s<input type="hidden" name="as_of" value="%s"><textarea name="data" style="display:none">%s</textarea>'
-                "<p>P6 project %s <input type=\"submit\" value=\"Update preview\"> <small>(the same file can hold several P6 projects, such as a baseline and a later version: "
-                "choose the one to load)</small></p>%s</form>" % (
-                    hidden(u=u), esc(as_of), esc(data), sel("p6_project", [(p, p) for p in projects], chosen),
-                    ('<p><input type="submit" name="confirm" value="Load %d budget%s from %s"></p>' % (len(to_load), "" if len(to_load) == 1 else "s", esc(chosen)))
-                    if to_load else "<p>Nothing to load for this project.</p>"))
-    return layout(con, u, "Admin", "".join(body))
-
-
-def act_budgets(con, form):
-    u = int(form["u"][0])
-    if not can_use_tab(con, u, "budgets"):
-        return view_admin(con, u, "budgets")
-    try:
-        as_of = need_date(form.get("as_of", [""])[0], "As of")
-        data = form.get("data", [""])[0]
-        lines = [x for x in data.replace("\r", "").split("\n") if x.strip()]
-        if not lines:
-            raise ValueError("Paste at least one line: CTR No, budget hours.")
-        if p6_format(data):
-            return p6_budgets(con, u, form, data, as_of)
-        ctrs = {r["no"].upper(): r["phase_id"] for r in con.execute(
-            "select ph.phase_id, s.scope_code || '-' || coalesce(ph.ctr_code, upper(ph.name)) as no from phase ph join scope s on s.scope_id=ph.scope_id "
-            "join client c on c.client_id=s.client_id where c.is_internal=0")}
-        loaded, same, unknown, bad = 0, 0, [], []
-        for n, line in enumerate(lines, 1):
-            cells = next(csv.reader([line], delimiter="\t" if "\t" in line else ","))
-            cells = [c.strip() for c in cells]
-            try:
-                hours = float(cells[1])
-                if hours < 0:
-                    raise ValueError
-            except (IndexError, ValueError):
-                if n == 1:
-                    continue  # a heading line
-                bad.append("line %d" % n)
-                continue
-            pid = ctrs.get(cells[0].upper())
-            if pid is None:
-                unknown.append(cells[0])
-                continue
-            cur = con.execute("select hours, as_of from ctr_budget where phase_id=? order by as_of desc limit 1", (pid,)).fetchone()
-            if cur and abs(cur["hours"] - hours) < 1e-9:
-                same += 1
-            elif cur and cur["as_of"] >= as_of:
-                bad.append("%s (a budget as of %s is already held: use a later date)" % (cells[0], cur["as_of"]))
-            else:
-                con.execute("insert into ctr_budget (phase_id, hours, as_of, loaded_by) values (?,?,?,?)", (pid, hours, as_of, u))
-                loaded += 1
-        con.commit()
-        msgs = ["%d budget%s loaded, as of %s. %d unchanged." % (loaded, "" if loaded == 1 else "s", as_of, same)]
-        if unknown:
-            msgs.append("Not recognised as a CTR No (nothing loaded for): %s." % ", ".join(unknown))
-        if bad:
-            msgs.append("Skipped: %s." % "; ".join(bad))
-        return view_admin(con, u, "budgets", msgs, ok=not (unknown or bad))
-    except ValueError as e:
-        con.rollback()
-        return view_admin(con, u, "budgets", [str(e)])
 
 
 def act_period(con, form):

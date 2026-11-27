@@ -32,8 +32,8 @@ DASH_CSS = """<style>
 </style>"""
 
 
-def dash_budget_chart(rows, u):
-    """Horizontal bars, one per budgeted CTR: the budget as a track with an end tick, approved hours filled, pending hours hatched.
+def dash_budget_chart(rows, u, what="CTR"):
+    """Horizontal bars, one per budgeted CTR (or per role, when the rows have no phase_id): the budget as a track with an end tick, approved hours filled, pending hours hatched.
     A CTR over its budget is dark red and says so in words."""
     w, left, right, row_h, top = 900, 170, 210, 30, 8
     scale_max = max(max(r["budget_hours"], r["actual_hours"] + r["pending_hours"]) for r in rows)
@@ -41,7 +41,7 @@ def dash_budget_chart(rows, u):
     plot = w - left - right
     x = lambda v: left + plot * v / top_v
     h = top + row_h * len(rows) + 26
-    o = ['<svg class="chart" viewBox="0 0 %d %d" role="img" aria-label="Budget hours against approved hours for each CTR">' % (w, h),
+    o = ['<svg class="chart" viewBox="0 0 %d %d" role="img" aria-label="Budget hours against approved hours for each %s">' % (w, h, what.lower()),
          '<defs><pattern id="pend" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">'
          '<rect width="2.5" height="6" fill="#fe6700"/></pattern></defs>']
     for k in range(5):
@@ -51,11 +51,13 @@ def dash_budget_chart(rows, u):
         y = top + i * row_h
         bud, act, pend = r["budget_hours"], r["actual_hours"], r["pending_hours"]
         over = bud > 0 and act > bud
-        pct = ("%.0f%%" % (100 * act / bud)) if bud else "no budget"
+        pct = ("%.0f%%" % (100 * act / bud)) if bud else "not budgeted"
         tip = "%s: budget %s hrs, approved %s hrs, pending %s hrs, %s hrs %s" % (
             r["phase"], fmt(bud), fmt(act), fmt(pend), fmt(abs(bud - act)), "over budget" if over else "remaining")
         fill = "#b3261e" if over else "#fe6700"
-        o.append('<a href="/ctr?u=%d&amp;phase=%d"><g><title>%s (click to open the CTR)</title><rect class="hit" x="0" y="%d" width="%d" height="%d" fill="transparent"/>' % (u, r["phase_id"], esc(tip), y, w, row_h))
+        link = r.get("phase_id")
+        o.append('%s<g><title>%s%s</title><rect class="hit" x="0" y="%d" width="%d" height="%d" fill="transparent"/>' % (
+            ('<a href="/ctr?u=%d&amp;phase=%d">' % (u, link)) if link else "<a>", esc(tip), " (click to open the CTR)" if link else "", y, w, row_h))
         o.append('<text x="%d" y="%d" text-anchor="end" class="val">%s</text>' % (left - 10, y + 19, esc(r["phase"])))
         o.append('<rect x="%.1f" y="%d" width="%.1f" height="14" fill="#e5e5e6"/>' % (left, y + 7, x(bud) - left))                 # the budget
         o.append('<rect x="%.1f" y="%d" width="%.1f" height="14" fill="%s"/>' % (left, y + 7, max(x(act) - left, 0), fill))      # approved
@@ -67,6 +69,34 @@ def dash_budget_chart(rows, u):
         o[-1] = o[-1] + "</a>"
     o.append("</svg>")
     return "".join(o)
+
+
+def role_rows(con, phase_ids):
+    """Budget against hours by role, added up over the given CTRs that have their latest budget split by role: [{phase: role name, budget_hours, actual_hours,
+    pending_hours}] and how many of the CTRs were counted. Hours booked in a role with no budget count too (budget 0: not budgeted)."""
+    if not phase_ids:
+        return [], 0
+    marks = ",".join("?" * len(phase_ids))
+    split = [r[0] for r in con.execute(
+        "select b.phase_id from ctr_budget b where b.phase_id in (%s) and b.as_of = (select max(x.as_of) from ctr_budget x where x.phase_id=b.phase_id) "
+        "and exists (select 1 from ctr_budget_role r where r.budget_id=b.budget_id)" % marks, tuple(phase_ids))]
+    if not split:
+        return [], 0
+    marks = ",".join("?" * len(split))
+    out = {}
+    for r in con.execute(
+            "select ro.role_id, ro.name, sum(br.hours) as hrs from ctr_budget_role br join role ro on ro.role_id=br.role_id join ctr_budget b on b.budget_id=br.budget_id "
+            "where b.phase_id in (%s) and b.as_of = (select max(x.as_of) from ctr_budget x where x.phase_id=b.phase_id) group by ro.role_id, ro.name" % marks, tuple(split)):
+        out[r["role_id"]] = {"phase": r["name"], "budget_hours": float(r["hrs"]), "actual_hours": 0.0, "pending_hours": 0.0}
+    for r in con.execute(
+            "select ro.role_id, ro.name, sum(case when t.status='Approved' then t.hours else 0 end) as act, "
+            "sum(case when t.status in ('Submitted','Edited') then t.hours else 0 end) as pend from time_entry t join role ro on ro.role_id=t.worked_role_id "
+            "where t.phase_id in (%s) group by ro.role_id, ro.name" % marks, tuple(split)):
+        row = out.setdefault(r["role_id"], {"phase": r["name"], "budget_hours": 0.0, "actual_hours": 0.0, "pending_hours": 0.0})
+        row["actual_hours"], row["pending_hours"] = float(r["act"]), float(r["pend"])
+    rows = [r for r in out.values() if r["budget_hours"] or r["actual_hours"] or r["pending_hours"]]
+    rows.sort(key=lambda r: (r["budget_hours"] == 0, -(r["actual_hours"] / r["budget_hours"]) if r["budget_hours"] else -r["actual_hours"], r["phase"]))
+    return rows, len(split)
 
 
 def dash_week_chart(weeks, clients, colours):
@@ -101,7 +131,7 @@ def dash_week_chart(weeks, clients, colours):
 
 
 def view_dashboard(con, u, q):
-    """The cost controllers' dashboard: budget hours (from P6) against the approved hours booked here, in hours only, and the weekly flow of hours."""
+    """The cost controllers' dashboard: budget hours against the approved hours booked here, in hours only, and the weekly flow of hours."""
     if permission_of(con, u) != "controller":
         return no_access(con, u, "Dashboard")
     (f_client, f_project, f_scope, f_phase), (f_clients, f_projects, f_scopes, f_phases) = period_filters(con, q, u, ALL_REPORTS)
@@ -126,7 +156,7 @@ def view_dashboard(con, u, q):
     elif show == "under":
         rows = [r for r in rows if r["actual_hours"] < 0.9 * r["budget_hours"]]
     auto = ' onchange="this.form.submit()"'
-    b = [DASH_CSS, "<p><small>Hours only, as P6 holds hours only. Actual is approved hours; pending is submitted hours waiting for approval. Client work only: "
+    b = [DASH_CSS, "<p><small>Hours only. Budgets are set by role on each CTR's page (Admin, Projects / scopes / CTRs). Actual is approved hours; pending is submitted hours waiting for approval. Client work only: "
          "internal hours are not budgeted. Click a CTR to open it. The tables are on the <a href=\"/reports?u=%d\">Reports</a> page.</small></p>" % u,
          '<form method="get" action="/dashboard">%s<p>Client %s Project %s Scope %s CTR %s Show %s</p>'
          '<p>Weeks from %s to %s <small>(the weekly chart only: budgets are always compared with all approved hours to date)</small> '
@@ -153,12 +183,21 @@ def view_dashboard(con, u, q):
                  '<span><i style="background:repeating-linear-gradient(135deg,#fe6700 0 2px,#fff 2px 5px)"></i>Pending</span>'
                  '<span><i style="background:#b3261e"></i>Over budget</span><span><i style="background:#0f0f12;width:2px;height:12px"></i>Budget line</span></div>')
         b.append(dash_budget_chart(rows, u))
+        by_role, n_split = role_rows(con, [r["phase_id"] for r in rows])
+        b.append("<h4>Budget against approved hours, by role</h4>")
+        if by_role:
+            b.append("<p><small>The roles of the %d CTR%s above that have their budget split by role (set on the CTR page), added together. Hours booked in a role "
+                     "with no budget are shown as not budgeted.%s</small></p>" % (n_split, "" if n_split == 1 else "s", (
+                         " The other %d have a budget as a single total." % (len(rows) - n_split)) if n_split < len(rows) else ""))
+            b.append(dash_budget_chart(by_role, u, "role"))
+        else:
+            b.append("<p>None of these CTRs has its budget split by role yet. Set it on the CTR page (Admin, Projects / scopes / CTRs) and it will show here.</p>")
     elif n_budgeted:
         b.append("<p>No CTRs match these filters (%d budgeted CTR%s before the Show filter).</p>" % (n_budgeted, "" if n_budgeted == 1 else "s"))
     elif f_client or f_project or f_scope or f_phase:
-        b.append("<p>No budgets are held for the CTRs these filters select. Load them from P6 on Admin, Budgets.</p>")
+        b.append("<p>No budgets are held for the CTRs these filters select. Set them on the CTR page (Admin, Projects / scopes / CTRs).</p>")
     else:
-        b.append("<p>No budgets have been loaded yet. Load them from P6 on Admin, Budgets and the charts will fill in.</p>")
+        b.append("<p>No budgets have been set yet. Set them on each CTR's page (Admin, Projects / scopes / CTRs) and the charts will fill in.</p>")
     # approved hours by week and client
     per = con.execute("select monday_of(t.work_date) as wk, c.name as client, sum(t.hours) as hrs "
                       "from time_entry t join scope s on s.scope_id=t.scope_id join client c on c.client_id=s.client_id "

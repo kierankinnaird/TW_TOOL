@@ -3,7 +3,7 @@
 Builds into the PostgreSQL database in DATABASE_URL (default: the local development server, see docker-compose.yml). Anything already in that
 database's public schema is dropped first, so this is for a development or demo database, never for one holding real hours.
 
---cmap loads the company's people from CMAP's user grid (scripts/load_cmap.py); with --users as well, each is linked to their Microsoft account from the tenant export. --users on its own loads the people in the tenant export that have a job title (scripts/load_users.py). --history adds twelve weeks of approved demo timesheets before the seed's own weeks (scripts/seed_history.py).
+--cmap loads the company's people from CMAP's user grid (scripts/load_cmap.py); with --users as well, each is linked to their Microsoft account from the tenant export. --users on its own loads the people in the tenant export that have a job title (scripts/load_users.py). --history adds a lot of demo data (scripts/seed_history.py): more projects, scopes and CTRs, client-specific job titles and rates, a PAAF for everyone, and timesheets for everyone from 3 Aug to 22 Nov in every state (approved, waiting, draft).
 
 --extra applies more SQL after the seed, for example a local, git-ignored file of real data (docs/p6_spirit_pack.sql).
 """
